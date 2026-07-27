@@ -130,15 +130,26 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
       if (typeof j.status === "string") status = j.status;
       const agentId = j.agentId;
       if (agentId) {
-        const lr = await run(["paseo", "logs", agentId, "--filter", "text"], {
-          cwd: opts.cwd,
-          timeoutMs: 60_000,
-        });
-        if (lr.ok) {
-          output = lr.stdout
+        // The paseo log store can lag behind agent completion: reading once
+        // right after `paseo run` returns sometimes captures a partial
+        // transcript (missing the agent's final lines — e.g. REVIEW_VERDICT).
+        // Poll until the filtered output stops changing so we capture the full
+        // text instead of truncating mid-generation.
+        let prev = "";
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const lr = await run(["paseo", "logs", agentId, "--filter", "text"], {
+            cwd: opts.cwd,
+            timeoutMs: 60_000,
+          });
+          if (!lr.ok) break;
+          const cur = lr.stdout
             .split(/\r?\n/)
             .filter((line) => !/^\[User\]/.test(line))
             .join("\n");
+          output = cur;
+          if (cur.length > 0 && cur === prev) break;
+          prev = cur;
+          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 2000));
         }
       }
     } catch {

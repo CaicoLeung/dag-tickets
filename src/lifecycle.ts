@@ -1,4 +1,4 @@
-import type { Ticket } from "./types.ts";
+import type { Ticket, ReviewVerdict } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
 import { parseReviewVerdict } from "./parse.ts";
 import { branchFor, commitCount, deleteBranch, createPr, watchChecks, mergePr, closeIssue, removeWorktreeOnBranch, type MergeStrategy } from "./gitgh.ts";
@@ -162,36 +162,33 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   }
 }
 
-/** Run /code-review in a fresh worktree on the branch; retry once on an unparseable verdict. */
-async function runReview(t: Ticket, branch: string, ctx: RunContext): Promise<ReturnType<typeof parseReviewVerdict>> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await removeWorktreeOnBranch(branch, ctx.cwd);
-    const r: DispatchResult = await dispatchWithFallback(
-      reviewPrompt(t, ctx.baseBranch),
-      {
-        provider: ctx.prefs.review,
-        title: `review #${t.number}`,
-        slug: `${SLUG(t.number)}-review`,
-        cwd: ctx.cwd,
-        timeoutMs: ctx.runTimeoutMs,
-        branchMode: "checkout-branch",
-        branch,
-      },
-      ctx.fallbackProviders,
-      async (next) => {
-        ctx.log("warn", `review rate-limited; retrying on ${next}`, t.number);
-        await removeWorktreeOnBranch(branch, ctx.cwd);
-      },
-    );
-    if (!r.ok) {
-      ctx.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
-      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
-    }
-    const v = parseReviewVerdict(r.output);
-    if (v.kind !== "unknown" || attempt > 0) return v;
-    ctx.log("warn", "review verdict unparseable; retrying once", t.number);
+/** Run /code-review in a fresh worktree on the branch. Single attempt — the
+ *  stable-log polling in dispatch guarantees we capture the agent's full output,
+ *  so an unparseable verdict now means the agent genuinely didn't emit one. */
+async function runReview(t: Ticket, branch: string, ctx: RunContext): Promise<ReviewVerdict> {
+  await removeWorktreeOnBranch(branch, ctx.cwd);
+  const r: DispatchResult = await dispatchWithFallback(
+    reviewPrompt(t, ctx.baseBranch),
+    {
+      provider: ctx.prefs.review,
+      title: `review #${t.number}`,
+      slug: `${SLUG(t.number)}-review`,
+      cwd: ctx.cwd,
+      timeoutMs: ctx.runTimeoutMs,
+      branchMode: "checkout-branch",
+      branch,
+    },
+    ctx.fallbackProviders,
+    async (next) => {
+      ctx.log("warn", `review rate-limited; retrying on ${next}`, t.number);
+      await removeWorktreeOnBranch(branch, ctx.cwd);
+    },
+  );
+  if (!r.ok) {
+    ctx.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
+    return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
   }
-  return { kind: "unknown", issueCount: 0, raw: "" };
+  return parseReviewVerdict(r.output);
 }
 
 async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
