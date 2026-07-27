@@ -1,0 +1,109 @@
+import type { ReviewVerdict } from "./types.ts";
+
+/**
+ * Pure parsing helpers — no I/O. Unit-tested.
+ *
+ * Two concerns:
+ *  1. `Blocked by` edges — the `to-tickets` skill writes them inline
+ *     (`**Blocked by:** #12, #15`) or as a `## Blocked by` section with
+ *     bullets. Blockers may be `#NN` references OR title references (e.g.
+ *     "T2 — Ticket-type labels + routing dispatch"); we extract both, and the
+ *     graph layer resolves titles to numbers within the batch.
+ *  2. Review verdicts — the code-review agent is prompted to end its output
+ *     with a machine-parseable line so the driver can branch the fix-loop.
+ */
+
+const NONE_RE = /\b(none|n\/a|nothing|can start immediately|no dependencies?)\b/i;
+
+export interface BlockedByRefs {
+  numbers: number[];
+  /** Raw textual references (titles or prose) that couldn't be parsed as #NN. */
+  titleRefs: string[];
+}
+
+/**
+ * Extract every reference under a `Blocked by` marker — both `#NN` numbers and
+ * free-text title references. Handles inline and section forms.
+ */
+export function parseBlockedByRefs(body: string | null | undefined): BlockedByRefs {
+  if (!body) return { numbers: [], titleRefs: [] };
+  const lines = body.split(/\r?\n/);
+  const numbers = new Set<number>();
+  const titleRefs: string[] = [];
+
+  let inSection = false;
+  for (const line of lines) {
+    const heading = line.match(/^#{1,6}\s+blocked\s+by\s*$/i);
+    if (heading) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && /^#{1,6}\s/.test(line)) inSection = false;
+
+    const inline = line.match(/^\s*(?:[-*]\s+)?\*{0,2}\s*blocked\s+by\*{0,2}\s*:?\s*(.*)$/i);
+
+    if (inSection) {
+      const text = line.replace(/^\s*[-*]\s*/, "");
+      absorb(text, numbers, titleRefs);
+    } else if (inline) {
+      const rest = inline[1] ?? "";
+      if (NONE_RE.test(rest)) continue;
+      absorb(rest, numbers, titleRefs);
+    }
+  }
+
+  return {
+    numbers: [...numbers].sort((a, b) => a - b),
+    titleRefs: dedup(titleRefs),
+  };
+}
+
+function absorb(text: string, numbers: Set<number>, titleRefs: string[]): void {
+  for (const m of text.matchAll(/#(\d+)/g)) {
+    const n = parseInt(m[1]!, 10);
+    if (Number.isFinite(n) && n > 0) numbers.add(n);
+  }
+  // Drop the #NN tokens, then split the remainder on commas / "and" — each
+  // non-empty, non-"none" piece is a title reference.
+  const deNumd = text.replace(/#\d+/g, " ");
+  for (const part of deNumd.split(/[,;]|\band\b/i)) {
+    const t = part.trim().replace(/^[-*.:]\s*/, "").replace(/[.,;:\s]+$/, "").trim();
+    if (!t || NONE_RE.test(t)) continue;
+    titleRefs.push(t);
+  }
+}
+
+function dedup(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of arr) {
+    const k = s.toLowerCase();
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/**
+ * Parse the code-review agent's verdict line.
+ *
+ * The review prompt instructs the agent to emit, as its final non-empty line:
+ *   REVIEW_VERDICT: CLEAN
+ *   REVIEW_VERDICT: ISSUES 3
+ *
+ * Anything else is treated as `unknown` so the driver escalates rather than
+ * silently auto-merging.
+ */
+export function parseReviewVerdict(output: string): ReviewVerdict {
+  const tail = (output ?? "").trim();
+  const m = tail.match(/REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/i);
+  if (!m) {
+    return { kind: "unknown", issueCount: 0, raw: tail.slice(-800) };
+  }
+  const word = m[1]!.toUpperCase();
+  if (word === "CLEAN") return { kind: "clean", issueCount: 0, raw: tail.slice(-800) };
+  const count = m[2] ? parseInt(m[2], 10) : 1;
+  return { kind: "issues", issueCount: Number.isFinite(count) ? count : 1, raw: tail.slice(-800) };
+}
