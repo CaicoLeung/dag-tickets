@@ -23,13 +23,30 @@ Provider defaults come from `~/.paseo/orchestration-preferences.json` (categorie
 
 ## Install
 
+Prebuilt binaries (no Bun or Node required at runtime) for macOS (Apple Silicon
++ Intel) and Linux (x64 + arm64) are published with each release.
+
+**Homebrew** (macOS):
+
 ```bash
-git clone <this repo> && cd dag-tickets
+brew tap CaicoLeung/tap
+brew install dag-tickets
+```
+
+**Installer script** (macOS or Linux):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CaicoLeung/dag-tickets/main/install.sh | bash
+```
+
+Installs to `~/.dag-tickets/bin` and prints the PATH line for your shell.
+
+**From source** (development):
+
+```bash
+git clone https://github.com/CaicoLeung/dag-tickets && cd dag-tickets
 bun install            # dev deps (typescript, @types/bun)
-# run in place:
 bun run bin/dag-tickets.ts --help
-# or link it:
-ln -s "$PWD/bin/dag-tickets.ts" ~/.local/bin/dag-tickets
 ```
 
 ## Usage
@@ -88,7 +105,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 ## Verify before trusting it
 
 ```bash
-bun test                 # 31 unit tests: DAG, frontier, cascade, cycles, parsing
+bun test                 # 34 unit tests: DAG, frontier, cascade, cycles, parsing, args
 bun run typecheck        # tsc --noEmit
 dag-tickets --dry-run --parent 42   # see the plan before any agent runs
 ```

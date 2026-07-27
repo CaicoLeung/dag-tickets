@@ -11,6 +11,7 @@ import {
 import { repoInfo, type MergeStrategy } from "./gitgh.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
+import pkg from "../package.json";
 
 interface ParsedArgs {
   parent?: number;
@@ -33,6 +34,7 @@ interface ParsedArgs {
   triageLabel?: string;
   researchLabel?: string;
   help: boolean;
+  version: boolean;
 }
 
 const HELP = `dag-tickets — DAG-aware batch driver for mattpocock-skills tickets.
@@ -68,12 +70,13 @@ OPTIONS
   --resume <id>           Resume a previous run; skip its merged/failed tickets.
   --dry-run               Print the per-ticket plan and dispatch nothing.
   -h, --help              Show this help.
+  -V, --version           Show the version and exit.
 
 The driver reads \`~/.paseo/orchestration-preferences.json\` for providers and
 falls back to codex/gpt-5.4 (impl) + claude/opus (review) when absent.
 `;
 
-function parseArgs(argv: string[]): ParsedArgs {
+export function parseArgs(argv: string[]): ParsedArgs {
   const a: ParsedArgs = {
     frontier: false,
     numbers: [],
@@ -85,6 +88,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     requireChecks: false,
     dryRun: false,
     help: false,
+    version: false,
   };
   const num = (v: string): number | undefined => {
     const n = parseInt(v, 10);
@@ -97,6 +101,9 @@ function parseArgs(argv: string[]): ParsedArgs {
       case "-h":
       case "--help":
         a.help = true; break;
+      case "-V":
+      case "--version":
+        a.version = true; break;
       case "--dry-run":
         a.dryRun = true; break;
       case "--frontier":
@@ -206,6 +213,10 @@ export async function main(argv: string[]): Promise<number> {
   } catch (e) {
     process.stderr.write(`${(e as Error).message}\n\n${HELP}`);
     return 2;
+  }
+  if (a.version) {
+    process.stdout.write(`dag-tickets ${pkg.version}\n`);
+    return 0;
   }
   if (a.help || argv.length === 0) {
     process.stdout.write(HELP);

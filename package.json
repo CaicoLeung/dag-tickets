@@ -4,6 +4,15 @@
   "description": "DAG-aware CLI that drives a batch of GitHub issues through implement → code-review → PR → merge, fanning independent tickets out across Paseo worktrees and serialising the rest in dependency order.",
   "type": "module",
   "license": "MIT",
+  "author": "Caico Leung",
+  "homepage": "https://github.com/CaicoLeung/dag-tickets#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CaicoLeung/dag-tickets.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CaicoLeung/dag-tickets/issues"
+  },
   "bin": {
     "dag-tickets": "./bin/dag-tickets.ts"
   },
