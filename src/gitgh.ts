@@ -35,8 +35,41 @@ export function branchFor(number: number, title: string): string {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
-      .slice(0, 40) || "ticket";
+      .slice(0, 40)
+      .replace(/^-+|-+$/g, "") || "ticket";
   return `loop/${number}-${slug}`;
+}
+
+/**
+ * Remove any linked worktree whose HEAD is on `branch`. Git forbids a branch
+ * being checked out in more than one worktree, so a leftover worktree from a
+ * prior dispatch (implement/fix) makes a later `checkout-branch` dispatch fail
+ * with "Branch already checked out". Commits live on the branch ref, so forcing
+ * removal here loses no work. The main checkout is never on a `loop/` branch.
+ */
+export async function removeWorktreeOnBranch(branch: string, cwd?: string): Promise<void> {
+  const target = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
+  const r = await run(["git", "worktree", "list", "--porcelain"], { cwd });
+  if (!r.ok) return;
+  const toRemove: string[] = [];
+  let path = "";
+  let onBranch = false;
+  const flush = () => {
+    if (path && onBranch) toRemove.push(path);
+  };
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      flush();
+      path = line.slice("worktree ".length).trim();
+      onBranch = false;
+    } else if (line.startsWith("branch ")) {
+      onBranch = line.slice("branch ".length).trim() === target;
+    }
+  }
+  flush();
+  for (const p of toRemove) {
+    await run(["git", "worktree", "remove", "--force", p], { cwd });
+  }
 }
 
 /** Create a PR for the pushed head branch. Returns the PR number. */

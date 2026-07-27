@@ -1,7 +1,7 @@
 import type { Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
 import { parseReviewVerdict } from "./parse.ts";
-import { branchFor, createPr, watchChecks, mergePr, closeIssue, type MergeStrategy } from "./gitgh.ts";
+import { branchFor, createPr, watchChecks, mergePr, closeIssue, removeWorktreeOnBranch, type MergeStrategy } from "./gitgh.ts";
 import {
   dispatch,
   implementPrompt,
@@ -83,6 +83,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   while (verdict.kind === "issues" && rounds < ctx.maxFixRounds) {
     rounds++;
     ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
+    await removeWorktreeOnBranch(branch, ctx.cwd);
     const fix = await dispatch(fixPrompt(t, verdict.raw, branch), {
       provider: ctx.prefs.impl,
       title: `fix #${t.number} r${rounds}`,
@@ -138,6 +139,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
 /** Run /code-review in a fresh worktree on the branch; retry once on an unparseable verdict. */
 async function runReview(t: Ticket, branch: string, ctx: RunContext): Promise<ReturnType<typeof parseReviewVerdict>> {
   for (let attempt = 0; attempt < 2; attempt++) {
+    await removeWorktreeOnBranch(branch, ctx.cwd);
     const r: DispatchResult = await dispatch(reviewPrompt(t, ctx.baseBranch), {
       provider: ctx.prefs.review,
       title: `review #${t.number}`,
