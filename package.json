@@ -1,16 +1,16 @@
 {
-  "name": "loop-tickets",
+  "name": "dag-tickets",
   "version": "0.1.0",
-  "description": "DAG-aware batch driver for mattpocock-skills tickets: implement -> code-review -> fix-loop -> PR -> auto-merge, fanned out across Paseo worktrees.",
+  "description": "DAG-aware CLI that drives a batch of GitHub issues through implement → code-review → PR → merge, fanning independent tickets out across Paseo worktrees and serialising the rest in dependency order.",
   "type": "module",
   "license": "MIT",
   "bin": {
-    "loop-tickets": "./bin/loop-tickets.ts"
+    "dag-tickets": "./bin/dag-tickets.ts"
   },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "loop-tickets": "bun run bin/loop-tickets.ts"
+    "dag-tickets": "bun run bin/dag-tickets.ts"
   },
   "engines": {
     "bun": ">=1.1.0"

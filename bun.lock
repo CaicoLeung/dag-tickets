@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "loop-tickets",
+      "name": "dag-tickets",
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^7.0.2",

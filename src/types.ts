@@ -1,5 +1,5 @@
 /**
- * Core domain types for loop-tickets.
+ * Core domain types for dag-tickets.
  *
  * A Ticket mirrors a GitHub issue. The driver never edits the issue body; it
  * reads `Blocked by` edges to build a dependency graph and walks the frontier

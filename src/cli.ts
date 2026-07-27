@@ -35,18 +35,18 @@ interface ParsedArgs {
   help: boolean;
 }
 
-const HELP = `loop-tickets — DAG-aware batch driver for mattpocock-skills tickets.
+const HELP = `dag-tickets — DAG-aware batch driver for mattpocock-skills tickets.
 
 Drives a batch of GitHub issues through implement -> code-review -> fix-loop ->
 PR -> auto-merge, fanning independent tickets out across Paseo worktrees and
 serialising any whose "Blocked by" edges gate them.
 
 USAGE
-  loop-tickets                       # all open \`ready-for-agent\` (the frontier)
-  loop-tickets --frontier            #   (explicit)
-  loop-tickets --label ready-for-agent
-  loop-tickets --parent 42           # sub-issues of parent #42
-  loop-tickets 12 15 23              # explicit issue numbers
+  dag-tickets                       # all open \`ready-for-agent\` (the frontier)
+  dag-tickets --frontier            #   (explicit)
+  dag-tickets --label ready-for-agent
+  dag-tickets --parent 42           # sub-issues of parent #42
+  dag-tickets 12 15 23              # explicit issue numbers
 
 OPTIONS
   --parent <n>            Process sub-issues of parent issue <n>.
@@ -271,7 +271,7 @@ export async function main(argv: string[]): Promise<number> {
   if (a.resume) {
     const loaded = await loadState(a.resume, a.cwd);
     if (!loaded) {
-      process.stderr.write(`No saved state for run "${a.resume}" at ${`.scratch/loop-tickets/${a.resume}/state.json`}\n`);
+      process.stderr.write(`No saved state for run "${a.resume}" at ${`.scratch/dag-tickets/${a.resume}/state.json`}\n`);
       return 2;
     }
     state = loaded;
@@ -328,7 +328,7 @@ export async function main(argv: string[]): Promise<number> {
   if (result.failed.length > 0) {
     log("error", `failed tickets: ${result.failed.map((n) => "#" + n).join(", ")}`);
   }
-  log("dim", `state: ${`.scratch/loop-tickets/${runId}/state.json`}`);
+  log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
   return result.failed.length > 0 ? 1 : 0;
 }
 

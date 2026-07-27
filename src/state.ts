@@ -26,7 +26,7 @@ export interface RunState {
 }
 
 export function statePath(runId: string): string {
-  return `.scratch/loop-tickets/${runId}/state.json`;
+  return `.scratch/dag-tickets/${runId}/state.json`;
 }
 
 export async function saveState(state: RunState, cwd?: string): Promise<void> {

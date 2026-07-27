@@ -1,4 +1,4 @@
-# loop-tickets
+# dag-tickets
 
 A DAG-aware batch driver for [mattpocock-skills](https://github.com/mattpocock/skills) tickets. It chews through a batch of GitHub issues — a parent issue's sub-issues, everything labelled `ready-for-agent`, or an explicit list — and drives each through the full per-ticket lifecycle you normally do by hand:
 
@@ -19,17 +19,17 @@ You already work ticket-by-ticket in Paseo: `/implement`, then a fresh session f
 - The target repo set up with mattpocock-skills: `/setup-matt-pocock-skills` run once, so issues carry the triage labels (`ready-for-agent`, etc.) and the agents have `/implement`, `/code-review`, `/tdd` available.
 - **Bun** ≥ 1.1.
 
-Provider defaults come from `~/.paseo/orchestration-preferences.json` (categories `impl`/`audit`/`research`/`planning`). If absent, loop-tickets falls back to `codex/gpt-5.4` for implement/fix and `claude/opus` for review — review deliberately uses a *different* provider so the reviewer catches the implementer's blind spots.
+Provider defaults come from `~/.paseo/orchestration-preferences.json` (categories `impl`/`audit`/`research`/`planning`). If absent, dag-tickets falls back to `codex/gpt-5.4` for implement/fix and `claude/opus` for review — review deliberately uses a *different* provider so the reviewer catches the implementer's blind spots.
 
 ## Install
 
 ```bash
-git clone <this repo> && cd loop-tickets
+git clone <this repo> && cd dag-tickets
 bun install            # dev deps (typescript, @types/bun)
 # run in place:
-bun run bin/loop-tickets.ts --help
+bun run bin/dag-tickets.ts --help
 # or link it:
-ln -s "$PWD/bin/loop-tickets.ts" ~/.local/bin/loop-tickets
+ln -s "$PWD/bin/dag-tickets.ts" ~/.local/bin/dag-tickets
 ```
 
 ## Usage
@@ -37,16 +37,16 @@ ln -s "$PWD/bin/loop-tickets.ts" ~/.local/bin/loop-tickets
 Run from inside the project repo (where `gh` + paseo resolve), or pass `--cwd`.
 
 ```bash
-loop-tickets                         # the frontier: all open ready-for-agent
-loop-tickets --frontier              #   (explicit)
-loop-tickets --parent 42             # sub-issues of parent issue #42
-loop-tickets --label ready-for-agent
-loop-tickets 12 15 23                # explicit issue numbers
+dag-tickets                         # the frontier: all open ready-for-agent
+dag-tickets --frontier              #   (explicit)
+dag-tickets --parent 42             # sub-issues of parent issue #42
+dag-tickets --label ready-for-agent
+dag-tickets 12 15 23                # explicit issue numbers
 
-loop-tickets --dry-run 12 15         # print the plan, dispatch nothing
-loop-tickets --concurrency 5 --label ready-for-agent
-loop-tickets --no-auto-merge 12 15   # stop before merge; leave PRs for you
-loop-tickets --resume <run-id>       # pick up a killed run where it left off
+dag-tickets --dry-run 12 15         # print the plan, dispatch nothing
+dag-tickets --concurrency 5 --label ready-for-agent
+dag-tickets --no-auto-merge 12 15   # stop before merge; leave PRs for you
+dag-tickets --resume <run-id>       # pick up a killed run where it left off
 ```
 
 ### Flags
@@ -82,7 +82,7 @@ loop-tickets --resume <run-id>       # pick up a killed run where it left off
 
 - **Auto-merge is gated on a clean review AND green CI.** A failing check leaves the PR open for you. `--require-checks` additionally blocks merge when a repo has no CI.
 - **A failed ticket cascades** to its not-yet-started dependents (marked failed, not retried), so a doomed branch can't hang the run. Dependents already in flight are left to settle.
-- **Resume is idempotent.** State lives at `.scratch/loop-tickets/<run-id>/state.json`. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
+- **Resume is idempotent.** State lives at `.scratch/dag-tickets/<run-id>/state.json`. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
 - The driver never edits issue bodies; it only opens PRs, merges, and closes with a linking comment.
 
 ## Verify before trusting it
@@ -90,11 +90,11 @@ loop-tickets --resume <run-id>       # pick up a killed run where it left off
 ```bash
 bun test                 # 31 unit tests: DAG, frontier, cascade, cycles, parsing
 bun run typecheck        # tsc --noEmit
-loop-tickets --dry-run --parent 42   # see the plan before any agent runs
+dag-tickets --dry-run --parent 42   # see the plan before any agent runs
 ```
 
 ## Design notes
 
 - **Hybrid driver.** The script owns the deterministic skeleton (DAG, scheduling, PR, CI, merge). Only the implement↔review iteration is delegated to agents, bounded by `--max-fix-rounds`. No LLM is spent on orchestration itself.
 - **Why no Orca orchestration.** The steps are mechanical; a deterministic CLI is debuggable, resumable, and token-free to run. Paseo worktrees give the isolation Orca would.
-- **Worktrees persist in Paseo** after each step (named `loop-<n>`), so you can inspect or kill them in the Paseo UI. The driver does not auto-archive — you stay in control of the machines.
+- **Worktrees persist in Paseo** after each step (named `dag-<n>`), so you can inspect or kill them in the Paseo UI. The driver does not auto-archive — you stay in control of the machines.
