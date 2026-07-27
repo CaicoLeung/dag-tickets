@@ -100,6 +100,13 @@ function dedup(arr: string[]): string[] {
  * ISSUES 4"); neither sits at line-start, so neither can false-match. We take
  * the LAST line-anchored match. No match at all → `unknown`, so the driver
  * escalates rather than silently auto-merging.
+ *
+ * `raw` is the review body the fixer acts on. It is the text UP TO AND
+ * INCLUDING the verdict line — i.e. the findings report — not the whole tail:
+ * the agent often emits its findings + verdict, then keeps "thinking"
+ * (vote-counting, meta-reasoning) which is useless to the fixer. Slicing the
+ * last N chars of the whole tail handed the fixer that deliberation instead of
+ * the findings, so fix rounds couldn't converge.
  */
 export function parseReviewVerdict(output: string): ReviewVerdict {
   const tail = (output ?? "").trim();
@@ -111,7 +118,9 @@ export function parseReviewVerdict(output: string): ReviewVerdict {
     return { kind: "unknown", issueCount: 0, raw: tail.slice(-800) };
   }
   const word = last[1]!.toUpperCase();
-  if (word === "CLEAN") return { kind: "clean", issueCount: 0, raw: tail.slice(-800) };
+  const findingsBody = tail.slice(0, last.index + last[0].length);
+  const raw = findingsBody.slice(-4000);
+  if (word === "CLEAN") return { kind: "clean", issueCount: 0, raw };
   const count = last[2] ? parseInt(last[2], 10) : 1;
-  return { kind: "issues", issueCount: Number.isFinite(count) ? count : 1, raw: tail.slice(-800) };
+  return { kind: "issues", issueCount: Number.isFinite(count) ? count : 1, raw };
 }
