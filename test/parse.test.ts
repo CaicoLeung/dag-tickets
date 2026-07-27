@@ -129,3 +129,22 @@ test("parseReviewVerdict: line-anchored — ignores backticked prompt examples a
   expect(v.kind).toBe("issues");
   expect(v.issueCount).toBe(3);
 });
+
+test("parseReviewVerdict: raw carries the findings body, not post-verdict deliberation", () => {
+  // The agent emits findings + verdict, then keeps "thinking" (vote-counting).
+  // The fixer needs the findings, not the deliberation tail.
+  const text = [
+    "## Standards",
+    "HARD: ADR-0029 citation wrong at study-word-tap.ts:32.",
+    "## Spec",
+    "Missing { passive: false } on the click listener (latent preventDefault no-op).",
+    "REVIEW_VERDICT: ISSUES 2",
+    "[Thought] hmm, is it 2 or 3? Let me recount. I'll go with 2. Now write report.",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("issues");
+  expect(v.issueCount).toBe(2);
+  expect(v.raw).toContain("ADR-0029");
+  expect(v.raw).toContain("passive: false");
+  expect(v.raw).not.toContain("Let me recount");
+});
