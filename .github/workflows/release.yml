@@ -85,7 +85,9 @@ jobs:
           set -eu
           DARWIN_ARM64=$(awk -v t="dag-tickets-darwin-arm64.tar.gz" '$2==t {print $1}' dist/SHA256SUMS)
           DARWIN_X64=$(awk -v t="dag-tickets-darwin-x64.tar.gz"   '$2==t {print $1}' dist/SHA256SUMS)
-          [ -n "$DARWIN_ARM64" ] && [ -n "$DARWIN_X64" ] || { echo "missing darwin checksums"; exit 1; }
+          LINUX_X64=$(awk -v t="dag-tickets-linux-x64.tar.gz"     '$2==t {print $1}' dist/SHA256SUMS)
+          LINUX_ARM64=$(awk -v t="dag-tickets-linux-arm64.tar.gz" '$2==t {print $1}' dist/SHA256SUMS)
+          [ -n "$DARWIN_ARM64" ] && [ -n "$DARWIN_X64" ] && [ -n "$LINUX_X64" ] && [ -n "$LINUX_ARM64" ] || { echo "missing release checksums"; exit 1; }
 
           git clone "https://x-access-token:${GH_TOKEN}@github.com/CaicoLeung/homebrew-tap.git" /tmp/tap
           mkdir -p /tmp/tap/Formula
@@ -105,6 +107,16 @@ jobs:
               on_intel do
                 url "https://github.com/CaicoLeung/dag-tickets/releases/download/${TAG}/dag-tickets-darwin-x64.tar.gz"
                 sha256 "${DARWIN_X64}"
+              end
+            end
+            on_linux do
+              on_arm do
+                url "https://github.com/CaicoLeung/dag-tickets/releases/download/${TAG}/dag-tickets-linux-arm64.tar.gz"
+                sha256 "${LINUX_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/CaicoLeung/dag-tickets/releases/download/${TAG}/dag-tickets-linux-x64.tar.gz"
+                sha256 "${LINUX_X64}"
               end
             end
 

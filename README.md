@@ -86,6 +86,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 | `--resume <id>` | — | resume a previous run; skip its merged/failed tickets |
 | `--dry-run` | off | print the per-ticket plan, dispatch nothing |
 | `-h, --help` | | show help |
+| `-V, --version` | | show the version and exit |
 
 ## How a ticket flows
 
