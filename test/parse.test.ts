@@ -110,3 +110,22 @@ test("parseReviewVerdict: a leaked prompt instruction does not override the real
   expect(v.kind).toBe("issues");
   expect(v.issueCount).toBe(2);
 });
+
+test("parseReviewVerdict: line-anchored — ignores backticked prompt examples and mid-sentence reasoning", () => {
+  // Mirrors real `paseo logs --filter text`: prompt bullets in backticks, the
+  // agent's verdict as a standalone line, plus reasoning quoting the token
+  // mid-sentence. Only the standalone line should match.
+  const text = [
+    "[User] You are reviewing...",
+    "## Verdict (required)",
+    "- `REVIEW_VERDICT: CLEAN`           — no actionable findings",
+    "- `REVIEW_VERDICT: ISSUES <n>`      — n actionable findings remain",
+    "## Standards",
+    "found the ADR miscite",
+    "REVIEW_VERDICT: ISSUES 3",
+    "Actually simplest: Verdict: REVIEW_VERDICT: ISSUES 3. Now write report.",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("issues");
+  expect(v.issueCount).toBe(3);
+});

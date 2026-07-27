@@ -93,15 +93,17 @@ function dedup(arr: string[]): string[] {
  *   REVIEW_VERDICT: CLEAN
  *   REVIEW_VERDICT: ISSUES 3
  *
- * We take the LAST matching line because the retrieved agent text may also
- * contain reasoning that quotes the verdict token, and (before upstream
- * [User]-stripping) the prompt itself echoes these instruction tokens. The
- * agent's own final verdict statement is the last occurrence. No match at all
- * → `unknown`, so the driver escalates rather than silently auto-merging.
+ * The regex is line-anchored (`^\\s*REVIEW_VERDICT:`) so it matches ONLY the
+ * agent's standalone verdict line. The review prompt echoes the tokens inside
+ * backticked list items (`` - `REVIEW_VERDICT: CLEAN` ``) and the agent's own
+ * reasoning often quotes the token mid-sentence ("I'll emit REVIEW_VERDICT:
+ * ISSUES 4"); neither sits at line-start, so neither can false-match. We take
+ * the LAST line-anchored match. No match at all → `unknown`, so the driver
+ * escalates rather than silently auto-merging.
  */
 export function parseReviewVerdict(output: string): ReviewVerdict {
   const tail = (output ?? "").trim();
-  const re = /REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/gi;
+  const re = /^\s*REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/gim;
   let m: RegExpExecArray | null;
   let last: RegExpExecArray | null = null;
   while ((m = re.exec(tail)) !== null) last = m;
