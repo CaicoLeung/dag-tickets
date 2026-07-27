@@ -71,6 +71,15 @@ export interface DispatchResult {
   ok: boolean;
   output: string;
   timedOut: boolean;
+  /** True when the agent output indicates provider rate-limiting / quota exhaustion. */
+  rateLimited: boolean;
+}
+
+const RATE_LIMIT_RE = /\b429\b|usage limit reached|rate[ -]?limit|quota|too many requests/i;
+
+/** Detect provider rate-limiting / quota exhaustion in agent output. */
+export function isRateLimited(output: string): boolean {
+  return RATE_LIMIT_RE.test(output);
 }
 
 /**
@@ -136,11 +145,36 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
       /* non-JSON stdout (older paseo) → keep the status envelope as output */
     }
   }
+  const rateLimited = isRateLimited(output);
   return {
     ok: r.ok && (status === "completed" || status === "idle"),
     output,
     timedOut: r.timedOut,
+    rateLimited,
   };
+}
+
+/**
+ * Dispatch with provider fallback. If the primary provider is rate-limited,
+ * retry each fallback in order. `onSwitch` runs before each retry so the caller
+ * can reset worktree/branch state (branch-off retries need a clean branch).
+ * A result that is still rate-limited after exhausting fallbacks is marked !ok.
+ */
+export async function dispatchWithFallback(
+  prompt: string,
+  opts: DispatchOpts,
+  fallbacks: string[],
+  onSwitch?: (nextProvider: string) => Promise<void>,
+): Promise<DispatchResult> {
+  let result = await dispatch(prompt, opts);
+  for (const fb of fallbacks) {
+    if (!result.rateLimited) break;
+    if (fb === opts.provider) continue;
+    if (onSwitch) await onSwitch(fb);
+    result = await dispatch(prompt, { ...opts, provider: fb });
+  }
+  if (result.rateLimited) result.ok = false;
+  return result;
 }
 
 // ---------------------------------------------------------------------------

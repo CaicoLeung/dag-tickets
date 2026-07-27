@@ -1,9 +1,10 @@
 import type { Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
 import { parseReviewVerdict } from "./parse.ts";
-import { branchFor, createPr, watchChecks, mergePr, closeIssue, removeWorktreeOnBranch, type MergeStrategy } from "./gitgh.ts";
+import { branchFor, commitCount, deleteBranch, createPr, watchChecks, mergePr, closeIssue, removeWorktreeOnBranch, type MergeStrategy } from "./gitgh.ts";
 import {
   dispatch,
+  dispatchWithFallback,
   implementPrompt,
   reviewPrompt,
   fixPrompt,
@@ -26,6 +27,8 @@ export interface RunContext {
   requireChecks: boolean;
   dryRun: boolean;
   runTimeoutMs?: number;
+  /** Provider fallback chain tried (in order) when the primary is rate-limited. */
+  fallbackProviders: string[];
   log: Logger;
 }
 
@@ -62,20 +65,35 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   ctx.log("info", `implement on branch ${branch}`, t.number);
 
   // 1. Implement (fresh worktree, branch-off from the default branch).
-  const impl = await dispatch(implementPrompt(t, branch), {
-    provider: ctx.prefs.impl,
-    title: `implement #${t.number}`,
-    slug: SLUG(t.number),
-    cwd: ctx.cwd,
-    timeoutMs: ctx.runTimeoutMs,
-    branchMode: "branch-off",
-    newBranch: branch,
-    base: ctx.baseBranch,
-  });
+  // A rate-limited or otherwise-empty agent still "completes" with no diff, so
+  // we verify real commits landed before proceeding to review.
+  const impl = await dispatchWithFallback(
+    implementPrompt(t, branch),
+    {
+      provider: ctx.prefs.impl,
+      title: `implement #${t.number}`,
+      slug: SLUG(t.number),
+      cwd: ctx.cwd,
+      timeoutMs: ctx.runTimeoutMs,
+      branchMode: "branch-off",
+      newBranch: branch,
+      base: ctx.baseBranch,
+    },
+    ctx.fallbackProviders,
+    async (next) => {
+      ctx.log("warn", `implement rate-limited; retrying on ${next}`, t.number);
+      await removeWorktreeOnBranch(branch, ctx.cwd);
+      await deleteBranch(branch, ctx.cwd);
+    },
+  );
   if (!impl.ok) {
-    return fail(t, ctx, `implement agent failed${impl.timedOut ? " (timeout)" : ""}`, branch);
+    return fail(t, ctx, `implement agent failed${impl.timedOut ? " (timeout)" : ""}${impl.rateLimited ? " (rate-limited, no fallback succeeded)" : ""}`, branch);
   }
-  ctx.log("ok", "implement complete; running review", t.number);
+  const commits = await commitCount(ctx.baseBranch, branch, ctx.cwd);
+  if (commits === 0) {
+    return fail(t, ctx, `implement produced no commits (agent may have failed silently)`, branch);
+  }
+  ctx.log("ok", `implement complete (${commits} commit${commits === 1 ? "" : "s"}); running review`, t.number);
 
   // 2. Review + bounded fix-loop.
   let rounds = 0;
@@ -84,15 +102,23 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     rounds++;
     ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
     await removeWorktreeOnBranch(branch, ctx.cwd);
-    const fix = await dispatch(fixPrompt(t, verdict.raw, branch), {
-      provider: ctx.prefs.impl,
-      title: `fix #${t.number} r${rounds}`,
-      slug: SLUG(t.number),
-      cwd: ctx.cwd,
-      timeoutMs: ctx.runTimeoutMs,
-      branchMode: "checkout-branch",
-      branch,
-    });
+    const fix = await dispatchWithFallback(
+      fixPrompt(t, verdict.raw, branch),
+      {
+        provider: ctx.prefs.impl,
+        title: `fix #${t.number} r${rounds}`,
+        slug: SLUG(t.number),
+        cwd: ctx.cwd,
+        timeoutMs: ctx.runTimeoutMs,
+        branchMode: "checkout-branch",
+        branch,
+      },
+      ctx.fallbackProviders,
+      async (next) => {
+        ctx.log("warn", `fix rate-limited; retrying on ${next}`, t.number);
+        await removeWorktreeOnBranch(branch, ctx.cwd);
+      },
+    );
     if (!fix.ok) return fail(t, ctx, `fix round ${rounds} failed`, branch);
     verdict = await runReview(t, branch, ctx);
   }
@@ -140,15 +166,23 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
 async function runReview(t: Ticket, branch: string, ctx: RunContext): Promise<ReturnType<typeof parseReviewVerdict>> {
   for (let attempt = 0; attempt < 2; attempt++) {
     await removeWorktreeOnBranch(branch, ctx.cwd);
-    const r: DispatchResult = await dispatch(reviewPrompt(t, ctx.baseBranch), {
-      provider: ctx.prefs.review,
-      title: `review #${t.number}`,
-      slug: `${SLUG(t.number)}-review`,
-      cwd: ctx.cwd,
-      timeoutMs: ctx.runTimeoutMs,
-      branchMode: "checkout-branch",
-      branch,
-    });
+    const r: DispatchResult = await dispatchWithFallback(
+      reviewPrompt(t, ctx.baseBranch),
+      {
+        provider: ctx.prefs.review,
+        title: `review #${t.number}`,
+        slug: `${SLUG(t.number)}-review`,
+        cwd: ctx.cwd,
+        timeoutMs: ctx.runTimeoutMs,
+        branchMode: "checkout-branch",
+        branch,
+      },
+      ctx.fallbackProviders,
+      async (next) => {
+        ctx.log("warn", `review rate-limited; retrying on ${next}`, t.number);
+        await removeWorktreeOnBranch(branch, ctx.cwd);
+      },
+    );
     if (!r.ok) {
       ctx.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
       return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };

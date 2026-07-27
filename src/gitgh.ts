@@ -72,6 +72,18 @@ export async function removeWorktreeOnBranch(branch: string, cwd?: string): Prom
   }
 }
 
+/** Count commits on `branch` not reachable from `base` (0 on error / no diff). */
+export async function commitCount(base: string, branch: string, cwd?: string): Promise<number> {
+  const r = await run(["git", "rev-list", "--count", `${base}..${branch}`], { cwd });
+  if (!r.ok) return 0;
+  return parseInt(r.stdout.trim(), 10) || 0;
+}
+
+/** Force-delete a local branch (used to reset a failed branch-off before retry). */
+export async function deleteBranch(branch: string, cwd?: string): Promise<void> {
+  await run(["git", "branch", "-D", branch], { cwd });
+}
+
 /** Create a PR for the pushed head branch. Returns the PR number. */
 export async function createPr(opts: {
   title: string;

@@ -26,6 +26,7 @@ interface ParsedArgs {
   requireChecks: boolean;
   dryRun: boolean;
   provider?: string;
+  fallbackProviders: string[];
   reviewProvider?: string;
   cwd?: string;
   runId?: string;
@@ -62,6 +63,7 @@ OPTIONS
   --require-checks        A PR with no CI does NOT satisfy the merge gate.
   --provider <p>          Override the implement/fix provider.
   --review-provider <p>   Override the review provider.
+  --fallback-provider <p> Provider tried when the primary is rate-limited (repeat / comma-sep).
   --impl-label <l>        Override the implement-routing label.
   --triage-label <l>      Override the triage-routing label.
   --research-label <l>    Override the research-routing label.
@@ -87,6 +89,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     mergeStrategy: "squash",
     requireChecks: false,
     dryRun: false,
+    fallbackProviders: [],
     help: false,
     version: false,
   };
@@ -131,6 +134,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.provider = next(); break;
       case "--review-provider":
         a.reviewProvider = next(); break;
+      case "--fallback-provider":
+        a.fallbackProviders.push(...(next()?.split(",").map((s) => s.trim()).filter(Boolean) ?? [])); break;
       case "--impl-label":
         a.implLabel = next(); break;
       case "--triage-label":
@@ -313,6 +318,7 @@ export async function main(argv: string[]): Promise<number> {
     autoMerge: a.noAutoMerge ? false : a.autoMerge ? true : true,
     requireChecks: a.requireChecks,
     dryRun: a.dryRun,
+    fallbackProviders: a.fallbackProviders,
     log,
   };
 
