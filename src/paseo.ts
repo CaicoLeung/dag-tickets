@@ -74,15 +74,22 @@ export interface DispatchResult {
 }
 
 /**
- * Run one Paseo agent in a fresh worktree. `paseo run --new-workspace worktree`
- * creates the worktree + agent and blocks until the agent finishes; its stdout
- * is the agent's final answer (used for verdict parsing on review).
+ * Run one Paseo agent in a fresh worktree. `paseo run --json --new-workspace
+ * worktree` creates the worktree + agent and blocks until the agent finishes.
+ *
+ * `paseo run`'s stdout is NOT the agent's answer — it's a status envelope
+ * (`{agentId, status, provider, cwd, title}`). The agent's actual answer text
+ * lives in `paseo logs <agentId>`. We fetch it with `--filter text` and strip
+ * `[User]` lines so the prompt (which echoes the literal `REVIEW_VERDICT:`
+ * instruction tokens) cannot false-match the verdict parser; the parser also
+ * takes the LAST verdict match as a second line of defence.
  */
 export async function dispatch(prompt: string, opts: DispatchOpts): Promise<DispatchResult> {
   const waitMs = opts.timeoutMs ?? DEFAULT_RUN_MS;
   const args = [
     "paseo",
     "run",
+    "--json",
     "--provider",
     opts.provider,
     "--title",
@@ -106,7 +113,34 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   args.push(prompt);
 
   const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + 60_000 });
-  return { ok: r.ok, output: r.stdout, timedOut: r.timedOut };
+  let status = r.ok ? "completed" : "failed";
+  let output = r.stdout;
+  if (r.ok) {
+    try {
+      const j = JSON.parse(r.stdout) as { agentId?: string; status?: string };
+      if (typeof j.status === "string") status = j.status;
+      const agentId = j.agentId;
+      if (agentId) {
+        const lr = await run(["paseo", "logs", agentId, "--filter", "text"], {
+          cwd: opts.cwd,
+          timeoutMs: 60_000,
+        });
+        if (lr.ok) {
+          output = lr.stdout
+            .split(/\r?\n/)
+            .filter((line) => !/^\[User\]/.test(line))
+            .join("\n");
+        }
+      }
+    } catch {
+      /* non-JSON stdout (older paseo) → keep the status envelope as output */
+    }
+  }
+  return {
+    ok: r.ok && (status === "completed" || status === "idle"),
+    output,
+    timedOut: r.timedOut,
+  };
 }
 
 // ---------------------------------------------------------------------------

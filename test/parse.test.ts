@@ -84,3 +84,29 @@ test("parseReviewVerdict: missing verdict is unknown (never auto-merge)", () => 
   const v = parseReviewVerdict("the agent just rambled with no verdict line");
   expect(v.kind).toBe("unknown");
 });
+
+test("parseReviewVerdict: last verdict wins when reasoning quotes the token", () => {
+  const text = [
+    "I'll emit REVIEW_VERDICT: ISSUES 4.",
+    "",
+    "## Standards",
+    "found stuff",
+    "REVIEW_VERDICT: ISSUES 4",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("issues");
+  expect(v.issueCount).toBe(4);
+});
+
+test("parseReviewVerdict: a leaked prompt instruction does not override the real verdict", () => {
+  // Simulates [User]-stripping having missed a prompt line: the prompt's CLEAN
+  // instruction appears first, but the agent's own ISSUES verdict is last.
+  const text = [
+    "Emit one of: REVIEW_VERDICT: CLEAN  or  REVIEW_VERDICT: ISSUES <n>",
+    "the agent did the review",
+    "REVIEW_VERDICT: ISSUES 2",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("issues");
+  expect(v.issueCount).toBe(2);
+});

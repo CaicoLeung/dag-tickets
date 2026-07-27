@@ -93,17 +93,23 @@ function dedup(arr: string[]): string[] {
  *   REVIEW_VERDICT: CLEAN
  *   REVIEW_VERDICT: ISSUES 3
  *
- * Anything else is treated as `unknown` so the driver escalates rather than
- * silently auto-merging.
+ * We take the LAST matching line because the retrieved agent text may also
+ * contain reasoning that quotes the verdict token, and (before upstream
+ * [User]-stripping) the prompt itself echoes these instruction tokens. The
+ * agent's own final verdict statement is the last occurrence. No match at all
+ * → `unknown`, so the driver escalates rather than silently auto-merging.
  */
 export function parseReviewVerdict(output: string): ReviewVerdict {
   const tail = (output ?? "").trim();
-  const m = tail.match(/REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/i);
-  if (!m) {
+  const re = /REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/gi;
+  let m: RegExpExecArray | null;
+  let last: RegExpExecArray | null = null;
+  while ((m = re.exec(tail)) !== null) last = m;
+  if (!last) {
     return { kind: "unknown", issueCount: 0, raw: tail.slice(-800) };
   }
-  const word = m[1]!.toUpperCase();
+  const word = last[1]!.toUpperCase();
   if (word === "CLEAN") return { kind: "clean", issueCount: 0, raw: tail.slice(-800) };
-  const count = m[2] ? parseInt(m[2], 10) : 1;
+  const count = last[2] ? parseInt(last[2], 10) : 1;
   return { kind: "issues", issueCount: Number.isFinite(count) ? count : 1, raw: tail.slice(-800) };
 }
