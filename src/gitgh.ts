@@ -84,7 +84,8 @@ export async function deleteBranch(branch: string, cwd?: string): Promise<void> 
   await run(["git", "branch", "-D", branch], { cwd });
 }
 
-/** Create a PR for the pushed head branch. Returns the PR number. */
+/** Push the head branch and open a PR for it. Returns the PR number.
+ *  Force-pushes so a stale remote branch from a prior batch is overwritten. */
 export async function createPr(opts: {
   title: string;
   body: string;
@@ -93,6 +94,7 @@ export async function createPr(opts: {
   cwd?: string;
   draft?: boolean;
 }): Promise<number> {
+  await run(["git", "push", "-u", "--force", "origin", `${opts.head}:${opts.head}`], { cwd: opts.cwd });
   const args = [
     "gh",
     "pr",
@@ -105,12 +107,13 @@ export async function createPr(opts: {
     opts.head,
     "--base",
     opts.base,
-    "--json",
-    "number",
   ];
   if (opts.draft) args.push("--draft");
   const r = await mustRun(args, { cwd: opts.cwd });
-  return JSON.parse(r.stdout).number as number;
+  // gh pr create prints the PR URL on success; older gh lacks --json on create.
+  const m = r.stdout.match(/\/pull\/(\d+)/) ?? r.stderr.match(/\/pull\/(\d+)/);
+  if (!m) throw new Error(`could not parse PR number from gh output: ${r.stdout}\n${r.stderr}`);
+  return parseInt(m[1]!, 10);
 }
 
 export interface CheckResult {
