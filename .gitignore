@@ -2,3 +2,5 @@ node_modules/
 .scratch/
 *.log
 .DS_Store
+dag-tickets
+dist/
