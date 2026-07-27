@@ -148,3 +148,38 @@ test("parseReviewVerdict: raw carries the findings body, not post-verdict delibe
   expect(v.raw).toContain("passive: false");
   expect(v.raw).not.toContain("Let me recount");
 });
+
+test("parseReviewVerdict: tier-2 catches verdict embedded in closing prose (real field case)", () => {
+  // The agent ended mid-deliberation — the verdict token sits in its final
+  // sentence, not on a standalone line. This is the exact output from the
+  // fix-round review that returned 'unknown' before the tail-search fallback.
+  const text = [
+    "## Standards",
+    "resolveStudyWordTap speculative export — candidate to cut.",
+    "## Spec",
+    "Spec axis clean.",
+    "Final verdict line must be exactly one of the two formats. REVIEW_VERDICT: ISSUES 1.",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("issues");
+  expect(v.issueCount).toBe(1);
+});
+
+test("parseReviewVerdict: tier-2 catches verdict in markdown bold", () => {
+  const v = parseReviewVerdict("Report done.\n**REVIEW_VERDICT: CLEAN**");
+  expect(v.kind).toBe("clean");
+});
+
+test("parseReviewVerdict: tier-2 window excludes the [User] prompt", () => {
+  // The prompt's REVIEW_VERDICT instructions sit at the top. When the agent's
+  // own closing output has no verdict, tier-2 must NOT fall back to the prompt.
+  const longFiller = "x".repeat(2500);
+  const text = [
+    "[User] You are reviewing...",
+    "- `REVIEW_VERDICT: CLEAN` — no findings",
+    longFiller,
+    "The agent reviewed but forgot to emit a verdict line.",
+  ].join("\n");
+  const v = parseReviewVerdict(text);
+  expect(v.kind).toBe("unknown");
+});

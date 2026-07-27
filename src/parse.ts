@@ -110,17 +110,45 @@ function dedup(arr: string[]): string[] {
  */
 export function parseReviewVerdict(output: string): ReviewVerdict {
   const tail = (output ?? "").trim();
+
+  // A matched verdict: the word (CLEAN/ISSUES), optional count, and the end
+  // index of the match in `tail` (for slicing the findings body the fixer reads).
+  let word: string | null = null;
+  let count: string | undefined;
+  let endIndex = 0;
+
+  // Tier 1: line-anchored match — the agent's standalone verdict line. Take the
+  // LAST (the agent sometimes deliberates mid-output before the final).
   const re = /^\s*REVIEW_VERDICT:\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/gim;
   let m: RegExpExecArray | null;
-  let last: RegExpExecArray | null = null;
-  while ((m = re.exec(tail)) !== null) last = m;
-  if (!last) {
+  while ((m = re.exec(tail)) !== null) {
+    word = m[1]!;
+    count = m[2];
+    endIndex = m.index + m[0].length;
+  }
+
+  // Tier 2: the agent often ends mid-deliberation, embedding the verdict token
+  // in its closing prose ("...formats. REVIEW_VERDICT: ISSUES 1.") instead of a
+  // standalone line. Search only the last 2KB — the agent's closing output. The
+  // [User] prompt (which echoes REVIEW_VERDICT in backticked instructions) sits
+  // at the top of the log and is excluded by this window.
+  if (!word) {
+    const win = tail.slice(-2000);
+    const offset = tail.length - win.length;
+    const re2 = /REVIEW_VERDICT[:]?\s*[`*]*\s*(CLEAN|ISSUES)\b(?:\s+(\d+))?/gi;
+    while ((m = re2.exec(win)) !== null) {
+      word = m[1]!;
+      count = m[2];
+      endIndex = m.index + m[0].length + offset;
+    }
+  }
+
+  if (!word) {
     return { kind: "unknown", issueCount: 0, raw: tail.slice(-800) };
   }
-  const word = last[1]!.toUpperCase();
-  const findingsBody = tail.slice(0, last.index + last[0].length);
-  const raw = findingsBody.slice(-4000);
-  if (word === "CLEAN") return { kind: "clean", issueCount: 0, raw };
-  const count = last[2] ? parseInt(last[2], 10) : 1;
-  return { kind: "issues", issueCount: Number.isFinite(count) ? count : 1, raw };
+  const w = word.toUpperCase();
+  const raw = tail.slice(0, endIndex).slice(-4000);
+  if (w === "CLEAN") return { kind: "clean", issueCount: 0, raw };
+  const n = count ? parseInt(count, 10) : 1;
+  return { kind: "issues", issueCount: Number.isFinite(n) ? n : 1, raw };
 }

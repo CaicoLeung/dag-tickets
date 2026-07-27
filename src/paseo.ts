@@ -227,9 +227,11 @@ Fixed point for the diff: \`origin/${baseRef}\` (the repo's default branch).
 Run /code-review with that fixed point. Report findings under the Standards and Spec axes exactly as the skill prescribes.
 
 ## Verdict (required)
-As your FINAL non-empty line, emit exactly one of:
-- \`REVIEW_VERDICT: CLEAN\`           — no actionable findings
-- \`REVIEW_VERDICT: ISSUES <n>\`      — n actionable findings remain
+After your full report, your VERY LAST line must be EXACTLY one of these (copy verbatim, on its own line, nothing after it):
+REVIEW_VERDICT: CLEAN
+REVIEW_VERDICT: ISSUES 3
+
+Replace 3 with the actual count of actionable findings. Do not embed the verdict inside a sentence or wrap it in markdown — it must be a standalone line so the orchestrator can parse it.
 
 Do not modify any code. Do not commit or push.`;
 }
