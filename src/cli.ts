@@ -10,7 +10,7 @@ import {
 } from "./discover.ts";
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
-import type { Ticket, TicketStatus } from "./types.ts";
+import type { SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog } from "./events.ts";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
@@ -214,13 +214,17 @@ function makeLogger(dryRun: boolean): Logger {
   };
 }
 
-function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: number; rounds?: number; error?: string }): TicketState {
+function stateFromOutcome(
+  status: TicketStatus,
+  o?: { branch?: string; pr?: number; rounds?: number; error?: string; skipReason?: SettleReason },
+): TicketState {
   return {
     status,
     branch: o?.branch,
     pr: o?.pr,
     rounds: o?.rounds,
     error: o?.error,
+    skipReason: o?.skipReason,
   };
 }
 
@@ -421,9 +425,10 @@ export async function main(argv: string[]): Promise<number> {
         if (t) await agent.abort(t);
       },
       onSettle: async (n, status, reason) => {
-        // `reason` (set on a cascade-abort) is persisted as `error` so a resumed
-        // run can distinguish a killed dependent from an unknown-kind skip.
-        state.tickets[n] = stateFromOutcome(status, { ...state.tickets[n], ...(reason ? { error: reason } : {}) });
+        // A cascade-abort `reason` is persisted on its own field (not overloaded
+        // onto `error`) so a resumed run distinguishes a killed dependent from a
+        // genuine error or an unknown-kind skip without scraping `error`.
+        state.tickets[n] = stateFromOutcome(status, { ...state.tickets[n], ...(reason ? { skipReason: reason } : {}) });
         if (!a.dryRun) await saveState(state, a.cwd);
       },
     });

@@ -1,8 +1,9 @@
 import { test, expect, describe } from "bun:test";
-import { runBatch, planCascade } from "../src/scheduler.ts";
+import { runBatch, planCascade, applyCascadePlan } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
 import { fanInHeavyGraph } from "./helpers.ts";
 import type { Ticket, TicketStatus } from "../src/types.ts";
+import type { CascadeAction } from "../src/scheduler.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 
 function ticket(n: number, blockedBy: number[] = []): Ticket {
@@ -554,5 +555,121 @@ describe("runBatch — in-flight abort wiring (#20)", () => {
     const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
     const out = await runBatch(g, { concurrency: 3, process: makeFake({ 1: "failed" }).process });
     expect(out.failed).toEqual([1, 2, 3]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyCascadePlan — the applier side of the cascade. planCascade (the pure
+// decision) is covered above; these tests prove the SIDE-EFFECT machinery that
+// runBatch's strict frontier can't reach today: an abort action removes the
+// dependent from the in-flight race (the no-double-report guard), records it
+// cascade-skipped with a typed reason, fires the kill, and emits the close
+// events. This is the seam #29 (frontier relaxation) makes reachable in prod.
+// ---------------------------------------------------------------------------
+
+describe("applyCascadePlan — abort side-effect machinery (#20)", () => {
+  test("an abort action deletes the dependent from the race, records cascade-skipped, and fires the kill", () => {
+    // Dep 2 is in-flight, doomed by failed blocker 1. The plan says abort 2.
+    const plan: CascadeAction[] = [
+      { dep: 2, kind: "abort", status: "skipped", from: [1] },
+    ];
+    const sets = {
+      completed: new Set<number>(),
+      failed: new Set<number>([1]),
+      skipped: new Set<number>(),
+    };
+    // 2 is in the in-flight race map — the precondition #29 will make live.
+    const inflight = new Map<number, unknown>([[2, Promise.resolve({ number: 2, status: "done" })]]);
+    const startedAt = new Map<number, number>([[2, Date.now() - 50]]);
+    const settled: Array<{ n: number; status: TicketStatus; reason?: string }> = [];
+    const aborted: number[] = [];
+    const sink = new RecordingSink();
+
+    applyCascadePlan(plan, sets, inflight, startedAt, {
+      onSettle: (n, status, reason) => settled.push({ n, status, reason }),
+      abort: async (n) => {
+        aborted.push(n);
+      },
+      events: sink,
+    });
+
+    // no-double-report: 2 is gone from the race map → its orphaned promise
+    // (still pending above) can never win a later Promise.race / re-settle.
+    expect(inflight.has(2)).toBe(false);
+    // recorded cascade-skipped synchronously, before the kill is awaited
+    expect([...sets.skipped]).toEqual([2]);
+    expect(settled).toEqual([{ n: 2, status: "skipped", reason: "cascade-abort" }]);
+    // the dispatch kill was fired
+    expect(aborted).toEqual([2]);
+    // events: cascade + end both stamped cascade-abort; end carries durationMs
+    const cascade = sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE);
+    expect(cascade?.data).toMatchObject({ status: "skipped", from: [1], reason: "cascade-abort" });
+    const end = sink.of(2).find((e) => e.type === EVT.TICKET_END);
+    expect(end?.data).toMatchObject({ status: "skipped", reason: "cascade-abort" });
+    expect(typeof end?.data?.durationMs).toBe("number");
+    // startedAt entry closed + removed (no dangling lifecycle pair)
+    expect(startedAt.has(2)).toBe(false);
+  });
+
+  test("an abort action for a dependent no longer in-flight is a no-op (lost race)", () => {
+    // 2 already settled naturally and left the race before the cascade ran —
+    // the applier must not re-record it or fire a redundant kill.
+    const plan: CascadeAction[] = [{ dep: 2, kind: "abort", status: "skipped", from: [1] }];
+    const sets = { completed: new Set<number>(), failed: new Set<number>([1]), skipped: new Set<number>() };
+    const inflight = new Map<number, unknown>(); // 2 already gone
+    let settled = false;
+    let aborted = false;
+    applyCascadePlan(plan, sets, inflight, new Map(), {
+      onSettle: () => {
+        settled = true;
+      },
+      abort: async () => {
+        aborted = true;
+      },
+      events: new RecordingSink(),
+    });
+    expect(settled).toBe(false);
+    expect(aborted).toBe(false);
+    expect(sets.skipped.has(2)).toBe(false);
+  });
+
+  test("an abort action with no kill hook leaves the dependent in flight (pre-#20 behaviour)", () => {
+    // No abort wired: the applier must not touch the race map or record a
+    // status — the dependent settles naturally via its own promise.
+    const plan: CascadeAction[] = [{ dep: 2, kind: "abort", status: "skipped", from: [1] }];
+    const sets = { completed: new Set<number>(), failed: new Set<number>([1]), skipped: new Set<number>() };
+    const inflight = new Map<number, unknown>([[2, Promise.resolve()]]);
+    let settled = false;
+    applyCascadePlan(plan, sets, inflight, new Map(), {
+      onSettle: () => {
+        settled = true;
+      },
+      events: new RecordingSink(),
+    });
+    expect(inflight.has(2)).toBe(true); // untouched
+    expect(settled).toBe(false);
+    expect(sets.skipped.has(2)).toBe(false);
+  });
+
+  test("a mark action records the blocker's status with no reason and never fires the kill", () => {
+    const plan: CascadeAction[] = [{ dep: 2, kind: "mark", status: "failed", from: [1] }];
+    const sets = { completed: new Set<number>(), failed: new Set<number>([1]), skipped: new Set<number>() };
+    const settled: Array<{ n: number; status: TicketStatus; reason?: string }> = [];
+    let aborted = false;
+    const sink = new RecordingSink();
+    applyCascadePlan(plan, sets, new Map(), new Map(), {
+      onSettle: (n, status, reason) => settled.push({ n, status, reason }),
+      abort: async () => {
+        aborted = true;
+      },
+      events: sink,
+    });
+    expect([...sets.failed]).toEqual([1, 2]);
+    expect(settled).toEqual([{ n: 2, status: "failed" }]); // no reason on a natural cascade
+    expect(aborted).toBe(false);
+    expect(sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE)?.data).toMatchObject({
+      status: "failed",
+      from: [1],
+    });
   });
 });

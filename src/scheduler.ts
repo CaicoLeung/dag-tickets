@@ -1,6 +1,6 @@
 import type { Graph } from "./graph.ts";
 import { frontier, cascadeDependents } from "./graph.ts";
-import type { TicketStatus } from "./types.ts";
+import type { SettleReason, TicketStatus } from "./types.ts";
 import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -14,6 +14,15 @@ export interface BatchResult {
 
 /** Terminal status a cascade propagates from a settled blocker. */
 export type CascadeStatus = "failed" | "skipped";
+
+/** Terminal ticket sets — shared shape between {@link planCascade},
+ *  {@link applyCascadePlan} and {@link runBatch}'s closed-over state, so the
+ *  three never drift on the `completed/failed/skipped` triple. */
+export interface TerminalSets {
+  completed: Set<number>;
+  failed: Set<number>;
+  skipped: Set<number>;
+}
 
 /**
  * One cascade decision for a doomed dependent, produced by {@link planCascade}
@@ -56,10 +65,7 @@ export function planCascade(
   graph: Graph,
   seed: Set<number>,
   status: CascadeStatus,
-  ctx: {
-    completed: Set<number>;
-    failed: Set<number>;
-    skipped: Set<number>;
+  ctx: TerminalSets & {
     /** Tickets with a live dispatch promise — candidates for abort. */
     inflight: Set<number>;
   },
@@ -91,6 +97,85 @@ export function planCascade(
     }
   }
   return out;
+}
+
+/**
+ * The single source of the cascade-abort marker. Emitted on `onSettle`'s
+ * `reason`, persisted on `TicketState.skipReason`, and stamped into the
+ * `TICKET_CASCADE` / `TICKET_END` event data. Typed as {@link SettleReason}
+ * here so the vocabulary is pinned at every site that consumes it.
+ */
+const CASCADE_ABORT: SettleReason = "cascade-abort";
+
+/** Side-effect channels {@link applyCascadePlan} fires as it applies a plan. */
+export interface CascadeHooks {
+  onSettle?: (number: number, status: TicketStatus, reason?: SettleReason) => void;
+  abort?: (number: number) => Promise<void>;
+  events: EventSink;
+}
+
+/**
+ * Apply a cascade {@link planCascade|plan}: MARK not-yet-started dependents
+ * terminal (existing first-wins behaviour) and ABORT in-flight ones (#20).
+ *
+ * Exported (not a runBatch-internal closure) so the no-double-report machinery
+ * is unit-testable directly: under the scheduler's strict frontier a doomed
+ * dependent can never be genuinely in-flight, so {@link runBatch}'s own flow
+ * never reaches the abort branch — its correctness is proven here, and it goes
+ * live in prod once the frontier lets dependents overlap in-flight blockers
+ * (#29). The settle (status mutation + onSettle) is recorded synchronously
+ * BEFORE the dispatch kill is fired, so a run killed mid-cascade still persists
+ * the doomed branch. The kill is fire-and-forget: its promise resolves into the
+ * void because the record is already deleted from `inflight` (the delete IS the
+ * no-double-report guard — the orphaned promise can't win a later race).
+ *
+ * @param plan from {@link planCascade}; applied in order so a transitive
+ *   dependent's `from` (computed in the planner's local mirror) stays consistent.
+ * @param sets mutable terminal sets; failed/skipped gain the doomed dependents.
+ * @param inflight mutable in-flight map; aborted dependents are deleted (race guard).
+ * @param startedAt mutable launch timestamps; aborted dependents' entries closed + removed.
+ * @param hooks side-effect channels.
+ */
+export function applyCascadePlan(
+  plan: CascadeAction[],
+  sets: TerminalSets,
+  inflight: Map<number, unknown>,
+  startedAt: Map<number, number>,
+  hooks: CascadeHooks,
+): void {
+  for (const a of plan) {
+    if (a.kind === "abort") {
+      // No kill hook (focused scheduler tests): leave the dependent in flight
+      // to settle on its own — the pre-#20 behaviour.
+      if (!hooks.abort) continue;
+      if (!inflight.has(a.dep)) continue; // lost the race / already removed
+      // Free the slot + exclude from the race set so the killed dispatch can't
+      // double-settle. THIS delete is the #20 no-double-report guard.
+      inflight.delete(a.dep);
+      sets.skipped.add(a.dep);
+      hooks.onSettle?.(a.dep, "skipped", CASCADE_ABORT);
+      hooks.events.emit(EVT.TICKET_CASCADE, a.dep, {
+        status: "skipped",
+        from: a.from,
+        reason: CASCADE_ABORT,
+      });
+      const started = startedAt.get(a.dep);
+      hooks.events.emit(EVT.TICKET_END, a.dep, {
+        status: "skipped",
+        reason: CASCADE_ABORT,
+        ...(started !== undefined ? { durationMs: Date.now() - started } : {}),
+      });
+      startedAt.delete(a.dep);
+      // Kill without awaiting: the settle is already persisted, so a killed run
+      // records it even if the kill is still in flight. Errors swallowed.
+      void Promise.resolve(hooks.abort(a.dep)).catch(() => {});
+    } else {
+      const acc = a.status === "failed" ? sets.failed : sets.skipped;
+      acc.add(a.dep);
+      hooks.onSettle?.(a.dep, a.status);
+      hooks.events.emit(EVT.TICKET_CASCADE, a.dep, { status: a.status, from: a.from });
+    }
+  }
 }
 
 /**
@@ -129,10 +214,11 @@ export async function runBatch(
     /** Pre-seeded from resumed state (skipped up-front, e.g. unknown kind). */
     seedSkipped?: Iterable<number>;
     /** Called as each ticket settles, for logging/state persistence. The
-     *  optional `reason` carries a marker for non-natural settles — currently
-     *  `"cascade-abort"` when an in-flight dependent is killed by the cascade
-     *  (#20), so a resumed run can distinguish it from an unknown-kind skip. */
-    onSettle?: (number: number, status: TicketStatus, reason?: string) => void;
+     *  optional `reason` carries a {@link SettleReason} marker for non-natural
+     *  settles — currently `"cascade-abort"` when an in-flight dependent is
+     *  killed by the cascade (#20), so a resumed run can distinguish it from an
+     *  unknown-kind skip. */
+    onSettle?: (number: number, status: TicketStatus, reason?: SettleReason) => void;
     /** Machine-readable event channel (issue #19). Optional so the many
      *  scheduler tests that don't assert events can omit it; resolved to
      *  NULL_SINK once at the top of runBatch (no per-site `?.`). */
@@ -157,13 +243,11 @@ export async function runBatch(
   // races the temporal-dead-zone of a later `const`.
   const startedAt = new Map<number, number>();
 
-  // Apply a cascade plan: MARK not-yet-started dependents terminal (existing
-  // first-wins behaviour) and ABORT in-flight ones (#20). The settle (status
-  // mutation + onSettle) is recorded synchronously BEFORE the dispatch kill is
-  // fired, so a run killed mid-cascade still persists the doomed branch without
-  // waiting for resume to self-heal it. The kill itself is fire-and-forget:
-  // its promise resolves into the void (the record is already deleted from
-  // `inflight`, so it never re-enters the settle path → no double-report).
+  // Thin wrapper over the exported, unit-tested {@link applyCascadePlan}: plan
+  // the cascade from `seed`, then apply it against this run's live state. The
+  // planner is pure; the applier owns every side effect (set mutation, onSettle,
+  // events, the dispatch kill) and is tested in isolation because runBatch's
+  // strict frontier can't produce an in-flight doomed dependent (#29 changes that).
   const applyCascade = (status: CascadeStatus, seed: Set<number>): void => {
     const plan = planCascade(graph, seed, status, {
       completed,
@@ -171,50 +255,11 @@ export async function runBatch(
       skipped,
       inflight: new Set(inflight.keys()),
     });
-    for (const a of plan) {
-      if (a.kind === "abort") {
-        // No kill hook (focused scheduler tests): leave the dependent in flight
-        // to settle on its own — the pre-#20 behaviour. Status stays unset; the
-        // promise's natural resolution drives the settle.
-        if (!opts.abort) continue;
-        if (!inflight.has(a.dep)) continue; // lost the race / already removed
-        // Free the slot + exclude from the race set so the killed dispatch
-        // can't double-settle. THIS delete is the #20 no-double-report guard:
-        // the orphaned promise resolves into the void (it can't win the race).
-        inflight.delete(a.dep);
-        // cascade-skipped: the dependent never ran to an outcome of its own, so
-        // 'skipped' (not the blocker's status) is the honest record. `reason`
-        // persists to state so a resumed run can tell a cascade-abort apart from
-        // an unknown-kind skip.
-        skipped.add(a.dep);
-        opts.onSettle?.(a.dep, "skipped", "cascade-abort");
-        events.emit(EVT.TICKET_CASCADE, a.dep, {
-          status: "skipped",
-          from: a.from,
-          reason: "cascade-abort",
-        });
-        const started = startedAt.get(a.dep);
-        // Close the start↔end pair at the abort decision (the effective
-        // lifecycle ended here); the underlying process cleanup is an
-        // implementation detail of the kill below.
-        events.emit(EVT.TICKET_END, a.dep, {
-          status: "skipped",
-          reason: "cascade-abort",
-          ...(started !== undefined ? { durationMs: Date.now() - started } : {}),
-        });
-        startedAt.delete(a.dep);
-        // Kill the dispatch + clean the worktree without awaiting: the settle
-        // is already persisted, so a killed run records it even if the kill is
-        // still in flight. Errors are swallowed — the dependent is terminal here.
-        void Promise.resolve(opts.abort(a.dep)).catch(() => {});
-      } else {
-        // not-yet-started dependent: inherit the blocker's status (existing).
-        const acc = a.status === "failed" ? failed : skipped;
-        acc.add(a.dep);
-        opts.onSettle?.(a.dep, a.status);
-        events.emit(EVT.TICKET_CASCADE, a.dep, { status: a.status, from: a.from });
-      }
-    }
+    applyCascadePlan(plan, { completed, failed, skipped }, inflight, startedAt, {
+      onSettle: opts.onSettle,
+      abort: opts.abort,
+      events,
+    });
   };
 
   // A blocker that settled failed/skipped before this run still dooms its

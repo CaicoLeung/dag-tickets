@@ -286,17 +286,26 @@ Run /${skill} for this issue. When finished, post any required comment/output on
 const SLUG = (n: number) => `dag-${n}`;
 
 /**
+ * Does a worktree path's final segment belong to ticket `n`? The worktree
+ * layout contract in ONE place: a ticket's agent lives in a dir whose final
+ * segment is `dag-<n>` (implement/fix) or `dag-<n>-…` (`-review`, or a
+ * `-<counter>` reuse suffix). Requiring the segment to equal {@link SLUG} or
+ * continue with `-` disambiguates siblings — `dag-1` / `dag-1-review` never
+ * match `dag-12-1` / `dag-11-review-1`. Co-located with {@link SLUG} so the
+ * `dag-<n>` shape has a single source (it was previously re-derived here and
+ * in the slug itself).
+ */
+const ownsWorktreeSegment = (dir: string, n: number): boolean => {
+  const seg = dir.split("/").pop() ?? "";
+  return seg === SLUG(n) || seg.startsWith(`${SLUG(n)}-`);
+};
+
+/**
  * Stop every running Paseo agent whose worktree belongs to ticket `ticketNumber`
- * (#20). Paseo places a ticket's agent in a worktree dir derived from its
- * `--worktree-slug` (`dag-<n>` for implement/fix, `dag-<n>-review` for review),
- * optionally with a `-<counter>` suffix when a slug is reused. Matching the
- * worktree's final path segment — `dag-<n>` exactly or `dag-<n>-…` — pins the
- * ticket AND disambiguates siblings: `dag-1` / `dag-1-review` never match
- * `dag-12-1` or `dag-11-review-1`, because the segment is split on `/` and the
- * ticket number is followed by either end-of-string or `-`.
- *
- * Best-effort and never throws: a lookup that finds nothing (the dispatch
- * already finished — lost race) is a no-op; the caller still cleans the branch.
+ * (#20). Best-effort and never throws: a lookup that finds nothing (the
+ * dispatch already finished — lost race) is a no-op; the caller still cleans
+ * the branch. Worktree ownership is decided by {@link ownsWorktreeSegment}, the
+ * single source of the `dag-<n>` layout.
  */
 export async function stopRunningAgent(
   cwd: string | undefined,
@@ -311,14 +320,8 @@ export async function stopRunningAgent(
   } catch {
     return; // malformed `paseo ls` output — nothing to stop
   }
-  const plain = `dag-${ticketNumber}`;
-  const prefixed = `dag-${ticketNumber}-`;
-  const ownsWorktree = (dir: string): boolean => {
-    const seg = dir.split("/").pop() ?? "";
-    return seg === plain || seg.startsWith(prefixed);
-  };
   const running = agents.filter(
-    (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktree(a.cwd),
+    (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktreeSegment(a.cwd, ticketNumber),
   );
   for (const a of running) {
     if (a.id) await run(["paseo", "stop", a.id], { cwd });
