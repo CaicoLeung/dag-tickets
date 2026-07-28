@@ -1,34 +1,27 @@
-import type { Ticket, ReviewVerdict } from "./types.ts";
+import type { Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
-import { parseReviewVerdict } from "./parse.ts";
-import { branchFor, commitCount, deleteBranch, createPr, watchChecks, mergePr, closeIssue, removeWorktreeOnBranch, type MergeStrategy } from "./gitgh.ts";
-import {
-  dispatch,
-  dispatchWithFallback,
-  implementPrompt,
-  reviewPrompt,
-  fixPrompt,
-  singleShotPrompt,
-  type ProviderPrefs,
-  type DispatchResult,
-} from "./paseo.ts";
+import type { AgentPort, MergeStrategy, RepoPort } from "./ports.ts";
+import { branchFor } from "./gitgh.ts";
 
 export type LogLevel = "info" | "ok" | "warn" | "error" | "dim";
 export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => void;
 
+/**
+ * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
+ * no external system directly: agent runs cross {@link AgentPort}, git/gh ops
+ * cross {@link RepoPort}. Provider choice, fallback, timeouts, and cwd are the
+ * real adapters' concern — they don't appear here.
+ */
 export interface RunContext {
-  prefs: ProviderPrefs;
+  agent: AgentPort;
+  repo: RepoPort;
   baseBranch: string;
-  cwd?: string;
   maxFixRounds: number;
   mergeStrategy: MergeStrategy;
   autoMerge: boolean;
   /** When true, CI must pass before merge (a "none" check result blocks). */
   requireChecks: boolean;
   dryRun: boolean;
-  runTimeoutMs?: number;
-  /** Provider fallback chain tried (in order) when the primary is rate-limited. */
-  fallbackProviders: string[];
   log: Logger;
 }
 
@@ -40,8 +33,6 @@ export interface TicketOutcome {
   error?: string;
 }
 
-const SLUG = (n: number) => `dag-${n}`;
-
 /** Run one ticket's full lifecycle. Resolves to a terminal outcome. */
 export async function processTicket(t: Ticket, ctx: RunContext): Promise<TicketOutcome> {
   const rule = routingRuleFor(t.kind);
@@ -51,76 +42,44 @@ export async function processTicket(t: Ticket, ctx: RunContext): Promise<TicketO
   }
 
   if (ctx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, ctx);
-
   if (rule.expectPr) return runImplementLifecycle(t, ctx);
   return runSingleShot(t, rule.skill, ctx);
 }
 
 // ---------------------------------------------------------------------------
 // implement -> review -> fix-loop -> PR -> (auto)merge
+//
+// A pure state machine over TicketOutcome. The fix-loop bounds, the CI merge
+// gate, and the verdict escalation live here and are exercised through the
+// agent/repo ports — no real process is spawned.
 // ---------------------------------------------------------------------------
 
 async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<TicketOutcome> {
   const branch = branchFor(t.number, t.title);
   ctx.log("info", `implement on branch ${branch}`, t.number);
 
-  // 1. Implement (fresh worktree, branch-off from the default branch).
-  // A rate-limited or otherwise-empty agent still "completes" with no diff, so
-  // we verify real commits landed before proceeding to review.
-  const impl = await dispatchWithFallback(
-    implementPrompt(t, branch),
-    {
-      provider: ctx.prefs.impl,
-      title: `implement #${t.number}`,
-      slug: SLUG(t.number),
-      cwd: ctx.cwd,
-      timeoutMs: ctx.runTimeoutMs,
-      branchMode: "branch-off",
-      newBranch: branch,
-      base: ctx.baseBranch,
-    },
-    ctx.fallbackProviders,
-    async (next) => {
-      ctx.log("warn", `implement rate-limited; retrying on ${next}`, t.number);
-      await removeWorktreeOnBranch(branch, ctx.cwd);
-      await deleteBranch(branch, ctx.cwd);
-    },
-  );
+  // 1. Implement (fresh worktree, branch-off from the default branch). The
+  // adapter verifies real commits landed before reporting success.
+  const impl = await ctx.agent.implement(t, branch, ctx.baseBranch);
   if (!impl.ok) {
-    return fail(t, ctx, `implement agent failed${impl.timedOut ? " (timeout)" : ""}${impl.rateLimited ? " (rate-limited, no fallback succeeded)" : ""}`, branch);
+    const why =
+      impl.reason === "empty" ? "produced no commits (agent may have failed silently)" :
+      impl.reason === "rate-limited" ? "rate-limited, no fallback succeeded" :
+      impl.reason === "timeout" ? "agent timed out" :
+      "agent failed";
+    return fail(t, ctx, `implement ${why}`, branch);
   }
-  const commits = await commitCount(ctx.baseBranch, branch, ctx.cwd);
-  if (commits === 0) {
-    return fail(t, ctx, `implement produced no commits (agent may have failed silently)`, branch);
-  }
-  ctx.log("ok", `implement complete (${commits} commit${commits === 1 ? "" : "s"}); running review`, t.number);
+  ctx.log("ok", `implement complete (${impl.commits} commit${impl.commits === 1 ? "" : "s"}); running review`, t.number);
 
   // 2. Review + bounded fix-loop.
   let rounds = 0;
-  let verdict = await runReview(t, branch, ctx);
+  let verdict = await ctx.agent.review(t, branch, ctx.baseBranch);
   while (verdict.kind === "issues" && rounds < ctx.maxFixRounds) {
     rounds++;
     ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
-    await removeWorktreeOnBranch(branch, ctx.cwd);
-    const fix = await dispatchWithFallback(
-      fixPrompt(t, verdict.raw, branch),
-      {
-        provider: ctx.prefs.impl,
-        title: `fix #${t.number} r${rounds}`,
-        slug: SLUG(t.number),
-        cwd: ctx.cwd,
-        timeoutMs: ctx.runTimeoutMs,
-        branchMode: "checkout-branch",
-        branch,
-      },
-      ctx.fallbackProviders,
-      async (next) => {
-        ctx.log("warn", `fix rate-limited; retrying on ${next}`, t.number);
-        await removeWorktreeOnBranch(branch, ctx.cwd);
-      },
-    );
+    const fix = await ctx.agent.fix(t, verdict, branch);
     if (!fix.ok) return fail(t, ctx, `fix round ${rounds} failed`, branch);
-    verdict = await runReview(t, branch, ctx);
+    verdict = await ctx.agent.review(t, branch, ctx.baseBranch);
   }
 
   if (verdict.kind !== "clean") {
@@ -130,17 +89,16 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   ctx.log("ok", "review clean; opening PR", t.number);
 
   // 3. PR.
-  const pr = await createPr({
+  const pr = await ctx.repo.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
     head: branch,
     base: ctx.baseBranch,
-    cwd: ctx.cwd,
   });
   ctx.log("ok", `PR #${pr} opened`, t.number);
 
   // 4. CI gate.
-  const checks = await watchChecks(pr, { cwd: ctx.cwd, timeoutMs: ctx.runTimeoutMs });
+  const checks = await ctx.repo.watchChecks(pr);
   const ciOk = checks.state === "pass" || (checks.state === "none" && !ctx.requireChecks);
   if (!ciOk) {
     ctx.log("error", `CI not green (state=${checks.state}${checks.failed.length ? ": " + checks.failed.join(", ") : ""}); leaving PR #${pr} for human`, t.number);
@@ -153,57 +111,19 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     return { status: "done", branch, pr, rounds };
   }
   try {
-    await mergePr(pr, ctx.mergeStrategy, { cwd: ctx.cwd });
+    await ctx.repo.mergePr(pr, ctx.mergeStrategy);
     ctx.log("ok", `PR #${pr} merged (${ctx.mergeStrategy})`, t.number);
-    await closeIssue(t.number, `Implemented and merged via dag-tickets in PR #${pr}.`, { cwd: ctx.cwd });
+    await ctx.repo.closeIssue(t.number, `Implemented and merged via dag-tickets in PR #${pr}.`);
     return { status: "done", branch, pr, rounds };
   } catch (e) {
     return fail(t, ctx, `merge failed: ${(e as Error).message}`, branch, pr);
   }
 }
 
-/** Run /code-review in a fresh worktree on the branch. Single attempt — the
- *  stable-log polling in dispatch guarantees we capture the agent's full output,
- *  so an unparseable verdict now means the agent genuinely didn't emit one. */
-async function runReview(t: Ticket, branch: string, ctx: RunContext): Promise<ReviewVerdict> {
-  await removeWorktreeOnBranch(branch, ctx.cwd);
-  const r: DispatchResult = await dispatchWithFallback(
-    reviewPrompt(t, ctx.baseBranch),
-    {
-      provider: ctx.prefs.review,
-      title: `review #${t.number}`,
-      slug: `${SLUG(t.number)}-review`,
-      cwd: ctx.cwd,
-      timeoutMs: ctx.runTimeoutMs,
-      branchMode: "checkout-branch",
-      branch,
-    },
-    ctx.fallbackProviders,
-    async (next) => {
-      ctx.log("warn", `review rate-limited; retrying on ${next}`, t.number);
-      await removeWorktreeOnBranch(branch, ctx.cwd);
-    },
-  );
-  if (!r.ok) {
-    ctx.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
-    return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
-  }
-  return parseReviewVerdict(r.output);
-}
-
 async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
   const branch = branchFor(t.number, `${t.title}-shot`);
   ctx.log("info", `${skill} (single-shot)`, t.number);
-  const r = await dispatch(singleShotPrompt(skill, t), {
-    provider: skill === "research" ? ctx.prefs.research : ctx.prefs.triage,
-    title: `${skill} #${t.number}`,
-    slug: SLUG(t.number),
-    cwd: ctx.cwd,
-    timeoutMs: ctx.runTimeoutMs,
-    branchMode: "branch-off",
-    newBranch: branch,
-    base: ctx.baseBranch,
-  });
+  const r = await ctx.agent.singleShot(skill, t, branch, ctx.baseBranch);
   if (!r.ok) return fail(t, ctx, `${skill} agent failed${r.timedOut ? " (timeout)" : ""}`, branch);
   ctx.log("ok", `${skill} complete`, t.number);
   return { status: "done", branch };
@@ -215,12 +135,13 @@ async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise
 
 async function dryRunPlan(t: Ticket, skill: string, expectPr: boolean, ctx: RunContext): Promise<TicketOutcome> {
   const branch = branchFor(t.number, t.title);
+  const labelSkill = skill === "research" ? "research" : skill === "triage" ? "triage" : "implement";
   const lines: string[] = [];
   lines.push(`would run /${skill} on #${t.number} (${t.kind}) — ${t.title}`);
-  lines.push(`  provider: ${skill === "research" ? ctx.prefs.research : skill === "triage" ? ctx.prefs.triage : ctx.prefs.impl}`);
+  lines.push(`  provider: ${ctx.agent.providerLabel(labelSkill)}`);
   lines.push(`  worktree: branch-off new-branch=${branch} base=${ctx.baseBranch}`);
   if (expectPr) {
-    lines.push(`  review:   /code-review provider=${ctx.prefs.review} fixed-point=origin/${ctx.baseBranch}`);
+    lines.push(`  review:   /code-review provider=${ctx.agent.providerLabel("review")} fixed-point=origin/${ctx.baseBranch}`);
     if (ctx.maxFixRounds > 0) lines.push(`  fix-loop: up to ${ctx.maxFixRounds} round(s) on ${branch}`);
     lines.push(`  pr:       gh pr create --head ${branch} --base ${ctx.baseBranch}`);
     lines.push(`  checks:   gh pr checks --watch${ctx.requireChecks ? " (required)" : ""}`);

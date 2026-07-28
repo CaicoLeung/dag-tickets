@@ -1,5 +1,7 @@
 import { run } from "./shell.ts";
-import type { Ticket } from "./types.ts";
+import type { ReviewVerdict, Ticket } from "./types.ts";
+import type { AgentPort, ImplResult, RepoPort, StepResult } from "./ports.ts";
+import { parseReviewVerdict } from "./parse.ts";
 
 /**
  * Provider selection mirrors Paseo's `orchestration-preferences.json`:
@@ -267,4 +269,133 @@ Issue URL: ${t.url}
 ${t.body || "(no body)"}
 
 Run /${skill} for this issue. When finished, post any required comment/output on the issue via \`gh\` per the skill's contract, then report a one-paragraph summary.`;
+}
+
+const SLUG = (n: number) => `dag-${n}`;
+
+/**
+ * Real {@link AgentPort} adapter. Owns the worktree-cleanup invariant (each
+ * step starts on a clean branch), the rate-limit fallback chain, and verdict
+ * parsing — so the lifecycle orchestrator branches on outcomes, never on
+ * dispatch mechanics. The stable-log polling that guarantees a complete
+ * transcript lives inside {@link dispatch}.
+ */
+export class PaseoAgent implements AgentPort {
+  constructor(
+    private readonly repo: RepoPort,
+    private readonly prefs: ProviderPrefs,
+    private readonly fallbacks: string[],
+    private readonly cwd?: string,
+    private readonly timeoutMs: number = DEFAULT_RUN_MS,
+  ) {}
+
+  async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
+    const r = await dispatchWithFallback(
+      implementPrompt(t, branch),
+      {
+        provider: this.prefs.impl,
+        title: `implement #${t.number}`,
+        slug: SLUG(t.number),
+        cwd: this.cwd,
+        timeoutMs: this.timeoutMs,
+        branchMode: "branch-off",
+        newBranch: branch,
+        base,
+      },
+      this.fallbacks,
+      async () => {
+        // A branch-off retry must re-create the branch: clear any linked
+        // worktree (git forbids a branch in >1 worktree) then drop the branch.
+        await this.repo.cleanBranch(branch);
+        await this.repo.deleteBranch(branch);
+      },
+    );
+    if (!r.ok) {
+      return {
+        ok: false,
+        commits: 0,
+        reason: r.rateLimited ? "rate-limited" : r.timedOut ? "timeout" : "failed",
+      };
+    }
+    // A rate-limited or empty agent still "completes" with no diff — verify
+    // real commits landed before the lifecycle proceeds to review.
+    const commits = await this.repo.commitCount(base, branch);
+    if (commits === 0) return { ok: false, commits: 0, reason: "empty" };
+    return { ok: true, commits };
+  }
+
+  /** Single review attempt. Stable-log polling in dispatch guarantees the full
+   *  output, so an unparseable verdict means the agent genuinely didn't emit one. */
+  async review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict> {
+    await this.repo.cleanBranch(branch);
+    const r = await dispatchWithFallback(
+      reviewPrompt(t, base),
+      {
+        provider: this.prefs.review,
+        title: `review #${t.number}`,
+        slug: `${SLUG(t.number)}-review`,
+        cwd: this.cwd,
+        timeoutMs: this.timeoutMs,
+        branchMode: "checkout-branch",
+        branch,
+      },
+      this.fallbacks,
+      async () => {
+        await this.repo.cleanBranch(branch);
+      },
+    );
+    if (!r.ok) {
+      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
+    }
+    return parseReviewVerdict(r.output);
+  }
+
+  async fix(t: Ticket, verdict: ReviewVerdict, branch: string): Promise<StepResult> {
+    await this.repo.cleanBranch(branch);
+    const r = await dispatchWithFallback(
+      fixPrompt(t, verdict.raw, branch),
+      {
+        provider: this.prefs.impl,
+        title: `fix #${t.number}`,
+        slug: SLUG(t.number),
+        cwd: this.cwd,
+        timeoutMs: this.timeoutMs,
+        branchMode: "checkout-branch",
+        branch,
+      },
+      this.fallbacks,
+      async () => {
+        await this.repo.cleanBranch(branch);
+      },
+    );
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
+  }
+
+  async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
+    const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
+    const r = await dispatch(singleShotPrompt(skill, t), {
+      provider,
+      title: `${skill} #${t.number}`,
+      slug: SLUG(t.number),
+      cwd: this.cwd,
+      timeoutMs: this.timeoutMs,
+      branchMode: "branch-off",
+      newBranch: branch,
+      base,
+    });
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
+  }
+
+  providerLabel(skill: "implement" | "review" | "triage" | "research"): string {
+    switch (skill) {
+      case "implement":
+        return this.prefs.impl;
+      case "review":
+        return this.prefs.review;
+      case "triage":
+        return this.prefs.triage;
+      case "research":
+        return this.prefs.research;
+    }
+  }
 }
