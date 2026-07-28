@@ -1,6 +1,6 @@
 import type { Graph } from "./graph.ts";
-import { frontier, cascadeDependents } from "./graph.ts";
-import type { SettleReason, TicketStatus } from "./types.ts";
+import { frontier, cascadeDependents, overlapBlockerFor } from "./graph.ts";
+import type { SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -10,6 +10,15 @@ export interface BatchResult {
   failed: number[];
   /** Tickets skipped up-front (unknown kind) — not retried. */
   skipped: number[];
+}
+
+/** #29: per-launch context passed to {@link runBatch}'s `process` callback.
+ *  `overlapBlocker` is present iff the ticket launched via frontier relaxation
+ *  (one of its blockers was still in flight), telling the caller which blocker
+ *  to branch off + capture a tip from for the later reconcile. Absent on a
+ *  normal (all-blockers-completed) launch. */
+export interface LaunchInfo {
+  overlapBlocker?: number;
 }
 
 /** Terminal status a cascade propagates from a settled blocker. */
@@ -195,8 +204,12 @@ export async function runBatch(
   graph: Graph,
   opts: {
     concurrency: number;
-    /** Process one ticket -> terminal status. */
-    process: (number: number) => Promise<TicketStatus>;
+    /** Process one ticket -> terminal status. `info` (#29) describes how this
+     *  launch became ready: `overlapBlocker` is set iff the ticket launched via
+     *  frontier relaxation (a blocker still in flight), so the caller can branch
+     *  off the blocker's head + capture its tip for reconcile. Ignored by
+     *  callers that don't model overlap. */
+    process: (number: number, info?: LaunchInfo) => Promise<TicketStatus>;
     /**
      * Abort an in-flight ticket: stop its agent dispatch and clean its
      * worktree. Called only for a running dependent of a settled
@@ -208,6 +221,15 @@ export async function runBatch(
      * model a real kill stay green.
      */
     abort?: (number: number) => Promise<void>;
+    /** #29: frontier relaxation policy. When provided, a dependent `dep` may
+     *  become ready while its single in-flight `blocker` is still running
+     *  (rather than waiting for `completed`) — see {@link overlapBlockerFor}
+     *  for why overlap is restricted to one in-flight blocker (fan-in can't
+     *  compose onto one head). Injected (not built internally) so the scheduler
+     *  stays decoupled from ticket-kind / branch-state policy: the cli builds
+     *  it from routing kinds + "blocker head pushed" signals. Absent → strict
+     *  frontier (current behaviour). */
+    canOverlap?: (dep: Ticket, blocker: Ticket) => boolean;
     /** Pre-seeded from resumed state. */
     seedCompleted?: Iterable<number>;
     seedFailed?: Iterable<number>;
@@ -242,6 +264,11 @@ export async function runBatch(
   // stamp durationMs. Declared before applyCascade so the abort closure never
   // races the temporal-dead-zone of a later `const`.
   const startedAt = new Map<number, number>();
+  // #29: dependents currently in flight that were launched while a blocker was
+  // still in flight (overlap launches). Passed to frontier so weighting keeps
+  // their blocker's fan-in / critical-depth weight until it settles; cleared on
+  // settle + cascade-abort. The caller-owned `opts.canOverlap` gates who joins.
+  const overlapInflight = new Set<number>();
 
   // Thin wrapper over the exported, unit-tested {@link applyCascadePlan}: plan
   // the cascade from `seed`, then apply it against this run's live state. The
@@ -269,28 +296,55 @@ export async function runBatch(
   applyCascade("failed", failed);
   applyCascade("skipped", skipped);
 
-  const launch = (n: number): void => {
+  const launch = (n: number, info: LaunchInfo): void => {
+    // #29: an overlap launch (a blocker still in flight) joins `overlapInflight`
+    // for the weighting exclusion, and `info.overlapBlocker` tells the caller
+    // which blocker it overlapped so it can branch off its head + capture its tip.
+    if (info.overlapBlocker !== undefined) overlapInflight.add(n);
     startedAt.set(n, Date.now());
     events.emit(EVT.TICKET_START, n);
     const p = Promise.resolve(n)
-      .then(opts.process)
+      .then((nn) => opts.process(nn, info))
       .then((status) => ({ number: n, status }))
       .catch(() => ({ number: n, status: "failed" as TicketStatus }));
     inflight.set(n, p);
   };
 
   for (;;) {
-    // Skipped tickets are terminal but sit in none of completed/failed; without
-    // excluding them here, frontier re-offers them every pass → infinite relaunch.
-    const ready = frontier(graph, completed, new Set([...inflight.keys(), ...skipped]), failed);
-    while (inflight.size < opts.concurrency && ready.length > 0) {
-      launch(ready.shift()!);
+    // Launch greedily, recomputing the frontier after each launch. Without the
+    // recompute, #29 overlap can't trigger: a dependent only becomes overlap-
+    // ready once its blocker is in flight, which happens mid-pass — a single
+    // pre-pass frontier call would miss it and leave the chain serial. Under
+    // the strict frontier (no `canOverlap`) the recompute is a cheap no-op: a
+    // just-launched blocker satisfies no dependent by completion, so the
+    // recomputed `ready` is empty and the loop exits after one launch.
+    while (inflight.size < opts.concurrency) {
+      // `running` = in flight ∪ skipped (skipped tickets are folded in so they
+      // satisfy dependents exactly like completed ones do — see the settle
+      // path). Computed once so frontier's ready check and the launch-site
+      // overlap decision read the same set and can't disagree on a blocker.
+      const running = new Set([...inflight.keys(), ...skipped]);
+      const ready = frontier(graph, completed, running, failed, {
+        canOverlap: opts.canOverlap,
+        inflight: overlapInflight,
+      });
+      if (ready.length === 0) break;
+      const n = ready[0]!;
+      // #29: capture the single blocker n overlapped (if any) so the caller can
+      // branch off its head + capture its tip for the pull-model reconcile.
+      // overlapBlockerFor returns undefined for fan-in (>1 in-flight blocker),
+      // so a multi-blocker dependent never overlap-launches on just one head —
+      // matching frontier's ready decision exactly (shared helper).
+      const t = graph.byNumber.get(n);
+      const overlapBlocker = t ? overlapBlockerFor(t, graph, running, opts.canOverlap) : undefined;
+      launch(n, overlapBlocker !== undefined ? { overlapBlocker } : {});
     }
 
     if (inflight.size === 0) break; // nothing running, nothing launchable → done
 
     const settled = await Promise.race(inflight.values());
     inflight.delete(settled.number);
+    overlapInflight.delete(settled.number);
     // An aborted ticket was already removed from `inflight` by applyCascade, so
     // it can never be the one that won this race — no guard needed here. The
     // `inflight.delete` inside applyCascade IS the no-double-report mechanism.
@@ -299,6 +353,10 @@ export async function runBatch(
       skipped.add(settled.number);
     } else if (settled.status === "done") {
       completed.add(settled.number);
+      // Reconcile of an overlapped dependent onto its just-merged blocker is
+      // the lifecycle's job (pull model: between dispatches, before createPr —
+      // see lifecycle.ts). A push-model fire here would race a live agent
+      // worktree, so the scheduler does NOT touch overlap branches on settle.
     } else {
       // failed — cascade to not-yet-started dependents only.
       failed.add(settled.number);
@@ -313,6 +371,15 @@ export async function runBatch(
     // the doomed branch without waiting for resume to self-heal it.
     if (settled.status === "failed") applyCascade("failed", failed);
     else if (settled.status === "skipped") applyCascade("skipped", skipped);
+    // #29: prune overlap-launched dependents that left the in-flight race this
+    // pass. The `overlapInflight.delete(settled.number)` above covers a natural
+    // settle; this sweep covers the OTHER exit — a cascade-aborted dependent,
+    // which applyCascadePlan removed from `inflight` (not from overlapInflight).
+    // Without it, an aborted dependent would keep biasing its (now-settled)
+    // blocker's weight on the next frontier call.
+    for (const n of [...overlapInflight]) {
+      if (!inflight.has(n)) overlapInflight.delete(n);
+    }
   }
 
   return {

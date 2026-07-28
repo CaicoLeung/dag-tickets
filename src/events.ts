@@ -51,6 +51,7 @@ export const EVT = {
   PR_CREATED: "pr.created",
   CI_RESULT: "ci.result",
   MERGE: "merge",
+  TICKET_RECONCILE: "ticket.reconcile",
 } as const;
 
 /**

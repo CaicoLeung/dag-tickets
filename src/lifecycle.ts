@@ -25,6 +25,26 @@ export interface RunContext {
   /** Machine-readable event channel (issue #19). Required like `log`; tests
    *  pass NULL_SINK (or a capturing fake) via the shared ctx() helper. */
   events: EventSink;
+  /** #29: signal that ticket `n`'s head branch was pushed (its createPr step
+   *  ran), so the cli's `canOverlap` policy can admit `n`'s dependents to
+   *  overlap on it. Optional — absent in tests / when overlap is disabled. */
+  markHeadPushed?: (n: number) => void;
+  /** #29: resolve once every blocker in `blockers` has settled (done/failed/
+   *  skipped). Gates an overlapped dependent's createPr on its blocker merging
+   *  so reconcile lands on the merged base (no premature PR). Absent in tests /
+   *  when overlap is disabled. */
+  waitForBlockers?: (blockers: number[]) => Promise<void>;
+}
+
+/** #29: per-ticket overlap state for a dependent launched while its blocker was
+ *  still in flight. Absent → normal (strict) lifecycle. Threaded per-ticket
+ *  (NOT on the shared {@link RunContext}) so concurrent overlap dependents
+ *  don't clobber each other's captured tip / blocker ref. */
+export interface OverlapContext {
+  /** The blocker's head ref the dependent branched off (e.g. `origin/loop/42-x`). */
+  blockerHead: string;
+  /** The blocker tip SHA captured at launch — reconcile rebases `--onto` it. */
+  blockerTipSha: string;
 }
 
 export interface TicketOutcome {
@@ -46,7 +66,11 @@ export interface TicketOutcome {
 }
 
 /** Run one ticket's full lifecycle. Resolves to a terminal outcome. */
-export async function processTicket(t: Ticket, ctx: RunContext): Promise<TicketOutcome> {
+export async function processTicket(
+  t: Ticket,
+  ctx: RunContext,
+  overlap?: OverlapContext,
+): Promise<TicketOutcome> {
   const rule = routingRuleFor(t.kind);
   if (t.kind === "unknown" || !rule.skill) {
     ctx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
@@ -54,7 +78,7 @@ export async function processTicket(t: Ticket, ctx: RunContext): Promise<TicketO
   }
 
   if (ctx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, ctx);
-  if (rule.expectPr) return runImplementLifecycle(t, ctx);
+  if (rule.expectPr) return runImplementLifecycle(t, ctx, overlap);
   return runSingleShot(t, rule.skill, ctx);
 }
 
@@ -66,17 +90,28 @@ export async function processTicket(t: Ticket, ctx: RunContext): Promise<TicketO
 // agent/repo ports — no real process is spawned.
 // ---------------------------------------------------------------------------
 
-async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<TicketOutcome> {
+async function runImplementLifecycle(
+  t: Ticket,
+  ctx: RunContext,
+  overlap?: OverlapContext,
+): Promise<TicketOutcome> {
   const branch = branchFor(t.number, t.title);
-  ctx.log("info", `implement on branch ${branch}`, t.number);
+  // #29: an overlapped dependent composes on its blocker's head (not the
+  // integration base) until reconcile rebases it onto the merged base.
+  const branchBase = overlap?.blockerHead ?? ctx.baseBranch;
+  ctx.log(
+    "info",
+    `implement on branch ${branch}${overlap ? ` (overlap on ${overlap.blockerHead})` : ""}`,
+    t.number,
+  );
 
-  // 1. Implement (fresh worktree, branch-off from the default branch). The
+  // 1. Implement (fresh worktree, branch-off from `branchBase`). The
   // adapter verifies real commits landed before reporting success.
   const impl = await emitTimedStep(
     ctx,
     "implement",
     t.number,
-    () => ctx.agent.implement(t, branch, ctx.baseBranch),
+    () => ctx.agent.implement(t, branch, branchBase),
     (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason }),
   );
   if (!impl.ok) {
@@ -97,7 +132,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
       ctx,
       "review",
       t.number,
-      () => ctx.agent.review(t, branch, ctx.baseBranch),
+      () => ctx.agent.review(t, branch, branchBase),
       (r) => ({ verdict: r.kind, issueCount: r.issueCount }),
     );
 
@@ -129,6 +164,40 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   }
   ctx.log("ok", "review clean; opening PR", t.number);
 
+  // #29: gate createPr on all blockers settling — an overlapped dependent must
+  // not open its PR until its blocker has merged (so the reconcile below lands
+  // on the merged base). A strict launch's blockers are already done → no-op.
+  // Overlap can't trigger at concurrency 1, so this can't deadlock: the
+  // blocker always holds its own concurrency slot while the dependent waits.
+  if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
+
+  // #29 (pull-model reconcile): before opening a PR, land an overlapped
+  // dependent onto the merged integration base. Safe here — between dispatches,
+  // not mid-run. A conflicting/stale rebase fails the dependent (no PR opened).
+  if (overlap && ctx.agent.reconcile) {
+    const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
+    if (!rec.ok) {
+      // One reason, used in the event payload, the persisted FailureReason,
+      // and the human error message — formerly three separate
+      // `rec.reason ?? …` reads that drifted (the error said "unknown" while
+      // the reason said "overlap-rebase"). Default matches the failure type.
+      const reason = rec.reason ?? "overlap-rebase";
+      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, { ok: false, reason, onto: ctx.baseBranch });
+      return fail(
+        t,
+        ctx,
+        { reason, error: `overlap reconcile failed (${reason})` },
+        branch,
+      );
+    }
+    ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
+      ok: true,
+      onto: ctx.baseBranch,
+      from: overlap.blockerTipSha,
+    });
+    ctx.log("ok", `overlap reconcile landed ${branch} onto ${ctx.baseBranch}`, t.number);
+  }
+
   // 3. PR.
   const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
@@ -137,6 +206,9 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     base: ctx.baseBranch,
   });
   ctx.events.emit(EVT.PR_CREATED, t.number, { pr, head: branch, base: ctx.baseBranch });
+  // #29: the head is now pushed — mark it so this ticket's own dependents can
+  // overlap on it (the cli's canOverlap policy reads this signal).
+  ctx.markHeadPushed?.(t.number);
   ctx.log("ok", `PR #${pr} opened`, t.number);
 
   // 4. CI gate.

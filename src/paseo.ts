@@ -9,6 +9,7 @@ import type {
   EventSink,
   ImplResult,
   Logger,
+  ReconcileResult,
   StepResult,
 } from "./ports.ts";
 import { normalizeBase, remoteRef } from "./ports.ts";
@@ -547,5 +548,47 @@ export class PaseoAgent implements AgentPort {
       /* a stale/missing worktree is fine — the agent stop is the load-bearing part */
     }
     this.log("warn", `cascade-abort: stopped agent + cleaned worktree ${branch}`, t.number);
+  }
+
+  /**
+   * #29: rebase an overlapping in-flight dependent onto its just-merged blocker.
+   * Called when a blocker settles `done` while the dependent is still in flight
+   * (it launched via overlap). `blockerTipSha` is the blocker tip the dependent
+   * branched from; `base` is the integration branch whose `origin/<base>` now
+   * holds the merge. Returns the outcome so the caller can fail the dependent on
+   * conflict. Never throws: a failed fetch → `stale-base`; a conflicting rebase
+   * → `overlap-rebase`; any throw → `overlap-rebase`. Best-effort like
+   * {@link abort} — a missing worktree (lost race) is a clean success.
+   *
+   * Operational note: rebasing the branch checked out in a worktree while its
+   * agent is mid-dispatch is racy. The safe wiring is the pull model — call
+   * this at the dependent's create-Pr boundary (between dispatches), not mid-run.
+   */
+  async reconcile(t: Ticket, blockerTipSha: string, base: string): Promise<ReconcileResult> {
+    const branch = branchFor(t.number, t.title);
+    try {
+      const fresh = await this.branch.ensureBaseRefFresh(base);
+      if (!fresh) {
+        this.log(
+          "warn",
+          `overlap-reconcile: could not fetch ${remoteRef(base)} (offline?); failing rebase to avoid a stale base`,
+          t.number,
+        );
+        return { ok: false, reason: "stale-base" };
+      }
+      const ok = await this.branch.rebaseOnto(branch, blockerTipSha, remoteRef(base));
+      if (!ok) {
+        this.log(
+          "warn",
+          `overlap-reconcile: rebase of ${branch} onto ${remoteRef(base)} conflicted; dependent needs human resolution`,
+          t.number,
+        );
+        return { ok: false, reason: "overlap-rebase" };
+      }
+      this.log("ok", `overlap-reconcile: rebased ${branch} onto ${remoteRef(base)}`, t.number);
+      return { ok: true };
+    } catch {
+      return { ok: false, reason: "overlap-rebase" };
+    }
   }
 }

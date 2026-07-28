@@ -5,9 +5,11 @@ import type { Ticket } from "./types.ts";
  *
  * Edges come from each ticket's `blockedBy`. A ticket is on the **frontier**
  * when every one of its blockers is satisfied. A blocker is satisfied when it
- * is `completed` (merged/done in this run) OR it is not part of this batch
+ * is `completed` (merged/done in this run), OR it is not part of this batch
  * (already closed before the run, or external) — the graph cannot wait on
- * tickets it wasn't asked to process.
+ * tickets it wasn't asked to process. Under frontier relaxation (#29) an
+ * in-flight blocker may also satisfy a dependent when the caller's
+ * `canOverlap` policy permits it (see {@link frontier}).
  */
 export interface Graph {
   byNumber: Map<number, Ticket>;
@@ -88,8 +90,37 @@ function normKey(s: string): string {
 }
 
 /**
+ * #29: the single in-flight blocker `dep` may overlap, or `undefined` when
+ * overlap is unsafe. Overlap composes a dependent onto ONE blocker's head and
+ * later rebases onto that one blocker's merge — so it is only well-defined when
+ * the dependent has EXACTLY one not-yet-completed blocker, that blocker is
+ * genuinely in flight, and `canOverlap` admits it. With two or more in-flight
+ * blockers (fan-in) the dependent could only branch from one head, leaving the
+ * others uncompensated, so it returns `undefined` (strict).
+ *
+ * Shared by {@link frontier} (the ready decision) and the scheduler (the
+ * LaunchInfo it hands to `process`) so the two never disagree on who overlapped
+ * whom — the previous inline `find(first-in-flight)` at the launch site could
+ * diverge from frontier's per-blocker check and pick a different blocker.
+ */
+export function overlapBlockerFor(
+  dep: Ticket,
+  graph: Graph,
+  running: Set<number>,
+  canOverlap?: (dep: Ticket, blocker: Ticket) => boolean,
+): number | undefined {
+  // Only real, in-flight, in-batch blockers can satisfy via overlap.
+  const inflight = dep.blockedBy.filter((b) => running.has(b) && graph.byNumber.has(b));
+  if (inflight.length !== 1) return undefined;
+  const b = inflight[0]!;
+  return canOverlap?.(dep, graph.byNumber.get(b)!) ? b : undefined;
+}
+
+/**
  * Tickets eligible to start now: not completed, not running, not failed, and
- * with every in-batch blocker completed.
+ * with every in-batch blocker completed — or, under frontier relaxation
+ * (#29), with every blocker either completed or overlap-permitted while
+ * still in flight.
  *
  * Out-of-batch blockers are treated as satisfied (they're closed/external).
  *
@@ -105,13 +136,39 @@ export function frontier(
   completed: Set<number>,
   running: Set<number>,
   failed: Set<number>,
+  /** #29: frontier relaxation. Absent → strict frontier (current behaviour):
+   *  a blocker satisfies a dependent only by being `completed` or out-of-batch.
+   *  When provided, a dependent may additionally satisfy via ONE in-flight
+   *  blocker admitted by `canOverlap` (see {@link overlapBlockerFor}). `inflight`
+   *  lists overlap-launched dependents still in flight, excluded from the
+   *  weighting `done` snapshot below so they keep counting toward their
+   *  blocker's fan-in / critical-depth weight until it settles — otherwise
+   *  launching a dependent early would silently shrink its blocker's priority
+   *  and could reorder the remaining frontier. They're still excluded from
+   *  `ready`, so they're never re-launched. */
+  overlap?: {
+    canOverlap?: (dep: Ticket, blocker: Ticket) => boolean;
+    inflight?: Set<number>;
+  },
 ): number[] {
   const ready: number[] = [];
   for (const t of graph.byNumber.values()) {
     if (completed.has(t.number)) continue;
     if (running.has(t.number)) continue;
     if (failed.has(t.number)) continue;
-    const satisfied = t.blockedBy.every((b) => completed.has(b) || !graph.byNumber.has(b));
+    // #29: overlap is admitted for at most ONE in-flight blocker — the single
+    // head the dependent can branch from and later rebase onto. Fan-in with two
+    // or more in-flight blockers stays strict (can't compose onto one head
+    // without losing the others). overlapBlockerFor is shared with the scheduler
+    // so the ready decision and the LaunchInfo never disagree.
+    const overlapBlocker = overlap
+      ? overlapBlockerFor(t, graph, running, overlap.canOverlap)
+      : undefined;
+    const satisfied = t.blockedBy.every((b) => {
+      if (completed.has(b) || !graph.byNumber.has(b)) return true;
+      if (!running.has(b)) return false;
+      return b === overlapBlocker;
+    });
     if (satisfied) ready.push(t.number);
   }
 
@@ -119,6 +176,9 @@ export function frontier(
   // union below is exactly the set of tickets that are done or in flight —
   // i.e. no longer pending dependents a frontier ticket could unblock.
   const done = new Set<number>([...completed, ...running, ...failed]);
+  // #29 (decision #4): an overlap-launched dependent is in `running` but must
+  // still weigh as a pending dependent of its blocker (see `overlap.inflight`).
+  if (overlap?.inflight) for (const n of overlap.inflight) done.delete(n);
 
   // Direct dependents of `n` that still need to run — the shared edge-walk
   // both weighting keys derive from.

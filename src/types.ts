@@ -87,4 +87,5 @@ export type FailureReason =
   | "implement-empty" // agent completed but produced no commits
   | "implement-failed" // agent run failed (non-transient)
   | "fix-failed" // a fix round failed
-  | "single-shot-failed"; // a triage/research single-shot agent failed
+  | "single-shot-failed" // a triage/research single-shot agent failed
+  | "overlap-rebase"; // #29: rebasing an overlapped dependent onto its merged blocker conflicted (terminal — needs resolution)
