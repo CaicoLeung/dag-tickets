@@ -101,6 +101,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 - **Auto-merge is gated on a clean review AND green CI.** A failing check leaves the PR open for you. `--require-checks` additionally blocks merge when a repo has no CI.
 - **A failed or skipped ticket cascades** to its not-yet-started dependents (marked the same status, not retried), so a doomed branch can't hang the run. Dependents already in flight are left to settle.
 - **Resume is idempotent.** State lives at `.scratch/dag-tickets/<run-id>/state.json`. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
+- **One run per checkout.** The driver takes a repo-wide lock at `.scratch/dag-tickets/run.lock` before dispatching, so two `dag-tickets` runs can't fight over the shared `dag-<n>` worktrees/branches — the second run aborts with a clear message. A lock left behind by a killed run (the holder pid is dead) is recovered automatically on the next start. The lock is released on normal exit **and** on `SIGINT`/`SIGTERM`. `--dry-run` is lock-free (it dispatches nothing, so it never blocks a real run).
 - The driver never edits issue bodies; it only opens PRs, merges, and closes with a linking comment.
 
 ## Verify before trusting it

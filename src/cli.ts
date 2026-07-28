@@ -12,7 +12,18 @@ import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
+import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
 import pkg from "../package.json";
+
+/**
+ * Process exit codes. `2` is reserved for usage / config / discovery failures
+ * (unknown args, missing repo info, dependency cycles, missing run state). A
+ * lock conflict is a retryable concurrency condition, so it gets distinct
+ * codes a script can branch on instead of being indistinguishable from a
+ * usage error.
+ */
+const EXIT_LOCK_HELD = 75; // EX_TEMPFAIL — another live run owns the lock; retry shortly.
+const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investigate.
 
 interface ParsedArgs {
   parent?: number;
@@ -322,32 +333,76 @@ export async function main(argv: string[]): Promise<number> {
     log,
   };
 
-  const result = await runBatch(graph, {
-    concurrency: a.concurrency,
-    seedCompleted,
-    seedFailed,
-    seedSkipped,
-    process: async (n) => {
-      const t = graph.byNumber.get(n)!;
-      const outcome = await processTicket(t, ctx);
-      state.tickets[n] = stateFromOutcome(outcome.status, outcome);
-      if (!a.dryRun) await saveState(state, a.cwd);
-      return outcome.status;
-    },
-    onSettle: async (n, status) => {
-      state.tickets[n] = stateFromOutcome(status, state.tickets[n]);
-      if (!a.dryRun) await saveState(state, a.cwd);
-    },
-  });
-
-  if (!a.dryRun) await saveState(state, a.cwd);
-
-  log("ok", `done: ${result.completed.length} merged/complete, ${result.failed.length} failed, ${result.skipped.length} skipped`);
-  if (result.failed.length > 0) {
-    log("error", `failed tickets: ${result.failed.map((n) => "#" + n).join(", ")}`);
+  // Acquire the repo-wide run lock so a concurrent dag-tickets on this
+  // checkout can't fight over the shared dag-<n> worktrees/branches. --dry-run
+  // dispatches nothing, so it stays lock-free (and never blocks a real run).
+  let lockHandle: LockHandle | null = null;
+  let onSignal: ((sig: NodeJS.Signals) => void) | null = null;
+  if (!a.dryRun) {
+    try {
+      lockHandle = await acquireLock({ cwd: a.cwd, runId });
+    } catch (e) {
+      // Distinguish the two lock failures from discovery/usage errors (exit 2):
+      // a held lock is transient (retry later); an acquire failure means
+      // recovery couldn't settle and the human should investigate.
+      if (e instanceof LockHeldError) {
+        log("error", e.message);
+        return EXIT_LOCK_HELD;
+      }
+      if (e instanceof LockAcquireError) {
+        log("error", e.message);
+        return EXIT_LOCK_FAILED;
+      }
+      throw e;
+    }
+    // Release on Ctrl-C / SIGTERM too, not just clean exit. The handler is
+    // detached in the finally below so a later, unrelated signal keeps default
+    // behaviour. handle.release() is idempotent, so a double call is harmless.
+    const handle = lockHandle;
+    onSignal = (sig: NodeJS.Signals) => {
+      log("warn", `${sig} received; releasing run lock and exiting`);
+      // 128 + signal number: 130 for SIGINT, 143 for SIGTERM (the shell convention).
+      const code = 128 + (sig === "SIGINT" ? 2 : 15);
+      handle.release().finally(() => process.exit(code));
+    };
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
   }
-  log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
-  return result.failed.length > 0 ? 1 : 0;
+
+  try {
+    const result = await runBatch(graph, {
+      concurrency: a.concurrency,
+      seedCompleted,
+      seedFailed,
+      seedSkipped,
+      process: async (n) => {
+        const t = graph.byNumber.get(n)!;
+        const outcome = await processTicket(t, ctx);
+        state.tickets[n] = stateFromOutcome(outcome.status, outcome);
+        if (!a.dryRun) await saveState(state, a.cwd);
+        return outcome.status;
+      },
+      onSettle: async (n, status) => {
+        state.tickets[n] = stateFromOutcome(status, state.tickets[n]);
+        if (!a.dryRun) await saveState(state, a.cwd);
+      },
+    });
+
+    if (!a.dryRun) await saveState(state, a.cwd);
+
+    log("ok", `done: ${result.completed.length} merged/complete, ${result.failed.length} failed, ${result.skipped.length} skipped`);
+    if (result.failed.length > 0) {
+      log("error", `failed tickets: ${result.failed.map((n) => "#" + n).join(", ")}`);
+    }
+    log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
+    return result.failed.length > 0 ? 1 : 0;
+  } finally {
+    if (onSignal) {
+      process.removeListener("SIGINT", onSignal);
+      process.removeListener("SIGTERM", onSignal);
+    }
+    if (lockHandle) await lockHandle.release();
+  }
 }
 
 function defaultRunId(a: ParsedArgs): string {
