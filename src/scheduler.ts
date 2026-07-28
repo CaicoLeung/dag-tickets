@@ -43,9 +43,11 @@ export async function runBatch(
   // cascaded dependent via onSettle so a killed run records it immediately
   // rather than recovering only on the next resume. In-flight dependents are
   // left to settle on their own; a dependent already terminal (completed /
-  // failed / skipped) keeps its status — the first cascade to reach it wins,
-  // so a ticket doomed by both a skip and a failure lands in whichever
-  // settled first (an acceptable ambiguity; neither breaks the run).
+  // failed / skipped) keeps its status — the first cascade to reach it wins.
+  // Within a run that is genuinely first-wins (whichever blocker settles
+  // first cascades first); on a resumed run the startup passes below are
+  // ordered failed-then-skipped, so a ticket doomed by both settles `failed`.
+  // Neither status breaks the run, and there is no double-report.
   const cascade = (status: "failed" | "skipped", seed: Set<number>): void => {
     const acc = status === "failed" ? failed : skipped;
     for (const dep of cascadeDependents(graph, completed, seed)) {
