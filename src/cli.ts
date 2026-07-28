@@ -8,7 +8,7 @@ import {
   searchByLabel,
   fetchIssues,
 } from "./discover.ts";
-import { repoInfo, ShellRepo } from "./gitgh.ts";
+import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
@@ -310,11 +310,12 @@ export async function main(argv: string[]): Promise<number> {
     .filter(([, s]) => s.status === "failed")
     .map(([n]) => parseInt(n, 10));
 
-  const repo = new ShellRepo(a.cwd);
-  const agent = new PaseoAgent(repo, prefs, a.fallbackProviders, a.cwd);
+  const branch = new ShellBranch(a.cwd);
+  const pullRequest = new ShellPullRequest(a.cwd);
+  const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, a.cwd);
   const ctx: RunContext = {
     agent,
-    repo,
+    pullRequest,
     baseBranch,
     maxFixRounds: a.maxFixRounds,
     mergeStrategy: a.mergeStrategy,

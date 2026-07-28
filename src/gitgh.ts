@@ -1,5 +1,5 @@
 import { mustRun, run } from "./shell.ts";
-import type { CheckResult, CreatePrOpts, MergeStrategy, RepoPort } from "./ports.ts";
+import type { BranchPort, CheckResult, CreatePrOpts, MergeStrategy, PullRequestPort } from "./ports.ts";
 
 export interface RepoInfo {
   owner: string;
@@ -42,16 +42,13 @@ export function branchFor(number: number, title: string): string {
 }
 
 /**
- * Real {@link RepoPort} adapter: shells out to `git` (worktree/branch hygiene)
- * and `gh` (PR/CI/merge/issue). The lifecycle never sees these commands — it
- * crosses the seam at {@link RepoPort}.
+ * Real {@link BranchPort} adapter: git worktree/branch hygiene. Owns the
+ * invariant that each agent step starts on a clean branch (git forbids a
+ * branch in more than one worktree). Driven by {@link PaseoAgent}; the
+ * lifecycle orchestrator never sees these commands.
  */
-export class ShellRepo implements RepoPort {
-  constructor(
-    private readonly cwd?: string,
-    /** Watch-checks timeout; undefined polls indefinitely (current behaviour). */
-    private readonly timeoutMs?: number,
-  ) {}
+export class ShellBranch implements BranchPort {
+  constructor(private readonly cwd?: string) {}
 
   /**
    * Remove any linked worktree whose HEAD is on `branch`. Git forbids a branch
@@ -94,6 +91,18 @@ export class ShellRepo implements RepoPort {
   async deleteBranch(branch: string): Promise<void> {
     await run(["git", "branch", "-D", branch], { cwd: this.cwd });
   }
+}
+
+/**
+ * Real {@link PullRequestPort} adapter: the gh PR→CI→merge→close path. Driven
+ * by the lifecycle orchestrator; a fake stands in for tests.
+ */
+export class ShellPullRequest implements PullRequestPort {
+  constructor(
+    private readonly cwd?: string,
+    /** Watch-checks timeout; undefined polls indefinitely (current behaviour). */
+    private readonly timeoutMs?: number,
+  ) {}
 
   /** Push the head branch and open a PR for it. Returns the PR number.
    *  Force-pushes so a stale remote branch from a prior batch is overwritten. */

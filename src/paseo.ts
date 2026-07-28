@@ -1,6 +1,6 @@
 import { run } from "./shell.ts";
 import type { ReviewVerdict, Ticket } from "./types.ts";
-import type { AgentPort, ImplResult, RepoPort, StepResult } from "./ports.ts";
+import type { AgentPort, BranchPort, ImplResult, StepResult } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 
 /**
@@ -282,7 +282,7 @@ const SLUG = (n: number) => `dag-${n}`;
  */
 export class PaseoAgent implements AgentPort {
   constructor(
-    private readonly repo: RepoPort,
+    private readonly branch: BranchPort,
     private readonly prefs: ProviderPrefs,
     private readonly fallbacks: string[],
     private readonly cwd?: string,
@@ -306,8 +306,8 @@ export class PaseoAgent implements AgentPort {
       async () => {
         // A branch-off retry must re-create the branch: clear any linked
         // worktree (git forbids a branch in >1 worktree) then drop the branch.
-        await this.repo.cleanBranch(branch);
-        await this.repo.deleteBranch(branch);
+        await this.branch.cleanBranch(branch);
+        await this.branch.deleteBranch(branch);
       },
     );
     if (!r.ok) {
@@ -319,7 +319,7 @@ export class PaseoAgent implements AgentPort {
     }
     // A rate-limited or empty agent still "completes" with no diff — verify
     // real commits landed before the lifecycle proceeds to review.
-    const commits = await this.repo.commitCount(base, branch);
+    const commits = await this.branch.commitCount(base, branch);
     if (commits === 0) return { ok: false, commits: 0, reason: "empty" };
     return { ok: true, commits };
   }
@@ -327,7 +327,7 @@ export class PaseoAgent implements AgentPort {
   /** Single review attempt. Stable-log polling in dispatch guarantees the full
    *  output, so an unparseable verdict means the agent genuinely didn't emit one. */
   async review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict> {
-    await this.repo.cleanBranch(branch);
+    await this.branch.cleanBranch(branch);
     const r = await dispatchWithFallback(
       reviewPrompt(t, base),
       {
@@ -341,7 +341,7 @@ export class PaseoAgent implements AgentPort {
       },
       this.fallbacks,
       async () => {
-        await this.repo.cleanBranch(branch);
+        await this.branch.cleanBranch(branch);
       },
     );
     if (!r.ok) {
@@ -351,7 +351,7 @@ export class PaseoAgent implements AgentPort {
   }
 
   async fix(t: Ticket, verdict: ReviewVerdict, branch: string): Promise<StepResult> {
-    await this.repo.cleanBranch(branch);
+    await this.branch.cleanBranch(branch);
     const r = await dispatchWithFallback(
       fixPrompt(t, verdict.raw, branch),
       {
@@ -365,7 +365,7 @@ export class PaseoAgent implements AgentPort {
       },
       this.fallbacks,
       async () => {
-        await this.repo.cleanBranch(branch);
+        await this.branch.cleanBranch(branch);
       },
     );
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };

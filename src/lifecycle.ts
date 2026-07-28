@@ -1,6 +1,6 @@
 import type { Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
-import type { AgentPort, MergeStrategy, RepoPort } from "./ports.ts";
+import type { AgentPort, MergeStrategy, PullRequestPort } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 
 export type LogLevel = "info" | "ok" | "warn" | "error" | "dim";
@@ -8,13 +8,14 @@ export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => vo
 
 /**
  * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
- * no external system directly: agent runs cross {@link AgentPort}, git/gh ops
- * cross {@link RepoPort}. Provider choice, fallback, timeouts, and cwd are the
- * real adapters' concern — they don't appear here.
+ * no external system directly: agent runs cross {@link AgentPort}, the
+ * PR→CI→merge path crosses {@link PullRequestPort}. (BranchPort lives in the
+ * agent adapter, never seen here.) Provider choice, fallback, timeouts, and
+ * cwd are the real adapters' concern — they don't appear here.
  */
 export interface RunContext {
   agent: AgentPort;
-  repo: RepoPort;
+  pullRequest: PullRequestPort;
   baseBranch: string;
   maxFixRounds: number;
   mergeStrategy: MergeStrategy;
@@ -89,7 +90,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   ctx.log("ok", "review clean; opening PR", t.number);
 
   // 3. PR.
-  const pr = await ctx.repo.createPr({
+  const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
     head: branch,
@@ -98,7 +99,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   ctx.log("ok", `PR #${pr} opened`, t.number);
 
   // 4. CI gate.
-  const checks = await ctx.repo.watchChecks(pr);
+  const checks = await ctx.pullRequest.watchChecks(pr);
   const ciOk = checks.state === "pass" || (checks.state === "none" && !ctx.requireChecks);
   if (!ciOk) {
     ctx.log("error", `CI not green (state=${checks.state}${checks.failed.length ? ": " + checks.failed.join(", ") : ""}); leaving PR #${pr} for human`, t.number);
@@ -111,9 +112,9 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     return { status: "done", branch, pr, rounds };
   }
   try {
-    await ctx.repo.mergePr(pr, ctx.mergeStrategy);
+    await ctx.pullRequest.mergePr(pr, ctx.mergeStrategy);
     ctx.log("ok", `PR #${pr} merged (${ctx.mergeStrategy})`, t.number);
-    await ctx.repo.closeIssue(t.number, `Implemented and merged via dag-tickets in PR #${pr}.`);
+    await ctx.pullRequest.closeIssue(t.number, `Implemented and merged via dag-tickets in PR #${pr}.`);
     return { status: "done", branch, pr, rounds };
   } catch (e) {
     return fail(t, ctx, `merge failed: ${(e as Error).message}`, branch, pr);

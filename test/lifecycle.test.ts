@@ -6,7 +6,7 @@ import type {
   CreatePrOpts,
   ImplResult,
   MergeStrategy,
-  RepoPort,
+  PullRequestPort,
   StepResult,
 } from "../src/ports.ts";
 import type { ReviewVerdict, Ticket } from "../src/types.ts";
@@ -51,17 +51,12 @@ class FakeAgent implements AgentPort {
   }
 }
 
-/** Recording RepoPort. createPr returns 1000+N; watchChecks returns scripted state. */
-class FakeRepo implements RepoPort {
+/** Recording PullRequestPort. createPr returns 1000+N; watchChecks returns scripted state. */
+class FakePullRequest implements PullRequestPort {
   prs: CreatePrOpts[] = [];
   merged: number[] = [];
   closed: number[] = [];
   checks: CheckResult = { state: "pass", failed: [] };
-  async cleanBranch(): Promise<void> {}
-  async commitCount(): Promise<number> {
-    return 3;
-  }
-  async deleteBranch(): Promise<void> {}
   async createPr(opts: CreatePrOpts): Promise<number> {
     this.prs.push(opts);
     return 1000 + this.prs.length;
@@ -77,10 +72,10 @@ class FakeRepo implements RepoPort {
   }
 }
 
-function ctx(agent: FakeAgent, repo: FakeRepo, over: Partial<RunContext> = {}): RunContext {
+function ctx(agent: FakeAgent, pr: FakePullRequest, over: Partial<RunContext> = {}): RunContext {
   return {
     agent,
-    repo,
+    pullRequest: pr,
     baseBranch: "main",
     maxFixRounds: 2,
     mergeStrategy: "squash" as MergeStrategy,
@@ -96,7 +91,7 @@ describe("implement lifecycle — happy path", () => {
   test("clean on first review: one PR, merged, closed, zero fix rounds", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("done");
     expect(out.rounds).toBe(0);
@@ -110,7 +105,7 @@ describe("implement lifecycle — happy path", () => {
   test("one fix round resolves issues: rounds=1, still merged", async () => {
     const agent = new FakeAgent();
     agent.reviews = [issues(2), CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("done");
     expect(out.rounds).toBe(1);
@@ -124,7 +119,7 @@ describe("implement lifecycle — fix-loop bounds", () => {
     const agent = new FakeAgent();
     agent.reviews = [issues(3), issues(3), issues(3)];
     agent.fixes = [{ ok: true }, { ok: true }];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
     expect(agent.fixCalls).toBe(2); // exactly maxFixRounds
@@ -137,7 +132,7 @@ describe("implement lifecycle — fix-loop bounds", () => {
     const agent = new FakeAgent();
     agent.reviews = [issues(2)];
     agent.fixes = [{ ok: false }];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
     expect(agent.reviewCalls).toBe(1); // initial only; no re-review after failed fix
@@ -147,7 +142,7 @@ describe("implement lifecycle — fix-loop bounds", () => {
   test("unknown verdict after rounds is treated as not-clean: failed", async () => {
     const agent = new FakeAgent();
     agent.reviews = [{ kind: "unknown", issueCount: 0, raw: "rambled" }, CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     // unknown is not "issues", so the fix-loop never engages → not clean → fail.
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
@@ -160,7 +155,7 @@ describe("implement lifecycle — CI gate & merge", () => {
   test("failing CI: failed, PR retained, NOT merged, NOT closed", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     repo.checks = { state: "fail", failed: ["build"] };
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
@@ -173,7 +168,7 @@ describe("implement lifecycle — CI gate & merge", () => {
   test("no CI + requireChecks: 'none' blocks the merge gate", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     repo.checks = { state: "none", failed: [] };
     const out = await processTicket(ticket(), ctx(agent, repo, { requireChecks: true }));
     expect(out.status).toBe("failed");
@@ -183,7 +178,7 @@ describe("implement lifecycle — CI gate & merge", () => {
   test("no CI without requireChecks: 'none' satisfies the gate, merged", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     repo.checks = { state: "none", failed: [] };
     const out = await processTicket(ticket(), ctx(agent, repo, { requireChecks: false }));
     expect(out.status).toBe("done");
@@ -193,7 +188,7 @@ describe("implement lifecycle — CI gate & merge", () => {
   test("autoMerge off: done, PR left for human, NOT merged", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo, { autoMerge: false }));
     expect(out.status).toBe("done");
     expect(repo.prs).toHaveLength(1);
@@ -206,7 +201,7 @@ describe("implement lifecycle — early failure", () => {
   test("empty implement (no commits): failed before any review runs", async () => {
     const agent = new FakeAgent();
     agent.impl = { ok: false, commits: 0, reason: "empty" };
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
     expect(agent.reviewCalls).toBe(0);
@@ -216,7 +211,7 @@ describe("implement lifecycle — early failure", () => {
   test("rate-limited implement with no fallback: failed", async () => {
     const agent = new FakeAgent();
     agent.impl = { ok: false, commits: 0, reason: "rate-limited" };
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo));
     expect(out.status).toBe("failed");
     expect(repo.prs).toHaveLength(0);
@@ -226,7 +221,7 @@ describe("implement lifecycle — early failure", () => {
 describe("routing & dry-run", () => {
   test("single-shot (triage) completes without a PR", async () => {
     const agent = new FakeAgent();
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const t = ticket();
     t.kind = "triage";
     t.labels = ["needs-triage"];
@@ -238,7 +233,7 @@ describe("routing & dry-run", () => {
 
   test("unknown kind is skipped, nothing dispatched", async () => {
     const agent = new FakeAgent();
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const t = ticket();
     t.kind = "unknown";
     const out = await processTicket(t, ctx(agent, repo));
@@ -248,7 +243,7 @@ describe("routing & dry-run", () => {
 
   test("dry-run prints the plan and dispatches nothing", async () => {
     const agent = new FakeAgent();
-    const repo = new FakeRepo();
+    const repo = new FakePullRequest();
     const out = await processTicket(ticket(), ctx(agent, repo, { dryRun: true }));
     expect(out.status).toBe("done");
     expect(repo.prs).toHaveLength(0);
