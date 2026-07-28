@@ -35,6 +35,17 @@ const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investig
 const TICKET_RETRY_BASE_MS = 30_000;
 const TICKET_RETRY_MAX_MS = 5 * 60_000;
 
+/** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
+ *  completing check otherwise polls indefinitely and starves a concurrency slot
+ *  for the rest of the batch — the one load-bearing availability risk in an
+ *  unattended run. The ceiling turns that into a transient `ci-failed` (the
+ *  existing `checks-watch-timeout` path), which the retry loop backs off and
+ *  retries, so the run self-heals instead of hanging on one bad job. 30m is
+ *  long enough for normal CI and short enough that an overnight batch keeps
+ *  moving. `--ci-watch-timeout-minutes 0` disables the bound (indefinite,
+ *  pre-this-flag behaviour) for repos with legitimately long CI. */
+const DEFAULT_CI_WATCH_MINUTES = 30;
+
 interface ParsedArgs {
   parent?: number;
   label?: string;
@@ -44,6 +55,8 @@ interface ParsedArgs {
   maxFixRounds: number;
   /** Whole-ticket retries after a transient failure (issue #21). 0 disables. */
   maxTicketRetries: number;
+  /** Ceiling on `gh pr checks --watch` in minutes. 0 = no bound (indefinite). */
+  ciWatchTimeoutMinutes: number;
   autoMerge: boolean;
   noAutoMerge: boolean;
   mergeStrategy: MergeStrategy;
@@ -88,6 +101,10 @@ OPTIONS
   --no-auto-merge         Stop before merge; leave PRs for you to merge.
   --merge-strategy <s>    squash | merge | rebase (default squash).
   --require-checks        A PR with no CI does NOT satisfy the merge gate.
+  --ci-watch-timeout-minutes <n>  Ceiling on \`gh pr checks --watch\` (default 30).
+                         A stuck check otherwise polls forever and starves a
+                         slot; the timeout is a transient ci-failed (retried
+                         with backoff). 0 = no bound (indefinite watch).
   --provider <p>          Override the implement/fix provider.
   --review-provider <p>   Override the review provider.
   --fallback-provider <p> Provider tried when the primary is rate-limited (repeat / comma-sep).
@@ -112,6 +129,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     concurrency: 3,
     maxFixRounds: 2,
     maxTicketRetries: 2,
+    ciWatchTimeoutMinutes: DEFAULT_CI_WATCH_MINUTES,
     autoMerge: false,
     noAutoMerge: false,
     mergeStrategy: "squash",
@@ -158,6 +176,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
         // which rejects non-positive values for --concurrency / --max-fix-rounds.
         const r = parseInt(next()!, 10);
         if (Number.isFinite(r) && r >= 0) a.maxTicketRetries = r;
+        break;
+      }
+      case "--ci-watch-timeout-minutes": {
+        // 0 is valid (disables the ceiling → indefinite watch), so allow >= 0.
+        const m = parseInt(next()!, 10);
+        if (Number.isFinite(m) && m >= 0) a.ciWatchTimeoutMinutes = m;
         break;
       }
       case "--merge-strategy": {
@@ -480,7 +504,10 @@ export async function main(argv: string[]): Promise<number> {
     });
 
     const branch = new ShellBranch(a.cwd);
-    const pullRequest = new ShellPullRequest(a.cwd);
+    // Only a positive minute budget becomes a ms ceiling; 0 (or any non-positive
+    // fallback) leaves the watch unbounded, preserving the pre-flag behaviour.
+    const ciWatchMs = a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * 60_000 : undefined;
+    const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in

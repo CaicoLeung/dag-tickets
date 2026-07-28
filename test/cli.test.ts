@@ -64,3 +64,29 @@ test("--max-ticket-retries defaults to 2", () => {
 test("--max-ticket-retries=value form is accepted (= splicing)", () => {
   expect(parseArgs(["--max-ticket-retries=4"]).maxTicketRetries).toBe(4);
 });
+
+// --ci-watch-timeout-minutes: ceiling on `gh pr checks --watch` so a stuck
+// check can't starve a concurrency slot. Becomes a transient ci-failed on
+// timeout (retried with backoff). 0 disables the bound.
+test("--ci-watch-timeout-minutes defaults to 30", () => {
+  expect(parseArgs([]).ciWatchTimeoutMinutes).toBe(30);
+});
+
+test("--ci-watch-timeout-minutes sets the ceiling", () => {
+  expect(parseArgs(["--ci-watch-timeout-minutes", "60"]).ciWatchTimeoutMinutes).toBe(60);
+});
+
+test("--ci-watch-timeout-minutes 0 disables the bound (no ceiling)", () => {
+  // 0 is valid (indefinite watch) — distinct from --concurrency's num() which
+  // rejects non-positive values.
+  expect(parseArgs(["--ci-watch-timeout-minutes", "0"]).ciWatchTimeoutMinutes).toBe(0);
+});
+
+test("--ci-watch-timeout-minutes ignores non-numeric / negative, keeps default", () => {
+  expect(parseArgs(["--ci-watch-timeout-minutes", "abc"]).ciWatchTimeoutMinutes).toBe(30);
+  expect(parseArgs(["--ci-watch-timeout-minutes", "-5"]).ciWatchTimeoutMinutes).toBe(30);
+});
+
+test("--ci-watch-timeout-minutes=value form is accepted (= splicing)", () => {
+  expect(parseArgs(["--ci-watch-timeout-minutes=45"]).ciWatchTimeoutMinutes).toBe(45);
+});
