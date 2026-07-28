@@ -164,6 +164,47 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     const out = await run;
     expect(out.completed).toEqual([1, 2]);
   });
+
+  test("#29: a blocker settling done fires reconcile for each overlapping in-flight dependent", async () => {
+    // 1 → {2,3}. All three gated. Release 1 → it settles done while 2,3 are
+    // still in flight (overlap-launched) → reconcile must fire for both.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [1])]);
+    const reconciled: Array<{ dep: number; blocker: number }> = [];
+    const gates = new Map<number, () => void>();
+    const process = async (n: number): Promise<TicketStatus> => {
+      await new Promise<void>((r) => { gates.set(n, r); });
+      return "done";
+    };
+    const run = runBatch(g, {
+      concurrency: 3,
+      process,
+      canOverlap: () => true,
+      reconcile: async (dep, blocker) => {
+        reconciled.push({ dep, blocker });
+        gates.get(dep)?.(); // rebase done → let the dependent continue + settle
+      },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    // 1, 2, 3 all launched and gated. Release 1 → done → reconcile(2,1),(3,1).
+    gates.get(1)!();
+    await run;
+    expect(reconciled).toContainEqual({ dep: 2, blocker: 1 });
+    expect(reconciled).toContainEqual({ dep: 3, blocker: 1 });
+  });
+
+  test("#29: reconcile is not fired when the dependent was not overlap-launched", async () => {
+    // Strict order: 1 settles done BEFORE 2 launches, so 2 is never in flight
+    // concurrent with 1's settle → reconcile never fires.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const reconciled: Array<{ dep: number; blocker: number }> = [];
+    const fake = makeFake();
+    await runBatch(g, {
+      concurrency: 2,
+      process: fake.process,
+      reconcile: async (dep, blocker) => { reconciled.push({ dep, blocker }); },
+    });
+    expect(reconciled).toEqual([]);
+  });
 });
 
 describe("runBatch — failure cascade", () => {

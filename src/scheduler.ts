@@ -215,6 +215,16 @@ export async function runBatch(
      *  the cli builds it from routing kinds + "blocker head pushed" signals.
      *  Absent → strict frontier (current behaviour). */
     canOverlap?: (dep: Ticket, blocker: Ticket) => boolean;
+    /** #29: reconcile an overlapping in-flight `dependent` onto its just-merged
+     *  `blocker`. Fired from the settle path when a blocker settles `done`
+     *  while the dependent is still in flight (it launched via `canOverlap`).
+     *  The hook rebases the dependent's branch onto the merged result; on
+     *  conflict it should arrange for the dependent to settle `failed`.
+     *  Fire-and-forget (like `abort`): the scheduler records the merge and
+     *  moves on; a failed rebase surfaces when the dependent later settles.
+     *  Absent → no reconcile — the dependent keeps whatever base it branched
+     *  off and may conflict at its own PR. */
+    reconcile?: (dependent: number, blocker: number) => Promise<void>;
     /** Pre-seeded from resumed state. */
     seedCompleted?: Iterable<number>;
     seedFailed?: Iterable<number>;
@@ -330,6 +340,17 @@ export async function runBatch(
       skipped.add(settled.number);
     } else if (settled.status === "done") {
       completed.add(settled.number);
+      // #29: an overlapped in-flight dependent of this just-merged blocker must
+      // rebase onto the merged result before its own review/PR. Fire reconcile
+      // for each such dependent (best-effort, fire-and-forget — see `abort`);
+      // the hook coordinates the rebase and, on conflict, fails the dependent.
+      if (opts.reconcile) {
+        for (const dep of graph.blocks.get(settled.number) ?? []) {
+          if (inflight.has(dep) && overlapInflight.has(dep)) {
+            void Promise.resolve(opts.reconcile(dep, settled.number)).catch(() => {});
+          }
+        }
+      }
     } else {
       // failed — cascade to not-yet-started dependents only.
       failed.add(settled.number);
