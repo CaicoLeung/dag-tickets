@@ -31,10 +31,16 @@ const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investig
  *  Full-jitter is applied on top (delay = random() * computeBackoff), so these
  *  are caps: base 30s ± jitter, doubling, capped at 5 min. Long enough that a
  *  rate-limit window / CI queue drains, short enough that a batch still
- *  converges in a working session. */
+ *  converges in a working session.
+ *
+ *  The base/cap are env-tunable (`DAG_RETRY_BASE_MS` / `DAG_RETRY_MAX_MS`) so a
+ *  host running quick local batches (or the e2e suite, which collapses the wait
+ *  to prove the real retry loop without burning 30s) can shrink them. Defaults
+ *  are unchanged when unset. Read at call time so a caller can adjust between
+ *  dispatches. */
 const MS_PER_MINUTE = 60_000;
-const TICKET_RETRY_BASE_MS = 30_000;
-const TICKET_RETRY_MAX_MS = 5 * MS_PER_MINUTE;
+const retryBaseMs = (): number => Number(process.env.DAG_RETRY_BASE_MS ?? 30_000) || 30_000;
+const retryMaxMs = (): number => Number(process.env.DAG_RETRY_MAX_MS ?? 5 * MS_PER_MINUTE) || 5 * MS_PER_MINUTE;
 
 /** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
  *  completing check otherwise polls indefinitely and starves a concurrency slot
@@ -581,8 +587,8 @@ export async function main(argv: string[]): Promise<number> {
           () => processTicket(t, ctx, overlap),
           {
             maxRetries: a.maxTicketRetries,
-            baseDelayMs: TICKET_RETRY_BASE_MS,
-            maxDelayMs: TICKET_RETRY_MAX_MS,
+            baseDelayMs: retryBaseMs(),
+            maxDelayMs: retryMaxMs(),
             log,
             events,
             ticketNumber: n,
