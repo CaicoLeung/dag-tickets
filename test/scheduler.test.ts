@@ -124,6 +124,58 @@ describe("runBatch — failure cascade", () => {
   });
 });
 
+describe("runBatch — cascade reaches the settle callback", () => {
+  test("a mid-run failure reports each cascaded dependent as failed via onSettle", async () => {
+    // 1 fails -> 2 (depends on 1) and 3 (depends on 2) cascade. Each must
+    // reach onSettle so a killed run persists them without waiting for resume.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 3,
+      process: makeFake({ 1: "failed" }).process,
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    expect(settled).toContainEqual([1, "failed"]);
+    expect(settled).toContainEqual([2, "failed"]);
+    expect(settled).toContainEqual([3, "failed"]);
+    // root cause recorded before its dependents
+    expect(settled.findIndex((e) => e[0] === 1)).toBeLessThan(
+      settled.findIndex((e) => e[0] === 2),
+    );
+  });
+
+  test("a mid-run failure fires onSettle exactly once per dependent (no dup on later settles)", async () => {
+    // 1 fails (cascades 2); 3 is independent and completes afterwards. The
+    // cascade recompute on 3's settle must not re-fire for 2.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3)]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 1, // serialize: 1 settles, then 3 settles, so 2 is cascaded
+      process: makeFake({ 1: "failed" }).process,
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    const twoFails = settled.filter((e) => e[0] === 2 && e[1] === "failed");
+    expect(twoFails).toHaveLength(1);
+  });
+
+  test("a seeded-failure cascade at startup reports each cascaded dependent via onSettle", async () => {
+    // Resumed run: 1 already failed (persisted). Its dependents 2,3 cascade
+    // at startup and must be persisted immediately, not only on next resume.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 3,
+      process: makeFake().process,
+      seedFailed: [1],
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    expect(settled).toContainEqual([2, "failed"]);
+    expect(settled).toContainEqual([3, "failed"]);
+    // the seeded failure itself is NOT re-reported (already persisted)
+    expect(settled.find((e) => e[0] === 1)).toBeUndefined();
+  });
+});
+
 describe("runBatch — skipped and callbacks", () => {
   test("skipped tickets are counted separately and don't block siblings", async () => {
     const g = buildGraph([ticket(1), ticket(2), ticket(3)]);
