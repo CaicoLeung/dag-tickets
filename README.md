@@ -75,6 +75,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 | `--frontier` | on | process the open implement-label frontier (the default target) |
 | `--concurrency <n>` | `3` | max tickets in flight |
 | `--max-fix-rounds <n>` | `2` | implement↔review fix iterations before escalating |
+| `--max-ticket-retries <n>` | `2` | whole-ticket retries after a transient failure (CI flake / rate-limit / merge race) with exponential backoff. `0` disables |
 | `--auto-merge` / `--no-auto-merge` | auto | merge when review is clean + CI green (`--no-auto-merge` leaves PRs for you) |
 | `--merge-strategy <s>` | `squash` | `squash` \| `merge` \| `rebase` |
 | `--require-checks` | off | a PR with no CI does **not** satisfy the merge gate |
@@ -95,6 +96,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 3. **Walk the frontier.** Tickets with all blockers done launch up to `--concurrency` at a time. Each runs in its own fresh Paseo worktree. When one finishes, its dependents become eligible.
 4. **Per implement ticket:** `paseo run` `/implement` (branch-off from the default branch) → fresh `paseo run` `/code-review` against `origin/<default>` → if the verdict is `ISSUES`, a bounded fix-loop (fix agent → re-review) up to `--max-fix-rounds` → `gh pr create` → `gh pr checks --watch` → `gh pr merge` + close the issue.
 5. **The review verdict** is the contract between agent and driver. The review prompt asks the agent to end with `REVIEW_VERDICT: CLEAN` or `REVIEW_VERDICT: ISSUES <n>`. An unparseable verdict is retried once, then escalated — the driver **never auto-merges on an unknown verdict**.
+6. **Transient failures retry, terminal ones cascade.** A ticket that fails for a transient reason (CI flake, momentary rate-limit, merge race, an offline base-ref fetch) is retried with exponential backoff up to `--max-ticket-retries` before being declared terminal and cascading to its dependents. Each failure is tagged with a machine-readable `reason` (recorded in `state.json` and `events.jsonl`) so the post-mortem no longer conflates *"issues remain after N rounds"* with *"verdict unknown"*. Terminal causes (`review-issues`, `implement-empty`, …) are never retried — they cascade immediately, exactly as before.
 
 ## Safety
 
