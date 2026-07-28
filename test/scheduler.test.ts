@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { runBatch, planCascade, applyCascadePlan } from "../src/scheduler.ts";
+import { runBatch, planCascade, applyCascadePlan, type LaunchInfo } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
 import { fanInHeavyGraph, retryableOutcome } from "./helpers.ts";
 import type { FailureReason, Ticket, TicketStatus } from "../src/types.ts";
@@ -204,6 +204,25 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
       reconcile: async (dep, blocker) => { reconciled.push({ dep, blocker }); },
     });
     expect(reconciled).toEqual([]);
+  });
+
+  test("#29: process receives {overlapBlocker} on an overlap launch and {} otherwise", async () => {
+    // 1 → 2. Hold 1 in flight; 2 overlap-launches (canOverlap).
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const infos: Array<{ n: number; info: LaunchInfo | undefined }> = [];
+    let release1!: () => void;
+    const process = async (n: number, info?: LaunchInfo): Promise<TicketStatus> => {
+      infos.push({ n, info });
+      if (n === 1) await new Promise<void>((r) => { release1 = r; });
+      return "done";
+    };
+    const run = runBatch(g, { concurrency: 2, process, canOverlap: () => true });
+    await new Promise((r) => setTimeout(r, 0));
+    // 1 launched normally (no overlap info); 2 launched overlapping 1.
+    expect(infos.find((i) => i.n === 1)?.info).toEqual({});
+    expect(infos.find((i) => i.n === 2)?.info).toEqual({ overlapBlocker: 1 });
+    release1();
+    await run;
   });
 });
 

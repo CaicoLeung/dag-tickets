@@ -12,6 +12,15 @@ export interface BatchResult {
   skipped: number[];
 }
 
+/** #29: per-launch context passed to {@link runBatch}'s `process` callback.
+ *  `overlapBlocker` is present iff the ticket launched via frontier relaxation
+ *  (one of its blockers was still in flight), telling the caller which blocker
+ *  to branch off + capture a tip from for the later reconcile. Absent on a
+ *  normal (all-blockers-completed) launch. */
+export interface LaunchInfo {
+  overlapBlocker?: number;
+}
+
 /** Terminal status a cascade propagates from a settled blocker. */
 export type CascadeStatus = "failed" | "skipped";
 
@@ -195,8 +204,12 @@ export async function runBatch(
   graph: Graph,
   opts: {
     concurrency: number;
-    /** Process one ticket -> terminal status. */
-    process: (number: number) => Promise<TicketStatus>;
+    /** Process one ticket -> terminal status. `info` (#29) describes how this
+     *  launch became ready: `overlapBlocker` is set iff the ticket launched via
+     *  frontier relaxation (a blocker still in flight), so the caller can branch
+     *  off the blocker's head + capture its tip for reconcile. Ignored by
+     *  callers that don't model overlap. */
+    process: (number: number, info?: LaunchInfo) => Promise<TicketStatus>;
     /**
      * Abort an in-flight ticket: stop its agent dispatch and clean its
      * worktree. Called only for a running dependent of a settled
@@ -291,16 +304,15 @@ export async function runBatch(
   applyCascade("failed", failed);
   applyCascade("skipped", skipped);
 
-  const launch = (n: number): void => {
-    // #29: a launch counts as an overlap launch when one of its blockers is
-    // still in flight — i.e. it became ready via `canOverlap`, not by
-    // completion. Membership drives the weighting exclusion in `frontier`.
-    const t = graph.byNumber.get(n);
-    if (opts.canOverlap && t?.blockedBy.some((b) => inflight.has(b))) overlapInflight.add(n);
+  const launch = (n: number, info: LaunchInfo): void => {
+    // #29: an overlap launch (a blocker still in flight) joins `overlapInflight`
+    // for the weighting exclusion, and `info.overlapBlocker` tells the caller
+    // which blocker it overlapped so it can branch off its head + capture its tip.
+    if (info.overlapBlocker !== undefined) overlapInflight.add(n);
     startedAt.set(n, Date.now());
     events.emit(EVT.TICKET_START, n);
     const p = Promise.resolve(n)
-      .then(opts.process)
+      .then((nn) => opts.process(nn, info))
       .then((status) => ({ number: n, status }))
       .catch(() => ({ number: n, status: "failed" as TicketStatus }));
     inflight.set(n, p);
@@ -324,7 +336,12 @@ export async function runBatch(
         overlapInflight,
       );
       if (ready.length === 0) break;
-      launch(ready[0]);
+      const n = ready[0]!;
+      // #29: if n has a blocker still in flight, this is an overlap launch —
+      // record which blocker so the caller can branch off its head + capture
+      // its tip for the later reconcile.
+      const overlapBlocker = graph.byNumber.get(n)?.blockedBy.find((b) => inflight.has(b));
+      launch(n, overlapBlocker !== undefined ? { overlapBlocker } : {});
     }
 
     if (inflight.size === 0) break; // nothing running, nothing launchable → done
