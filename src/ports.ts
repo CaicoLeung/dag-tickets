@@ -81,6 +81,15 @@ export interface ImplResult {
   reason?: ImplFailReason;
 }
 
+/** #29: outcome of an overlap reconcile — rebase a dependent's branch onto its
+ *  just-merged blocker. `ok` → rebase clean, the dependent continues; `!ok` +
+ *  `reason` → the caller fails the dependent (terminal). */
+export interface ReconcileResult {
+  ok: boolean;
+  /** Present iff `!ok`. */
+  reason?: "stale-base" | "overlap-rebase";
+}
+
 /** Outcome of a fix or single-shot dispatch. */
 export interface StepResult {
   ok: boolean;
@@ -116,6 +125,16 @@ export interface AgentPort {
    * absent abort leaves in-flight dependents to settle on their own.
    */
   abort?(t: Ticket): Promise<void>;
+  /**
+   * #29: rebase an overlapping in-flight `dependent` onto its just-merged
+   *  `blocker`. `blockerTipSha` is the blocker tip captured at the dependent's
+   *  launch (the base it branched from); `base` is the integration branch whose
+   *  `origin/<base>` now holds the merge. Returns the outcome so the caller can
+   *  fail the dependent on conflict; never throws (errors → `{ ok: false }`).
+   *  Optional: fakes/tests need not implement it; an absent reconcile leaves the
+   *  dependent on whatever it branched off (it may conflict at its own PR).
+   */
+  reconcile?(t: Ticket, blockerTipSha: string, base: string): Promise<ReconcileResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +221,16 @@ export interface BranchPort {
    * never resolve the branch-off to `origin/<base>` without a confirmed fetch.
    */
   ensureBaseRefFresh(base: string): Promise<boolean>;
+  /**
+   * #29: rebase `branch` (checked out in its linked worktree) so commits in
+   *  `oldBase..branch` replay onto `newBase`. Used to land an overlapped
+   *  dependent onto its just-merged blocker: `oldBase` = the blocker tip the
+   *  dependent branched from, `newBase` = the fetched `origin/<base>` (now
+   *  holding the merge). Returns true on a clean rebase, false on conflict (the
+   *  worktree is left clean via `--abort`). A branch with no linked worktree
+   *  (lost race / already settled) is a no-op success.
+   */
+  rebaseOnto(branch: string, oldBase: string, newBase: string): Promise<boolean>;
 }
 
 /** Strip a stray `origin/` prefix so callers can pass either form without

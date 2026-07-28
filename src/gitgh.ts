@@ -51,22 +51,19 @@ export function branchFor(number: number, title: string): string {
 export class ShellBranch implements BranchPort {
   constructor(private readonly cwd?: string) {}
 
-  /**
-   * Remove any linked worktree whose HEAD is on `branch`. Git forbids a branch
-   * being checked out in more than one worktree, so a leftover worktree from a
-   * prior dispatch makes a later `checkout-branch` dispatch fail with "Branch
-   * already checked out". Commits live on the branch ref, so forcing removal
-   * here loses no work. The main checkout is never on a `loop/` branch.
-   */
-  async cleanBranch(branch: string): Promise<void> {
+  /** Paths of linked worktrees whose HEAD is on `branch` (git forbids >1, but
+   *  the porcelain walk collects all matches defensively). Shared by
+   *  {@link cleanBranch} (remove them) and {@link rebaseOnto} (rebase inside
+   *  the first). Returns [] when `git worktree list` fails. */
+  private async worktreesOnBranch(branch: string): Promise<string[]> {
     const target = branch.startsWith("refs/heads/") ? branch : `refs/heads/${branch}`;
     const r = await run(["git", "worktree", "list", "--porcelain"], { cwd: this.cwd });
-    if (!r.ok) return;
-    const toRemove: string[] = [];
+    if (!r.ok) return [];
+    const found: string[] = [];
     let path = "";
     let onBranch = false;
-    const flush = () => {
-      if (path && onBranch) toRemove.push(path);
+    const flush = (): void => {
+      if (path && onBranch) found.push(path);
     };
     for (const line of r.stdout.split("\n")) {
       if (line.startsWith("worktree ")) {
@@ -78,9 +75,38 @@ export class ShellBranch implements BranchPort {
       }
     }
     flush();
-    for (const p of toRemove) {
+    return found;
+  }
+
+  /**
+   * Remove any linked worktree whose HEAD is on `branch`. Git forbids a branch
+   * being checked out in more than one worktree, so a leftover worktree from a
+   * prior dispatch makes a later `checkout-branch` dispatch fail with "Branch
+   * already checked out". Commits live on the branch ref, so forcing removal
+   * here loses no work. The main checkout is never on a `loop/` branch.
+   */
+  async cleanBranch(branch: string): Promise<void> {
+    for (const p of await this.worktreesOnBranch(branch)) {
       await run(["git", "worktree", "remove", "--force", p], { cwd: this.cwd });
     }
+  }
+
+  /** @see {BranchPort.rebaseOnto}.
+   *
+   *  Runs inside the branch's linked worktree (`git -C <wt>`), since git forbids
+   *  rebasing a branch checked out elsewhere. On conflict the rebase is aborted
+   *  so the dependent's worktree is left clean. A branch with no linked
+   *  worktree (lost race / already settled) is a no-op success. */
+  async rebaseOnto(branch: string, oldBase: string, newBase: string): Promise<boolean> {
+    const wts = await this.worktreesOnBranch(branch);
+    if (wts.length === 0) return true;
+    const wt = wts[0]!;
+    const r = await run(["git", "-C", wt, "rebase", "--onto", newBase, oldBase], {
+      cwd: this.cwd,
+    });
+    if (r.ok) return true;
+    await run(["git", "-C", wt, "rebase", "--abort"], { cwd: this.cwd });
+    return false;
   }
 
   async commitCount(base: string, branch: string): Promise<number> {

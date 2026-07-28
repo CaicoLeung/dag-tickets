@@ -103,6 +103,13 @@ class FakeBranch implements BranchPort {
     this.commitCountBases.push(base);
     return this.countsByBase[`${base}..${branch}`] ?? this.counts[branch] ?? 3;
   }
+  rebased: Array<{ branch: string; oldBase: string; newBase: string }> = [];
+  /** Flip to false to simulate a conflicting rebase. */
+  rebaseOk = true;
+  async rebaseOnto(branch: string, oldBase: string, newBase: string): Promise<boolean> {
+    this.rebased.push({ branch, oldBase, newBase });
+    return this.rebaseOk;
+  }
 }
 
 function capturingLog(): { log: Logger; lines: [string, string, number | undefined][] } {
@@ -598,5 +605,46 @@ describe("PaseoAgent.abort (#20)", () => {
       async () => {},
     );
     await expect(a.abort(ticket(11))).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #29 — PaseoAgent.reconcile: rebase an overlapped dependent onto its merged
+// blocker. ensureBaseRefFresh reuses the #15 freshness gate; the rebase itself
+// reuses the tested BranchPort.rebaseOnto. Never throws — conflict / fetch
+// failure surface as a ReconcileResult the caller fails the dependent on.
+// ---------------------------------------------------------------------------
+
+describe("PaseoAgent.reconcile (#29)", () => {
+  test("fetches the base and rebases the dependent's branch onto the merged tip", async () => {
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, new ScriptedDispatcher());
+    const out = await a.reconcile(ticket(11), "abc123", "main");
+    expect(out).toEqual({ ok: true });
+    // #15 freshness gate ran against the bare base.
+    expect(branch.fetched).toEqual(["main"]);
+    // rebase replayed commits abc123..branch onto origin/main.
+    expect(branch.rebased).toEqual([
+      { branch: "loop/11-inject-dispatch", oldBase: "abc123", newBase: "origin/main" },
+    ]);
+    expect(logged(cap.lines, "ok", /overlap-reconcile/)).toBe(true);
+  });
+
+  test("a conflicting rebase returns {ok:false, reason:'overlap-rebase'} and never throws", async () => {
+    const branch = new FakeBranch();
+    branch.rebaseOk = false;
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, new ScriptedDispatcher());
+    const out = await a.reconcile(ticket(11), "abc123", "main");
+    expect(out).toEqual({ ok: false, reason: "overlap-rebase" });
+  });
+
+  test("a failed base fetch returns {ok:false, reason:'stale-base'} — refuses a stale rebase", async () => {
+    const branch = new FakeBranch();
+    branch.fetchOk = false;
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, new ScriptedDispatcher());
+    const out = await a.reconcile(ticket(11), "abc123", "main");
+    expect(out).toEqual({ ok: false, reason: "stale-base" });
+    expect(branch.rebased).toEqual([]); // rebase never attempted on a stale base
   });
 });
