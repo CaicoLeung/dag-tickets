@@ -309,6 +309,9 @@ export async function main(argv: string[]): Promise<number> {
   const seedFailed = Object.entries(state.tickets)
     .filter(([, s]) => s.status === "failed")
     .map(([n]) => parseInt(n, 10));
+  const seedSkipped = Object.entries(state.tickets)
+    .filter(([, s]) => s.status === "skipped")
+    .map(([n]) => parseInt(n, 10));
 
   const branch = new ShellBranch(a.cwd);
   const pullRequest = new ShellPullRequest(a.cwd);
@@ -329,6 +332,7 @@ export async function main(argv: string[]): Promise<number> {
     concurrency: a.concurrency,
     seedCompleted,
     seedFailed,
+    seedSkipped,
     process: async (n) => {
       const t = graph.byNumber.get(n)!;
       const outcome = await processTicket(t, ctx);

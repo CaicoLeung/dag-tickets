@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { buildGraph, frontier, cascadeFailures, CycleError } from "../src/graph.ts";
+import { buildGraph, frontier, cascadeDependents, CycleError } from "../src/graph.ts";
 import type { Ticket } from "../src/types.ts";
 
 function ticket(n: number, blockedBy: number[] = [], labels = ["ready-for-agent"]): Ticket {
@@ -60,16 +60,23 @@ describe("frontier", () => {
   });
 });
 
-describe("cascadeFailures", () => {
-  test("a failed blocker fails its dependents", () => {
+describe("cascadeDependents", () => {
+  test("a terminal blocker dooms its dependents transitively", () => {
     const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
-    expect(cascadeFailures(g, new Set(), new Set([1]))).toEqual([2, 3]);
+    expect(cascadeDependents(g, new Set(), new Set([1]))).toEqual([2, 3]);
   });
 
   test("completed branch is not cascaded", () => {
-    // 1 failed; 2 depends on 1 (fails); 3 depends on nothing (survives)
+    // 1 terminal; 2 depends on 1 (doomed); 3 depends on nothing (survives)
     const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3)]);
-    expect(cascadeFailures(g, new Set(), new Set([1]))).toEqual([2]);
+    expect(cascadeDependents(g, new Set(), new Set([1]))).toEqual([2]);
+  });
+
+  test("status-agnostic: seeds from any set (here a 'skipped' seed)", () => {
+    // Same closure logic drives both failure and skip cascades in the driver;
+    // the function only answers "which dependents are blocked by the seed?".
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2]), ticket(4, [1, 3])]);
+    expect(cascadeDependents(g, new Set(), new Set([1]))).toEqual([2, 3, 4]);
   });
 });
 

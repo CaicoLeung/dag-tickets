@@ -5,7 +5,8 @@ import { dirname } from "node:path";
 /**
  * Resume state. Persisted after every ticket transition so a killed run can be
  * re-invoked with `--resume <run-id>` and pick up where it left off: already
- * merged tickets are skipped, in-flight ones restart, failed ones stay failed.
+ * merged tickets are skipped, in-flight ones restart, failed and skipped
+ * ones stay terminal and re-cascade to their dependents.
  */
 export interface TicketState {
   status: TicketStatus;
