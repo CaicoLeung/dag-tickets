@@ -1,6 +1,16 @@
 import { run } from "./shell.ts";
 import type { ReviewVerdict, Ticket } from "./types.ts";
-import type { AgentPort, BranchPort, ImplResult, Logger, StepResult } from "./ports.ts";
+import type {
+  AgentPort,
+  BranchPort,
+  Dispatcher,
+  DispatchFn,
+  DispatchOpts,
+  DispatchResult,
+  ImplResult,
+  Logger,
+  StepResult,
+} from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 
 /**
@@ -49,32 +59,6 @@ const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
 function msToDuration(ms: number): string {
   const m = Math.max(1, Math.round(ms / 60000));
   return m >= 60 ? `${Math.round(m / 60)}h` : `${m}m`;
-}
-
-export interface DispatchOpts {
-  provider: string;
-  title: string;
-  /** Paseo worktree slug — groups the run in the UI. */
-  slug: string;
-  cwd?: string;
-  /** Max wall time for the agent run (paseo --wait-timeout). */
-  timeoutMs?: number;
-  mode?: string;
-  branchMode: "branch-off" | "checkout-branch";
-  /** branch-off: new branch to create. */
-  newBranch?: string;
-  /** branch-off: base ref. */
-  base?: string;
-  /** checkout-branch: existing branch to check out. */
-  branch?: string;
-}
-
-export interface DispatchResult {
-  ok: boolean;
-  output: string;
-  timedOut: boolean;
-  /** True when the agent output indicates provider rate-limiting / quota exhaustion. */
-  rateLimited: boolean;
 }
 
 const RATE_LIMIT_RE = /\b429\b|usage limit reached|rate[ -]?limit|quota|too many requests/i;
@@ -168,10 +152,39 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
 }
 
 /**
- * Dispatch with provider fallback. If the primary provider is rate-limited,
- * retry each fallback in order. `onSwitch` runs before each retry so the caller
- * can reset worktree/branch state (branch-off retries need a clean branch).
- * A result that is still rate-limited after exhausting fallbacks is marked !ok.
+ * The rate-limit fallback loop, factored out so it can run over ANY dispatch
+ * function. Prod binds it to the real {@link dispatch}; tests bind it to a fake
+ * so the retry ordering (onSwitch per fallback, stop on first success, skip the
+ * primary if it reappears in the fallback list) is exercised without spawning a
+ * `paseo run`.
+ *
+ * `onSwitch` runs before each retry so the caller can reset worktree/branch
+ * state (branch-off retries need a clean branch). A result that is still
+ * rate-limited after exhausting fallbacks is marked !ok.
+ */
+export async function runWithFallback(
+  dispatchFn: DispatchFn,
+  prompt: string,
+  opts: DispatchOpts,
+  fallbacks: string[],
+  onSwitch?: (nextProvider: string) => Promise<void>,
+): Promise<DispatchResult> {
+  let result = await dispatchFn(prompt, opts);
+  for (const fb of fallbacks) {
+    if (!result.rateLimited) break;
+    if (fb === opts.provider) continue;
+    if (onSwitch) await onSwitch(fb);
+    result = await dispatchFn(prompt, { ...opts, provider: fb });
+  }
+  if (result.rateLimited) result.ok = false;
+  return result;
+}
+
+/**
+ * Dispatch with provider fallback. Thin wrapper over {@link runWithFallback}
+ * bound to the real {@link dispatch}; behaviour is byte-identical to the
+ * pre-injection implementation. Direct callers and the injected {@link Dispatcher}
+ * share this single loop.
  */
 export async function dispatchWithFallback(
   prompt: string,
@@ -179,16 +192,18 @@ export async function dispatchWithFallback(
   fallbacks: string[],
   onSwitch?: (nextProvider: string) => Promise<void>,
 ): Promise<DispatchResult> {
-  let result = await dispatch(prompt, opts);
-  for (const fb of fallbacks) {
-    if (!result.rateLimited) break;
-    if (fb === opts.provider) continue;
-    if (onSwitch) await onSwitch(fb);
-    result = await dispatch(prompt, { ...opts, provider: fb });
-  }
-  if (result.rateLimited) result.ok = false;
-  return result;
+  return runWithFallback(dispatch, prompt, opts, fallbacks, onSwitch);
 }
+
+/**
+ * Real {@link Dispatcher}: wraps the module-level {@link dispatch} and
+ * {@link dispatchWithFallback} unchanged, so prod wiring gets byte-identical
+ * behaviour. Passed as the default dispatcher to {@link PaseoAgent}.
+ */
+export const realDispatcher: Dispatcher = {
+  dispatch,
+  dispatchWithFallback,
+};
 
 // ---------------------------------------------------------------------------
 // Prompt builders. The receiving Paseo agent starts with zero context, so each
@@ -279,6 +294,12 @@ const SLUG = (n: number) => `dag-${n}`;
  * parsing — so the lifecycle orchestrator branches on outcomes, never on
  * dispatch mechanics. The stable-log polling that guarantees a complete
  * transcript lives inside {@link dispatch}.
+ *
+ * Dispatch is injected via {@link Dispatcher}: prod wiring passes the default
+ * {@link realDispatcher} (byte-identical to a bare module call), while focused
+ * unit tests pass a fake that returns scripted {@link DispatchResult}s — so the
+ * dispatch-result → {@link ImplResult}.reason map and the adapter-originated
+ * unknown-verdict path are covered without spawning a process.
  */
 export class PaseoAgent implements AgentPort {
   constructor(
@@ -288,6 +309,7 @@ export class PaseoAgent implements AgentPort {
     private readonly log: Logger,
     private readonly cwd?: string,
     private readonly timeoutMs: number = DEFAULT_RUN_MS,
+    private readonly dispatcher: Dispatcher = realDispatcher,
   ) {}
 
   /**
@@ -304,7 +326,7 @@ export class PaseoAgent implements AgentPort {
   }
 
   async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
-    const r = await dispatchWithFallback(
+    const r = await this.dispatcher.dispatchWithFallback(
       implementPrompt(t, branch),
       {
         provider: this.prefs.impl,
@@ -343,7 +365,7 @@ export class PaseoAgent implements AgentPort {
    *  output, so an unparseable verdict means the agent genuinely didn't emit one. */
   async review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict> {
     await this.branch.cleanBranch(branch);
-    const r = await dispatchWithFallback(
+    const r = await this.dispatcher.dispatchWithFallback(
       reviewPrompt(t, base),
       {
         provider: this.prefs.review,
@@ -366,7 +388,7 @@ export class PaseoAgent implements AgentPort {
 
   async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
     await this.branch.cleanBranch(branch);
-    const r = await dispatchWithFallback(
+    const r = await this.dispatcher.dispatchWithFallback(
       fixPrompt(t, verdict.raw, branch),
       {
         provider: this.prefs.impl,
@@ -385,7 +407,7 @@ export class PaseoAgent implements AgentPort {
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
     const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
-    const r = await dispatch(singleShotPrompt(skill, t), {
+    const r = await this.dispatcher.dispatch(singleShotPrompt(skill, t), {
       provider,
       title: `${skill} #${t.number}`,
       slug: SLUG(t.number),
