@@ -11,7 +11,7 @@ import {
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
-import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
+import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import pkg from "../package.json";
 
 interface ParsedArgs {
@@ -212,14 +212,6 @@ function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: numb
   };
 }
 
-/** Ticket numbers already settled to `status` in persisted state — used to
- *  pre-seed the scheduler so a resumed run skips/re-cascades them. */
-function seedByStatus(state: RunState, status: TicketStatus): number[] {
-  return Object.entries(state.tickets)
-    .filter(([, s]) => s.status === status)
-    .map(([n]) => parseInt(n, 10));
-}
-
 export async function main(argv: string[]): Promise<number> {
   let a: ParsedArgs;
   try {
@@ -311,9 +303,9 @@ export async function main(argv: string[]): Promise<number> {
     };
   }
 
-  const seedCompleted = seedByStatus(state, "done");
-  const seedFailed = seedByStatus(state, "failed");
-  const seedSkipped = seedByStatus(state, "skipped");
+  const seedCompleted = ticketsWithStatus(state, "done");
+  const seedFailed = ticketsWithStatus(state, "failed");
+  const seedSkipped = ticketsWithStatus(state, "skipped");
 
   const branch = new ShellBranch(a.cwd);
   const pullRequest = new ShellPullRequest(a.cwd);

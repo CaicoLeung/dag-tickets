@@ -38,6 +38,14 @@ export async function saveState(state: RunState, cwd?: string): Promise<void> {
   await writeFile(full, JSON.stringify(state, null, 2) + "\n", "utf8");
 }
 
+/** Issue numbers persisted as `status` — used to pre-seed the scheduler so a
+ *  resumed run skips/re-cascades them instead of relaunching them. */
+export function ticketsWithStatus(state: RunState, status: TicketStatus): number[] {
+  return Object.entries(state.tickets)
+    .filter(([, s]) => s.status === status)
+    .map(([n]) => parseInt(n, 10));
+}
+
 export async function loadState(runId: string, cwd?: string): Promise<RunState | null> {
   const path = statePath(runId);
   const full = cwd ? `${cwd.replace(/\/$/, "")}/${path}` : path;
