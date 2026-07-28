@@ -1,4 +1,4 @@
-import type { FailureReason, TicketStatus } from "./types.ts";
+import type { FailureReason, SettleReason, TicketStatus } from "./types.ts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -21,6 +21,11 @@ export interface TicketState {
    *  ticket settled `failed`. */
   reason?: FailureReason;
   error?: string;
+  /** Non-natural settle marker (e.g. `"cascade-abort"` for a cascade-killed
+   *  dependent, #20). Distinct from `error` (a genuine failure) so a resumed
+   *  run can tell a cascade-aborted dependent from an unknown-kind skip without
+   *  scraping `error`. */
+  skipReason?: SettleReason;
 }
 
 export interface RunState {

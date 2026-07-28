@@ -11,7 +11,7 @@ import {
 } from "./discover.ts";
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
-import type { FailureReason, Ticket, TicketStatus } from "./types.ts";
+import type { FailureReason, SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog } from "./events.ts";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
@@ -236,7 +236,18 @@ function makeLogger(dryRun: boolean): Logger {
   };
 }
 
-function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: number; rounds?: number; attempts?: number; reason?: FailureReason; error?: string }): TicketState {
+function stateFromOutcome(
+  status: TicketStatus,
+  o?: {
+    branch?: string;
+    pr?: number;
+    rounds?: number;
+    attempts?: number;
+    reason?: FailureReason;
+    error?: string;
+    skipReason?: SettleReason;
+  },
+): TicketState {
   return {
     status,
     branch: o?.branch,
@@ -245,6 +256,7 @@ function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: numb
     attempts: o?.attempts,
     reason: o?.reason,
     error: o?.error,
+    skipReason: o?.skipReason,
   };
 }
 
@@ -485,8 +497,22 @@ export async function main(argv: string[]): Promise<number> {
         if (!a.dryRun) await saveState(state, a.cwd);
         return outcome.status;
       },
-      onSettle: async (n, status) => {
-        state.tickets[n] = stateFromOutcome(status, state.tickets[n]);
+      // #20: when a running dependent's blocker settles failed/skipped, kill the
+      // dependent's agent dispatch + clean its worktree instead of letting it
+      // burn a full implement→review→fix→CI cycle on a doomed branch. Wired
+      // unconditionally to mirror the sibling `onSettle` shape; the internal
+      // dry-run guard matches `saveState`'s (nothing dispatched → nothing to
+      // kill, and the scheduler's dry-run cascade never reaches the abort path).
+      abort: async (n: number) => {
+        if (a.dryRun) return;
+        const t = graph.byNumber.get(n);
+        if (t) await agent.abort(t);
+      },
+      onSettle: async (n, status, reason) => {
+        // A cascade-abort `reason` is persisted on its own field (not overloaded
+        // onto `error`) so a resumed run distinguishes a killed dependent from a
+        // genuine error or an unknown-kind skip without scraping `error`.
+        state.tickets[n] = stateFromOutcome(status, { ...state.tickets[n], ...(reason ? { skipReason: reason } : {}) });
         if (!a.dryRun) await saveState(state, a.cwd);
       },
     });

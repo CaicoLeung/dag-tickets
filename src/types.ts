@@ -18,6 +18,17 @@ export type TicketStatus =
   | "failed" // exhausted retries / fix-loop; needs human attention
   | "skipped"; // unknown kind, closed, or filtered out
 
+/**
+ * Non-natural settle marker — why a ticket settled other than by running to
+ * its own outcome. Persisted on resume state so a resumed run can tell a
+ * cascade-aborted dependent apart from an unknown-kind skip or a genuine error.
+ *
+ * - `"cascade-abort"` — an in-flight dependent killed by the cascade when its
+ *   blocker settled failed/skipped (#20). Reachable in prod once the frontier
+ *   lets dependents overlap in-flight blockers (#29).
+ */
+export type SettleReason = "cascade-abort";
+
 export interface Ticket {
   /** GitHub issue number. */
   number: number;
