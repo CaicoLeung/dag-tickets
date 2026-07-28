@@ -260,6 +260,68 @@ function stateFromOutcome(
   };
 }
 
+/**
+ * #29 overlap coordinator: owns the run-wide bookkeeping that gates frontier
+ * relaxation, extracted out of main() so the orchestrator stops growing a new
+ * field + closure per overlap reason. Three concerns, one home:
+ *  - `pushedHeads`: admits a dependent once its blocker has pushed its head
+ *    (createPr ran) — the canOverlap policy reads it.
+ *  - `settled` + `waiters`: gate an overlap-dependent's createPr on its blocker
+ *    merging (no premature PR); seeded from resume sets so a dependent
+ *    overlapping an already-done blocker resolves immediately.
+ * Exposed as the slim RunContext hooks (markHeadPushed / waitForBlockers) plus
+ * the scheduler's canOverlap policy; main() wires them, this class owns them.
+ */
+class OverlapCoordinator {
+  private readonly pushedHeads = new Set<number>();
+  private readonly settled: Set<number>;
+  private readonly waiters = new Map<number, Array<() => void>>();
+
+  constructor(seedSettled: Iterable<number>) {
+    this.settled = new Set(seedSettled);
+  }
+
+  /** Scheduler overlap policy: both implement AND the blocker has pushed its
+   *  head (createPr ran) so a dependent never branches off a missing tip. */
+  readonly canOverlap = (dep: Ticket, blocker: Ticket): boolean =>
+    dep.kind === "implement" &&
+    blocker.kind === "implement" &&
+    this.pushedHeads.has(blocker.number);
+
+  /** RunContext hook: ticket `n` pushed its head → admit its dependents. */
+  readonly markHeadPushed = (n: number): void => {
+    this.pushedHeads.add(n);
+  };
+
+  /** RunContext hook: gate createPr on every blocker settling. Overlap can't
+   *  trigger at concurrency 1, so a blocker always holds its own slot while a
+   *  dependent waits here — no deadlock. */
+  readonly waitForBlockers = async (blockers: number[]): Promise<void> => {
+    await Promise.all(blockers.map((b) => this.awaitOne(b)));
+  };
+
+  /** Scheduler onSettle hook: record `n` settled and release any overlap-
+   *  dependent waiting on it. Called before state persist so a resumed run
+   *  sees the blocker as settled too. */
+  noteSettled(n: number): void {
+    this.settled.add(n);
+    const w = this.waiters.get(n);
+    if (w) {
+      this.waiters.delete(n);
+      for (const fn of w) fn();
+    }
+  }
+
+  private awaitOne = (n: number): Promise<void> =>
+    this.settled.has(n)
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          const arr = this.waiters.get(n) ?? [];
+          arr.push(resolve);
+          this.waiters.set(n, arr);
+        });
+}
+
 export async function main(argv: string[]): Promise<number> {
   let a: ParsedArgs;
   try {
@@ -420,24 +482,11 @@ export async function main(argv: string[]): Promise<number> {
     const branch = new ShellBranch(a.cwd);
     const pullRequest = new ShellPullRequest(a.cwd);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
-    // #29: overlap bookkeeping shared across the run. `pushedHeads` admits a
-    // dependent to launch once its blocker has pushed its head (createPr) — the
-    // canOverlap policy reads it. `settled` + `blockerWaiters` gate an overlap-
-    // dependent's createPr on its blocker merging (no premature PR). Seeded from
-    // the resume sets so a dependent overlapping an already-done blocker resolves.
-    const pushedHeads = new Set<number>();
-    const settled = new Set<number>([...seedCompleted, ...seedFailed, ...seedSkipped]);
-    const blockerWaiters = new Map<number, Array<() => void>>();
-    const waitForBlocker = (n: number): Promise<void> =>
-      settled.has(n)
-        ? Promise.resolve()
-        : new Promise<void>((resolve) => {
-            const arr = blockerWaiters.get(n) ?? [];
-            arr.push(resolve);
-            blockerWaiters.set(n, arr);
-          });
-    const canOverlap = (dep: Ticket, blocker: Ticket): boolean =>
-      dep.kind === "implement" && blocker.kind === "implement" && pushedHeads.has(blocker.number);
+    // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
+    // createPr) lives in one coordinator instead of scattered sets/closures in
+    // main() — see OverlapCoordinator. Seeded from the resume sets so a
+    // dependent overlapping an already-done blocker resolves immediately.
+    const overlap = new OverlapCoordinator([...seedCompleted, ...seedFailed, ...seedSkipped]);
     const ctx: RunContext = {
       agent,
       pullRequest,
@@ -449,10 +498,8 @@ export async function main(argv: string[]): Promise<number> {
       dryRun: a.dryRun,
       log,
       events,
-      markHeadPushed: (n) => {
-        pushedHeads.add(n);
-      },
-      waitForBlockers: (blockers) => Promise.all(blockers.map(waitForBlocker)).then(() => {}),
+      markHeadPushed: overlap.markHeadPushed,
+      waitForBlockers: overlap.waitForBlockers,
     };
 
     const result = await runBatch(graph, {
@@ -461,7 +508,7 @@ export async function main(argv: string[]): Promise<number> {
       seedFailed,
       seedSkipped,
       events,
-      canOverlap,
+      canOverlap: overlap.canOverlap,
       process: async (n, info) => {
         const t = graph.byNumber.get(n)!;
         // #29: a launch via overlap composes on the blocker's pushed head +
@@ -545,15 +592,10 @@ export async function main(argv: string[]): Promise<number> {
         if (t) await agent.abort(t);
       },
       onSettle: async (n, status, reason) => {
-        // #29: this ticket settled — unblock any overlap-dependent waiting in
+        // #29: this ticket settled — release any overlap-dependent waiting in
         // its pre-createPr gate (waitForBlockers). Recorded before state persist
         // so a dependent resumed after a kill sees the blocker as settled too.
-        settled.add(n);
-        const waiters = blockerWaiters.get(n);
-        if (waiters) {
-          blockerWaiters.delete(n);
-          for (const w of waiters) w();
-        }
+        overlap.noteSettled(n);
         // A cascade-abort `reason` is persisted on its own field (not overloaded
         // onto `error`) so a resumed run distinguishes a killed dependent from a
         // genuine error or an unknown-kind skip without scraping `error`.

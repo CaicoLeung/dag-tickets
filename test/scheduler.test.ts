@@ -165,45 +165,72 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     expect(out.completed).toEqual([1, 2]);
   });
 
-  test("#29: a blocker settling done fires reconcile for each overlapping in-flight dependent", async () => {
-    // 1 → {2,3}. All three gated. Release 1 → it settles done while 2,3 are
-    // still in flight (overlap-launched) → reconcile must fire for both.
-    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [1])]);
-    const reconciled: Array<{ dep: number; blocker: number }> = [];
+  test("#29: a failing blocker aborts its overlap-launched in-flight dependent (AC-3)", async () => {
+    // 1 → 2. Hold 1 in flight so 2 overlap-launches (canOverlap). Then FAIL 1.
+    // The in-flight 2 must be aborted (cascade-skipped) via opts.abort — the
+    // path #28 landed but #29 makes genuinely reachable. Covers the AC-3 gap
+    // the review flagged (overlap × abort intersection had no test).
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const aborted: number[] = [];
     const gates = new Map<number, () => void>();
+    let fail1 = false;
     const process = async (n: number): Promise<TicketStatus> => {
-      await new Promise<void>((r) => { gates.set(n, r); });
+      if (n === 1) {
+        await new Promise<void>((r) => { gates.set(1, r); });
+        return fail1 ? "failed" : "done";
+      }
+      // 2 overlap-launched; sit in flight so it's still running when 1 fails.
+      await new Promise<void>((r) => { gates.set(2, r); });
       return "done";
     };
     const run = runBatch(g, {
-      concurrency: 3,
+      concurrency: 2,
       process,
       canOverlap: () => true,
-      reconcile: async (dep, blocker) => {
-        reconciled.push({ dep, blocker });
-        gates.get(dep)?.(); // rebase done → let the dependent continue + settle
+      abort: async (n) => {
+        aborted.push(n);
+        gates.get(n)?.(); // release the dependent's gate so its promise settles
       },
     });
     await new Promise((r) => setTimeout(r, 0));
-    // 1, 2, 3 all launched and gated. Release 1 → done → reconcile(2,1),(3,1).
+    // Both launched; 2 overlap-in-flight. Fail 1 → 2 must be aborted.
+    fail1 = true;
     gates.get(1)!();
-    await run;
-    expect(reconciled).toContainEqual({ dep: 2, blocker: 1 });
-    expect(reconciled).toContainEqual({ dep: 3, blocker: 1 });
+    const out = await run;
+    expect(aborted).toEqual([2]);
+    expect(out.failed).toEqual([1]);
+    expect(out.skipped).toEqual([2]); // cascade-skipped, NOT completed
+    expect(out.completed).toEqual([]);
   });
 
-  test("#29: reconcile is not fired when the dependent was not overlap-launched", async () => {
-    // Strict order: 1 settles done BEFORE 2 launches, so 2 is never in flight
-    // concurrent with 1's settle → reconcile never fires.
-    const g = buildGraph([ticket(1), ticket(2, [1])]);
-    const reconciled: Array<{ dep: number; blocker: number }> = [];
-    const fake = makeFake();
-    await runBatch(g, {
-      concurrency: 2,
-      process: fake.process,
-      reconcile: async (dep, blocker) => { reconciled.push({ dep, blocker }); },
-    });
-    expect(reconciled).toEqual([]);
+  test("#29: a fan-in dependent with two in-flight blockers does NOT overlap-launch", async () => {
+    // 4 depends on 2 and 3; both held in flight. Even under canOverlap=allow,
+    // 4 can't overlap (two heads → can't compose onto one) → it must NOT
+    // launch until one blocker settles. Proves the composition-gap fix at the
+    // runBatch seam: LaunchInfo.overlapBlocker stays absent for fan-in.
+    const g = buildGraph([ticket(2), ticket(3), ticket(4, [2, 3])]);
+    const launched: Array<{ n: number; overlap: boolean }> = [];
+    const gates = new Map<number, () => void>();
+    const process = async (n: number, info?: LaunchInfo): Promise<TicketStatus> => {
+      launched.push({ n, overlap: info?.overlapBlocker !== undefined });
+      await new Promise<void>((r) => { gates.set(n, r); });
+      return "done";
+    };
+    const run = runBatch(g, { concurrency: 3, process, canOverlap: () => true });
+    await new Promise((r) => setTimeout(r, 0));
+    // 2 and 3 launched; 4 must NOT have launched (fan-in, two in-flight blockers).
+    expect(launched.map((l) => l.n)).toContain(2);
+    expect(launched.map((l) => l.n)).toContain(3);
+    expect(launched.map((l) => l.n)).not.toContain(4);
+    // Complete 2 → only 3 remains in flight → 4 overlap-launches on 3.
+    gates.get(2)!();
+    await new Promise((r) => setTimeout(r, 0));
+    const four = launched.find((l) => l.n === 4);
+    expect(four).toBeDefined();
+    expect(four!.overlap).toBe(true); // overlapped on the single remaining blocker
+    gates.get(3)!();
+    gates.get(4)!();
+    await run;
   });
 
   test("#29: process receives {overlapBlocker} on an overlap launch and {} otherwise", async () => {

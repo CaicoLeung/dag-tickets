@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { buildGraph, frontier, cascadeDependents, CycleError } from "../src/graph.ts";
+import { buildGraph, frontier, cascadeDependents, overlapBlockerFor, CycleError } from "../src/graph.ts";
 import { fanInHeavyGraph } from "./helpers.ts";
 import type { Ticket } from "../src/types.ts";
 
@@ -66,25 +66,37 @@ describe("frontier", () => {
     // Strict frontier (no policy): 2 is NOT ready — 1 is neither completed nor overlap-allowed.
     expect(frontier(g, new Set(), new Set([1]), new Set())).toEqual([]);
     // Relaxed: 1 is in flight and the policy allows it → 2 becomes ready.
-    expect(frontier(g, new Set(), new Set([1]), new Set(), () => true)).toEqual([2]);
+    expect(frontier(g, new Set(), new Set([1]), new Set(), { canOverlap: () => true })).toEqual([2]);
   });
 
   test("#29 overlap: canOverlap=false keeps the strict frontier", () => {
     // 1 → 2 → 3. Blocker 1 in flight.
     const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
     // Deny-all policy → nothing ready (same as no policy).
-    expect(frontier(g, new Set(), new Set([1]), new Set(), () => false)).toEqual([]);
+    expect(frontier(g, new Set(), new Set([1]), new Set(), { canOverlap: () => false })).toEqual([]);
     // Allow 2 to overlap 1 only → 2 ready; 3 still blocked (its blocker 2 is not in flight).
     expect(
-      frontier(g, new Set(), new Set([1]), new Set(), (dep, blocker) =>
-        dep.number === 2 && blocker.number === 1),
+      frontier(g, new Set(), new Set([1]), new Set(), {
+        canOverlap: (dep, blocker) => dep.number === 2 && blocker.number === 1,
+      }),
     ).toEqual([2]);
   });
 
   test("#29 overlap: a completed blocker satisfies regardless of canOverlap", () => {
     const g = buildGraph([ticket(1), ticket(2, [1])]);
     // 1 completed → 2 ready even under a deny policy; the overlap path is never consulted.
-    expect(frontier(g, new Set([1]), new Set(), new Set(), () => false)).toEqual([2]);
+    expect(frontier(g, new Set([1]), new Set(), new Set(), { canOverlap: () => false })).toEqual([2]);
+  });
+
+  test("#29 overlap: fan-in with two in-flight blockers stays strict (no overlap)", () => {
+    // 4 depends on both 2 and 3; both in flight and overlap-permitted. Overlap
+    // composes onto ONE head, so with two unresolved blockers it is unsafe →
+    // 4 must NOT become ready even under an allow policy (the composition gap
+    // the review flagged: a single overlapBlocker can't cover fan-in).
+    const g = buildGraph([ticket(2), ticket(3), ticket(4, [2, 3])]);
+    expect(frontier(g, new Set(), new Set([2, 3]), new Set(), { canOverlap: () => true })).toEqual([]);
+    // Once one blocker completes, only one remains in flight → overlap-safe.
+    expect(frontier(g, new Set([2]), new Set([3]), new Set(), { canOverlap: () => true })).toEqual([4]);
   });
 });
 
@@ -143,8 +155,37 @@ describe("frontier ordering (fan-in / critical path)", () => {
     // and flipping the order to ascending [1,2]. Excluding it from the
     // weighting `done` keeps #2's fan-in at 2 → order stays [2,1].
     expect(
-      frontier(g, new Set(), new Set([3]), new Set(), undefined, new Set([3])),
+      frontier(g, new Set(), new Set([3]), new Set(), { inflight: new Set([3]) }),
     ).toEqual([2, 1]);
+  });
+});
+
+describe("overlapBlockerFor", () => {
+  test("single in-flight blocker admitted by canOverlap → returns it", () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    expect(overlapBlockerFor(g.byNumber.get(2)!, g, new Set([1]), () => true)).toBe(1);
+  });
+
+  test("two in-flight blockers (fan-in) → undefined (can't compose onto one head)", () => {
+    const g = buildGraph([ticket(2), ticket(3), ticket(4, [2, 3])]);
+    expect(overlapBlockerFor(g.byNumber.get(4)!, g, new Set([2, 3]), () => true)).toBeUndefined();
+  });
+
+  test("zero in-flight blockers (all completed) → undefined (no overlap needed)", () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    expect(overlapBlockerFor(g.byNumber.get(2)!, g, new Set(), () => true)).toBeUndefined();
+  });
+
+  test("single in-flight blocker but canOverlap denies → undefined", () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    expect(overlapBlockerFor(g.byNumber.get(2)!, g, new Set([1]), () => false)).toBeUndefined();
+  });
+
+  test("out-of-batch blocker doesn't count toward the single-in-flight check", () => {
+    // 2 depends on 1 (in-flight) and 999 (out-of-batch → satisfied). One real
+    // in-flight blocker → overlap-safe; the out-of-batch one is invisible here.
+    const g = buildGraph([ticket(1), ticket(2, [1, 999])]);
+    expect(overlapBlockerFor(g.byNumber.get(2)!, g, new Set([1]), () => true)).toBe(1);
   });
 });
 

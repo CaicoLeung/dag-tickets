@@ -1,5 +1,5 @@
 import type { Graph } from "./graph.ts";
-import { frontier, cascadeDependents } from "./graph.ts";
+import { frontier, cascadeDependents, overlapBlockerFor } from "./graph.ts";
 import type { SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
@@ -222,22 +222,14 @@ export async function runBatch(
      */
     abort?: (number: number) => Promise<void>;
     /** #29: frontier relaxation policy. When provided, a dependent `dep` may
-     *  become ready while one of its blockers `blocker` is still in flight
-     *  (rather than waiting for `completed`). Injected (not built internally)
-     *  so the scheduler stays decoupled from ticket-kind / branch-state policy:
-     *  the cli builds it from routing kinds + "blocker head pushed" signals.
-     *  Absent → strict frontier (current behaviour). */
+     *  become ready while its single in-flight `blocker` is still running
+     *  (rather than waiting for `completed`) — see {@link overlapBlockerFor}
+     *  for why overlap is restricted to one in-flight blocker (fan-in can't
+     *  compose onto one head). Injected (not built internally) so the scheduler
+     *  stays decoupled from ticket-kind / branch-state policy: the cli builds
+     *  it from routing kinds + "blocker head pushed" signals. Absent → strict
+     *  frontier (current behaviour). */
     canOverlap?: (dep: Ticket, blocker: Ticket) => boolean;
-    /** #29: reconcile an overlapping in-flight `dependent` onto its just-merged
-     *  `blocker`. Fired from the settle path when a blocker settles `done`
-     *  while the dependent is still in flight (it launched via `canOverlap`).
-     *  The hook rebases the dependent's branch onto the merged result; on
-     *  conflict it should arrange for the dependent to settle `failed`.
-     *  Fire-and-forget (like `abort`): the scheduler records the merge and
-     *  moves on; a failed rebase surfaces when the dependent later settles.
-     *  Absent → no reconcile — the dependent keeps whatever base it branched
-     *  off and may conflict at its own PR. */
-    reconcile?: (dependent: number, blocker: number) => Promise<void>;
     /** Pre-seeded from resumed state. */
     seedCompleted?: Iterable<number>;
     seedFailed?: Iterable<number>;
@@ -327,20 +319,24 @@ export async function runBatch(
     // just-launched blocker satisfies no dependent by completion, so the
     // recomputed `ready` is empty and the loop exits after one launch.
     while (inflight.size < opts.concurrency) {
-      const ready = frontier(
-        graph,
-        completed,
-        new Set([...inflight.keys(), ...skipped]),
-        failed,
-        opts.canOverlap,
-        overlapInflight,
-      );
+      // `running` = in flight ∪ skipped (skipped tickets are folded in so they
+      // satisfy dependents exactly like completed ones do — see the settle
+      // path). Computed once so frontier's ready check and the launch-site
+      // overlap decision read the same set and can't disagree on a blocker.
+      const running = new Set([...inflight.keys(), ...skipped]);
+      const ready = frontier(graph, completed, running, failed, {
+        canOverlap: opts.canOverlap,
+        inflight: overlapInflight,
+      });
       if (ready.length === 0) break;
       const n = ready[0]!;
-      // #29: if n has a blocker still in flight, this is an overlap launch —
-      // record which blocker so the caller can branch off its head + capture
-      // its tip for the later reconcile.
-      const overlapBlocker = graph.byNumber.get(n)?.blockedBy.find((b) => inflight.has(b));
+      // #29: capture the single blocker n overlapped (if any) so the caller can
+      // branch off its head + capture its tip for the pull-model reconcile.
+      // overlapBlockerFor returns undefined for fan-in (>1 in-flight blocker),
+      // so a multi-blocker dependent never overlap-launches on just one head —
+      // matching frontier's ready decision exactly (shared helper).
+      const t = graph.byNumber.get(n);
+      const overlapBlocker = t ? overlapBlockerFor(t, graph, running, opts.canOverlap) : undefined;
       launch(n, overlapBlocker !== undefined ? { overlapBlocker } : {});
     }
 
@@ -357,17 +353,10 @@ export async function runBatch(
       skipped.add(settled.number);
     } else if (settled.status === "done") {
       completed.add(settled.number);
-      // #29: an overlapped in-flight dependent of this just-merged blocker must
-      // rebase onto the merged result before its own review/PR. Fire reconcile
-      // for each such dependent (best-effort, fire-and-forget — see `abort`);
-      // the hook coordinates the rebase and, on conflict, fails the dependent.
-      if (opts.reconcile) {
-        for (const dep of graph.blocks.get(settled.number) ?? []) {
-          if (inflight.has(dep) && overlapInflight.has(dep)) {
-            void Promise.resolve(opts.reconcile(dep, settled.number)).catch(() => {});
-          }
-        }
-      }
+      // Reconcile of an overlapped dependent onto its just-merged blocker is
+      // the lifecycle's job (pull model: between dispatches, before createPr —
+      // see lifecycle.ts). A push-model fire here would race a live agent
+      // worktree, so the scheduler does NOT touch overlap branches on settle.
     } else {
       // failed — cascade to not-yet-started dependents only.
       failed.add(settled.number);
@@ -382,9 +371,12 @@ export async function runBatch(
     // the doomed branch without waiting for resume to self-heal it.
     if (settled.status === "failed") applyCascade("failed", failed);
     else if (settled.status === "skipped") applyCascade("skipped", skipped);
-    // #29: drop overlap-launched dependents that left the race this pass —
-    // either settled naturally (above) or cascade-aborted (applyCascade deletes
-    // from `inflight`). Once out of flight they weigh as terminal, not pending.
+    // #29: prune overlap-launched dependents that left the in-flight race this
+    // pass. The `overlapInflight.delete(settled.number)` above covers a natural
+    // settle; this sweep covers the OTHER exit — a cascade-aborted dependent,
+    // which applyCascadePlan removed from `inflight` (not from overlapInflight).
+    // Without it, an aborted dependent would keep biasing its (now-settled)
+    // blocker's weight on the next frontier call.
     for (const n of [...overlapInflight]) {
       if (!inflight.has(n)) overlapInflight.delete(n);
     }

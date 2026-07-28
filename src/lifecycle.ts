@@ -177,15 +177,16 @@ async function runImplementLifecycle(
   if (overlap && ctx.agent.reconcile) {
     const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
     if (!rec.ok) {
-      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
-        ok: false,
-        reason: rec.reason ?? "overlap-rebase",
-        onto: ctx.baseBranch,
-      });
+      // One reason, used in the event payload, the persisted FailureReason,
+      // and the human error message — formerly three separate
+      // `rec.reason ?? …` reads that drifted (the error said "unknown" while
+      // the reason said "overlap-rebase"). Default matches the failure type.
+      const reason = rec.reason ?? "overlap-rebase";
+      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, { ok: false, reason, onto: ctx.baseBranch });
       return fail(
         t,
         ctx,
-        { reason: rec.reason ?? "overlap-rebase", error: `overlap reconcile failed (${rec.reason ?? "unknown"})` },
+        { reason, error: `overlap reconcile failed (${reason})` },
         branch,
       );
     }
