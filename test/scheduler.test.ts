@@ -125,6 +125,47 @@ describe("runBatch — concurrency bound", () => {
   });
 });
 
+describe("runBatch — #29 frontier relaxation (overlap)", () => {
+  test("a dependent launches while its blocker is still in flight under canOverlap", async () => {
+    // 1 → 2. Blocker 1 is held in flight (gated), so the only way 2 can launch
+    // is via overlap: frontier must see 1 in `running` and let canOverlap admit 2.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const launched: number[] = [];
+    let release1!: () => void;
+    const process = async (n: number): Promise<TicketStatus> => {
+      launched.push(n);
+      if (n === 1) await new Promise<void>((r) => { release1 = r; });
+      return "done";
+    };
+    const run = runBatch(g, { concurrency: 2, process, canOverlap: () => true });
+    // Flush microtasks: the scheduler launches 1, recomputes frontier (1 now in
+    // flight → 2 overlap-ready), and launches 2 — all before 1 settles.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(launched).toEqual([1, 2]); // 2 launched AFTER 1, BEFORE 1 settled
+    release1();
+    const out = await run;
+    expect(out.completed).toEqual([1, 2]);
+  });
+
+  test("without canOverlap a dependent waits for its blocker to settle (strict)", async () => {
+    // Same graph, no canOverlap → 2 must NOT launch while 1 is in flight.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const launched: number[] = [];
+    let release1!: () => void;
+    const process = async (n: number): Promise<TicketStatus> => {
+      launched.push(n);
+      if (n === 1) await new Promise<void>((r) => { release1 = r; });
+      return "done";
+    };
+    const run = runBatch(g, { concurrency: 2, process }); // no canOverlap → strict
+    await new Promise((r) => setTimeout(r, 0));
+    expect(launched).toEqual([1]); // 2 NOT launched while 1 in flight
+    release1();
+    const out = await run;
+    expect(out.completed).toEqual([1, 2]);
+  });
+});
+
 describe("runBatch — failure cascade", () => {
   test("a failed ticket cascades to its unstarted dependents", async () => {
     // 1 fails -> 2 (depends on 1) and 3 (depends on 2) never run.

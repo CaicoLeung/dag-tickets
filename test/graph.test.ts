@@ -129,6 +129,23 @@ describe("frontier ordering (fan-in / critical path)", () => {
     ]);
     expect(frontier(g, new Set(), new Set(), new Set())).toEqual([1, 2]);
   });
+
+  test("#29 (decision #4): an overlap-inflight dependent keeps its blocker's fan-in weight", () => {
+    // #2 blocks {3,4} (fan-in 2); #1 blocks {5} (fan-in 1). Normally #2 leads.
+    const g = buildGraph([
+      ticket(1), ticket(2),
+      ticket(3, [2]), ticket(4, [2]),
+      ticket(5, [1]),
+    ]);
+    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2, 1]);
+    // 3 launched early via overlap → it's in flight (in `running`). Naively it
+    // would drop out of #2's pending dependents, tying #2's fan-in to #1's (1)
+    // and flipping the order to ascending [1,2]. Excluding it from the
+    // weighting `done` keeps #2's fan-in at 2 → order stays [2,1].
+    expect(
+      frontier(g, new Set(), new Set([3]), new Set(), undefined, new Set([3])),
+    ).toEqual([2, 1]);
+  });
 });
 
 describe("cascadeDependents", () => {

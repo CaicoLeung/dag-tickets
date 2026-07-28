@@ -116,6 +116,14 @@ export function frontier(
    *  The policy is caller-owned (the scheduler builds it from ticket kinds +
    *  branch state) so `frontier` stays pure and unit-testable. */
   canOverlap?: (dep: Ticket, blocker: Ticket) => boolean,
+  /** #29 (decision #4): dependents currently in flight that were launched via
+   *  overlap (their blocker was still in flight at launch time). Excluded
+   *  from the *weighting* `done` snapshot below so they still count toward
+   *  their blocker's fan-in / critical-depth weight until it settles —
+   *  otherwise launching a dependent early would silently shrink its
+   *  blocker's priority and could reorder the remaining frontier. They're
+   *  still excluded from `ready` above, so they're never re-launched. */
+  overlapInflight?: Set<number>,
 ): number[] {
   const ready: number[] = [];
   for (const t of graph.byNumber.values()) {
@@ -138,6 +146,9 @@ export function frontier(
   // union below is exactly the set of tickets that are done or in flight —
   // i.e. no longer pending dependents a frontier ticket could unblock.
   const done = new Set<number>([...completed, ...running, ...failed]);
+  // #29 (decision #4): an overlap-launched dependent is in `running` but must
+  // still weigh as a pending dependent of its blocker (see `overlapInflight`).
+  if (overlapInflight) for (const n of overlapInflight) done.delete(n);
 
   // Direct dependents of `n` that still need to run — the shared edge-walk
   // both weighting keys derive from.
