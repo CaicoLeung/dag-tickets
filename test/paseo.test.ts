@@ -110,6 +110,13 @@ class FakeBranch implements BranchPort {
     this.rebased.push({ branch, oldBase, newBase });
     return this.rebaseOk;
   }
+  /** Scripted tips: ref → SHA. An absent ref returns null ("not pushed yet"). */
+  tips: Record<string, string> = {};
+  fetchedTips: string[] = [];
+  async resolveRemoteTip(ref: string): Promise<string | null> {
+    this.fetchedTips.push(ref);
+    return this.tips[ref] ?? null;
+  }
 }
 
 function capturingLog(): { log: Logger; lines: [string, string, number | undefined][] } {

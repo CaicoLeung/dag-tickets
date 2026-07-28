@@ -109,6 +109,26 @@ export class ShellBranch implements BranchPort {
     return false;
   }
 
+  /** @see {BranchPort.resolveRemoteTip}.
+   *
+   *  Refspec mirrors {@link ensureBaseRefFresh} (the leading `+` force-updates
+   *  the remote-tracking ref so a rebased / force-pushed blocker head still
+   *  lands instead of being rejected). `null` covers both a failed fetch and a
+   *  ref that doesn't exist on the remote — the caller can't tell (and doesn't
+   *  need to) whether the blocker hasn't pushed yet or the fetch broke. */
+  async resolveRemoteTip(ref: string): Promise<string | null> {
+    const bare = normalizeBase(ref);
+    const fetch = await run(
+      ["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`],
+      { cwd: this.cwd },
+    );
+    if (!fetch.ok) return null;
+    const rev = await run(["git", "rev-parse", `origin/${bare}`], { cwd: this.cwd });
+    if (!rev.ok) return null;
+    const sha = rev.stdout.trim();
+    return sha || null;
+  }
+
   async commitCount(base: string, branch: string): Promise<number> {
     const r = await run(["git", "rev-list", "--count", `${base}..${branch}`], { cwd: this.cwd });
     if (!r.ok) return 0;

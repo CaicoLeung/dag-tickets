@@ -231,6 +231,16 @@ export interface BranchPort {
    *  (lost race / already settled) is a no-op success.
    */
   rebaseOnto(branch: string, oldBase: string, newBase: string): Promise<boolean>;
+  /**
+   * #29: fetch `ref` fresh into its remote-tracking ref and resolve its tip SHA.
+   *  Used at an overlap launch to (a) confirm the blocker's head branch was
+   *  pushed (its createPr step) and (b) capture the exact tip the dependent
+   *  branches from — the `blockerTipSha` {@link AgentPort.reconcile} later
+   *  rebases `--onto`. Returns null when the fetch fails OR the ref doesn't
+   *  exist on the remote (blocker hasn't pushed its head yet → the dependent
+   *  must wait, not branch off a missing tip).
+   */
+  resolveRemoteTip(ref: string): Promise<string | null>;
 }
 
 /** Strip a stray `origin/` prefix so callers can pass either form without
