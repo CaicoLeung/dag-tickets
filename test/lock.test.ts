@@ -7,6 +7,7 @@ import {
   isProcessAlive,
   lockPath,
   readLock,
+  LockAcquireError,
   LockHeldError,
   type LockInfo,
 } from "../src/lock.ts";
@@ -38,7 +39,7 @@ async function deadPid(): Promise<number> {
   });
   await child.exited;
   return child.pid!;
-};
+}
 
 describe("lockPath", () => {
   test("relative path when no cwd", () => {
@@ -119,6 +120,20 @@ describe("acquireLock", () => {
     }
   });
 
+  test("LockAcquireError is a distinct type from LockHeldError", () => {
+    // Pins the type separation: a held lock ("another run owns it, retry") is
+    // not the same condition as an unsettled acquire ("couldn't take it at
+    // all"), so the two must not be interchangeable. The fall-through in
+    // acquireLock throws LockAcquireError, never a mislabelled LockHeldError.
+    const holder: LockInfo = { pid: 1, startedAt: "t", hostname: "h", nonce: "n" };
+    const held = new LockHeldError(holder);
+    const failed = new LockAcquireError("could not settle", holder);
+    expect(held).not.toBeInstanceOf(LockAcquireError);
+    expect(failed).not.toBeInstanceOf(LockHeldError);
+    expect(failed.message).toBe("could not settle");
+    expect(failed.info?.pid).toBe(1);
+  });
+
   test("recovers a stale lock left by a dead process", async () => {
     // Simulate a killed run: write a lockfile owned by a now-dead pid.
     const stale: LockInfo = {
@@ -142,7 +157,7 @@ describe("acquireLock", () => {
 
   test("recovers a corrupt lockfile as if stale", async () => {
     await mkdir(dirname(lockPath(cwd)), { recursive: true });
-  await writeFile(lockPath(cwd), "{not json", "utf8");
+    await writeFile(lockPath(cwd), "{not json", "utf8");
     const h = await acquireLock({ cwd, runId: "after-corrupt" });
     expect(h.info.pid).toBe(process.pid);
   });

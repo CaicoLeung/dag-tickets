@@ -12,8 +12,18 @@ import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
-import { acquireLock, LockHeldError, type LockHandle } from "./lock.ts";
+import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
 import pkg from "../package.json";
+
+/**
+ * Process exit codes. `2` is reserved for usage / config / discovery failures
+ * (unknown args, missing repo info, dependency cycles, missing run state). A
+ * lock conflict is a retryable concurrency condition, so it gets distinct
+ * codes a script can branch on instead of being indistinguishable from a
+ * usage error.
+ */
+const EXIT_LOCK_HELD = 75; // EX_TEMPFAIL — another live run owns the lock; retry shortly.
+const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investigate.
 
 interface ParsedArgs {
   parent?: number;
@@ -332,9 +342,16 @@ export async function main(argv: string[]): Promise<number> {
     try {
       lockHandle = await acquireLock({ cwd: a.cwd, runId });
     } catch (e) {
+      // Distinguish the two lock failures from discovery/usage errors (exit 2):
+      // a held lock is transient (retry later); an acquire failure means
+      // recovery couldn't settle and the human should investigate.
       if (e instanceof LockHeldError) {
-        process.stderr.write(`${e.message}\n`);
-        return 2;
+        log("error", e.message);
+        return EXIT_LOCK_HELD;
+      }
+      if (e instanceof LockAcquireError) {
+        log("error", e.message);
+        return EXIT_LOCK_FAILED;
       }
       throw e;
     }

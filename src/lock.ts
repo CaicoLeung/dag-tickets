@@ -28,20 +28,18 @@ import { randomUUID } from "node:crypto";
  * pid reuse by an unrelated process is the accepted residual risk.
  */
 
-/** What we persist on disk so a holder can be identified and liveness-checked. */
+/** What we persist on disk so a holder can be identified and liveness-checked.
+ * Only the fields a consumer actually reads are kept (pid for liveness,
+ * nonce for safe release, runId/startedAt/hostname for diagnostics). */
 export interface LockInfo {
   /** OS pid of the holding process. */
   pid: number;
-  /** Parent pid, for diagnostics when the holder is an agent subprocess. */
-  ppid?: number;
   /** dag-tickets run-id, if known. */
   runId?: string;
   /** ISO timestamp the lock was taken. */
   startedAt: string;
   /** Hostname, so a lock left on one host is legible on another. */
   hostname: string;
-  /** Head of argv, for human-readable diagnostics. */
-  argv?: string[];
   /** Per-acquisition UUID; lets release prove the on-disk lock is still ours. */
   nonce: string;
 }
@@ -51,6 +49,20 @@ export class LockHeldError extends Error {
   constructor(public readonly info: LockInfo) {
     super(formatHolder(info));
     this.name = "LockHeldError";
+  }
+}
+
+/** Raised when acquire could not settle within its retry bound (e.g. a
+ *  pathological race or repeated corruption). Deliberately distinct from
+ *  {@link LockHeldError}: "another run owns it, retry later" is not the same
+ *  condition as "we could not take the lock at all". `.info` is the last
+ *  observed holder, if any was readable. */
+export class LockAcquireError extends Error {
+  readonly info?: LockInfo;
+  constructor(message: string, info?: LockInfo) {
+    super(message);
+    this.name = "LockAcquireError";
+    this.info = info;
   }
 }
 
@@ -122,11 +134,9 @@ export async function acquireLock(opts: { cwd?: string; runId?: string } = {}): 
 
   const info: LockInfo = {
     pid: process.pid,
-    ppid: process.ppid,
     runId: opts.runId,
     startedAt: new Date().toISOString(),
     hostname: hostname(),
-    argv: process.argv.slice(0, 6),
     nonce: randomUUID(),
   };
   const payload = JSON.stringify(info, null, 2) + "\n";
@@ -163,21 +173,26 @@ export async function acquireLock(opts: { cwd?: string; runId?: string } = {}): 
     await safeUnlink(path);
   }
 
-  // Couldn't settle inside the loop (e.g. a live holder kept appearing) —
-  // report the last known holder rather than silently proceeding.
+  // Couldn't settle inside the loop (e.g. a live holder kept appearing, or
+  // the file keeps getting recreated corrupt). This is NOT "another run owns
+  // it" — a live holder would have thrown LockHeldError inside the loop — so
+  // surface a distinct, honest error with the last observed holder (if any)
+  // rather than fabricating a pid:0 holder.
   const state = await inspectLock(opts.cwd);
   const finalHolder = state.present ? state.info : null;
-  throw new LockHeldError(
-    finalHolder ?? { pid: 0, startedAt: new Date().toISOString(), hostname: hostname(), nonce: "unknown" },
+  throw new LockAcquireError(
+    formatAcquireStalled(MAX_ATTEMPTS, opts.cwd, finalHolder ?? undefined),
+    finalHolder ?? undefined,
   );
 }
 
-/** Unlink, swallowing a "already gone" from a racing recoverer. */
+/** Unlink, tolerating a racing recoverer that removed it first. Any other
+ *  error (EACCES, EISDIR, …) is real and must surface, not be swallowed. */
 async function safeUnlink(path: string): Promise<void> {
   try {
     await unlink(path);
-  } catch {
-    /* a racing recoverer already removed it; the next wx attempt settles it */
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
 }
 
@@ -219,8 +234,9 @@ function makeHandle(path: string, info: LockInfo, cwd?: string): LockHandle {
       if (cur && cur.pid === info.pid && cur.nonce === info.nonce) {
         try {
           await unlink(path);
-        } catch {
-          /* already gone — nothing to do */
+        } catch (e) {
+          // Already gone (racing recoverer) is fine; anything else is not.
+          if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
         }
       }
     },
@@ -239,6 +255,29 @@ function formatHolder(info: LockInfo): string {
   );
   lines.push(
     "If the holder is already dead, just re-run dag-tickets — it recovers the stale lock automatically.",
+  );
+  return lines.join("\n");
+}
+
+/** Message for {@link LockAcquireError}: we could not settle, distinct from a
+ *  held lock. Includes the last observed holder if one was readable, so the
+ *  human has something to inspect, but never claims a live holder exists. */
+function formatAcquireStalled(attempts: number, cwd?: string, info?: LockInfo): string {
+  const lines = [
+    `dag-tickets: could not acquire the run lock after ${attempts} attempts.`,
+    "A concurrent run may be aggressively racing on recovery, or the lockfile",
+    "is being recreated faster than it can settle.",
+  ];
+  if (info) {
+    lines.push("Last observed holder:");
+    if (info.pid > 0) lines.push(`  pid:    ${info.pid}`);
+    if (info.runId) lines.push(`  run-id: ${info.runId}`);
+    if (info.startedAt) lines.push(`  since:  ${info.startedAt}`);
+    if (info.hostname) lines.push(`  host:   ${info.hostname}`);
+  }
+  lines.push(
+    "Re-run dag-tickets; if it keeps failing, inspect the lockfile manually:",
+    `  ${lockPath(cwd)}`,
   );
   return lines.join("\n");
 }
