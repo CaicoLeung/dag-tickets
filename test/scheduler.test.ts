@@ -3,6 +3,7 @@ import { runBatch } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
 import { fanInHeavyGraph } from "./helpers.ts";
 import type { Ticket, TicketStatus } from "../src/types.ts";
+import { EVT, RecordingSink } from "../src/events.ts";
 
 function ticket(n: number, blockedBy: number[] = []): Ticket {
   return {
@@ -361,5 +362,87 @@ describe("runBatch — resume (seed)", () => {
     });
     expect(out.failed).toEqual([1]);
     expect(out.completed).toEqual([2]); // resume correctness: not re-cascaded
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured event log (issue #19): the scheduler is the source of ticket
+// start/end + cascade transitions. Lifecycle step + provider.switch events
+// live in lifecycle/paseo and are tested there.
+// ---------------------------------------------------------------------------
+
+describe("runBatch — structured event log", () => {
+  test("each processed ticket emits ticket.start then ticket.end(done) with durationMs", async () => {
+    const g = buildGraph([ticket(1), ticket(2), ticket(3)]);
+    const sink = new RecordingSink();
+    await runBatch(g, { concurrency: 3, process: makeFake().process, events: sink });
+
+    for (const n of [1, 2, 3]) {
+      const ev = sink.of(n);
+      const startIdx = ev.findIndex((e) => e.type === EVT.TICKET_START);
+      const endIdx = ev.findIndex((e) => e.type === EVT.TICKET_END);
+      expect(startIdx).toBeGreaterThanOrEqual(0);
+      expect(endIdx).toBeGreaterThan(startIdx);
+      const end = ev[endIdx]!;
+      expect(end.data?.status).toBe("done");
+      expect(typeof end.data?.durationMs).toBe("number");
+      expect(end.data!.durationMs as number).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test("a failed ticket cascades ticket.cascade(failed, from=[root]) to dependents", async () => {
+    // 1 fails -> 2 (dep on 1) and 3 (dep on 2) cascade. Each must emit
+    // ticket.cascade (never ticket.start/ticket.end) with from linking to its
+    // immediate terminal blocker.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const sink = new RecordingSink();
+    await runBatch(g, {
+      concurrency: 3,
+      process: makeFake({ 1: "failed" }).process,
+      events: sink,
+    });
+
+    // root cause: processed -> ticket.end(failed)
+    const oneEnd = sink.of(1).find((e) => e.type === EVT.TICKET_END);
+    expect(oneEnd?.data?.status).toBe("failed");
+
+    // 2 cascades from 1; 3 cascades from 2.
+    const two = sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE);
+    expect(two?.data?.status).toBe("failed");
+    expect(two?.data?.from).toEqual([1]);
+    expect(sink.of(2).some((e) => e.type === EVT.TICKET_START)).toBe(false);
+
+    const three = sink.of(3).find((e) => e.type === EVT.TICKET_CASCADE);
+    expect(three?.data?.status).toBe("failed");
+    expect(three?.data?.from).toEqual([2]);
+  });
+
+  test("a skipped ticket cascades ticket.cascade(skipped) to dependents", async () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const sink = new RecordingSink();
+    await runBatch(g, {
+      concurrency: 2,
+      process: makeFake({ 1: "skipped" }).process,
+      events: sink,
+    });
+    expect(sink.of(1).find((e) => e.type === EVT.TICKET_END)?.data?.status).toBe("skipped");
+    const two = sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE);
+    expect(two?.data?.status).toBe("skipped");
+    expect(two?.data?.from).toEqual([1]);
+  });
+
+  test("seeded terminal tickets emit nothing (already persisted on a prior run)", async () => {
+    // Resumed run: 1 already failed. 2 cascades at startup; 1 itself emits
+    // neither start nor end (the resume contract: don't re-report seeded state).
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const sink = new RecordingSink();
+    await runBatch(g, {
+      concurrency: 2,
+      process: makeFake().process,
+      seedFailed: [1],
+      events: sink,
+    });
+    expect(sink.of(1)).toEqual([]);
+    expect(sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE)?.data?.from).toEqual([1]);
   });
 });

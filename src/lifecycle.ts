@@ -1,7 +1,8 @@
-import type { Ticket } from "./types.ts";
+import type { ReviewVerdict, Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
-import type { AgentPort, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
+import type { AgentPort, EventSink, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
+import { EVT } from "./events.ts";
 
 /**
  * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
@@ -21,6 +22,9 @@ export interface RunContext {
   requireChecks: boolean;
   dryRun: boolean;
   log: Logger;
+  /** Machine-readable event channel (issue #19). Required like `log`; tests
+   *  pass NULL_SINK (or a capturing fake) via the shared ctx() helper. */
+  events: EventSink;
 }
 
 export interface TicketOutcome {
@@ -58,7 +62,13 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
 
   // 1. Implement (fresh worktree, branch-off from the default branch). The
   // adapter verifies real commits landed before reporting success.
-  const impl = await ctx.agent.implement(t, branch, ctx.baseBranch);
+  const impl = await emitTimedStep(
+    ctx,
+    "implement",
+    t.number,
+    () => ctx.agent.implement(t, branch, ctx.baseBranch),
+    (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason }),
+  );
   if (!impl.ok) {
     const why =
       impl.reason === "empty" ? "produced no commits (agent may have failed silently)" :
@@ -70,15 +80,32 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   }
   ctx.log("ok", `implement complete (${impl.commits} commit${impl.commits === 1 ? "" : "s"}); running review`, t.number);
 
-  // 2. Review + bounded fix-loop.
+  // 2. Review + bounded fix-loop. Each review/fix pass is its own timed step
+  // so the event trace shows exactly how the loop converged.
+  const runReview = (): Promise<ReviewVerdict> =>
+    emitTimedStep(
+      ctx,
+      "review",
+      t.number,
+      () => ctx.agent.review(t, branch, ctx.baseBranch),
+      (r) => ({ verdict: r.kind, issueCount: r.issueCount }),
+    );
+
   let rounds = 0;
-  let verdict = await ctx.agent.review(t, branch, ctx.baseBranch);
+  let verdict = await runReview();
   while (verdict.kind === "issues" && rounds < ctx.maxFixRounds) {
     rounds++;
     ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
-    const fix = await ctx.agent.fix(t, verdict, branch, rounds);
+    const fix = await emitTimedStep(
+      ctx,
+      "fix",
+      t.number,
+      () => ctx.agent.fix(t, verdict, branch, rounds),
+      (r) => ({ round: rounds, ok: r.ok }),
+      { round: rounds },
+    );
     if (!fix.ok) return fail(t, ctx, `fix round ${rounds} failed`, branch);
-    verdict = await ctx.agent.review(t, branch, ctx.baseBranch);
+    verdict = await runReview();
   }
 
   if (verdict.kind !== "clean") {
@@ -94,10 +121,12 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     head: branch,
     base: ctx.baseBranch,
   });
+  ctx.events.emit(EVT.PR_CREATED, t.number, { pr, head: branch, base: ctx.baseBranch });
   ctx.log("ok", `PR #${pr} opened`, t.number);
 
   // 4. CI gate.
   const checks = await ctx.pullRequest.watchChecks(pr);
+  ctx.events.emit(EVT.CI_RESULT, t.number, { state: checks.state, failed: checks.failed });
   const ciOk = checks.state === "pass" || (checks.state === "none" && !ctx.requireChecks);
   if (!ciOk) {
     ctx.log("error", `CI not green (state=${checks.state}${checks.failed.length ? ": " + checks.failed.join(", ") : ""}); leaving PR #${pr} for human`, t.number);
@@ -107,22 +136,32 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   // 5. Merge (or hand off).
   if (!ctx.autoMerge) {
     ctx.log("ok", `PR #${pr} ready for manual merge (CI green, review clean)`, t.number);
+    ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: false, manual: true });
     return { status: "done", branch, pr, rounds };
   }
   try {
     await ctx.pullRequest.mergePr(pr, ctx.mergeStrategy);
+    ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: true });
     ctx.log("ok", `PR #${pr} merged (${ctx.mergeStrategy})`, t.number);
     await ctx.pullRequest.closeIssue(t.number, `Implemented and merged via dag-tickets in PR #${pr}.`);
     return { status: "done", branch, pr, rounds };
   } catch (e) {
-    return fail(t, ctx, `merge failed: ${(e as Error).message}`, branch, pr);
+    const msg = (e as Error).message;
+    ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: false, error: msg });
+    return fail(t, ctx, `merge failed: ${msg}`, branch, pr);
   }
 }
 
 async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
   const branch = branchFor(t.number, `${t.title}-shot`);
   ctx.log("info", `${skill} (single-shot)`, t.number);
-  const r = await ctx.agent.singleShot(skill, t, branch, ctx.baseBranch);
+  const r = await emitTimedStep(
+    ctx,
+    skill,
+    t.number,
+    () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch),
+    (res) => ({ ok: res.ok, timedOut: res.timedOut }),
+  );
   if (!r.ok) return fail(t, ctx, `${skill} agent failed${r.timedOut ? " (timeout)" : ""}`, branch);
   ctx.log("ok", `${skill} complete`, t.number);
   return { status: "done", branch };
@@ -154,6 +193,32 @@ async function dryRunPlan(t: Ticket, skill: string, expectPr: boolean, ctx: RunC
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Run one agent step inside a timed step.start/step.end event pair. Collapses
+ * the implement/review/fix/singleShot timing shape so the start↔end pairing
+ * can't drift across the four call sites. `startExtra` is spread onto the
+ * START payload (e.g. a fix round); `endData(result)` supplies the
+ * result-specific END fields — `durationMs` is added by the helper.
+ */
+async function emitTimedStep<T>(
+  ctx: RunContext,
+  step: string,
+  ticketNumber: number,
+  fn: () => Promise<T>,
+  endData: (result: T) => Record<string, unknown>,
+  startExtra: Record<string, unknown> = {},
+): Promise<T> {
+  const start = Date.now();
+  ctx.events.emit(EVT.STEP_START, ticketNumber, { step, ...startExtra });
+  const result = await fn();
+  ctx.events.emit(EVT.STEP_END, ticketNumber, {
+    step,
+    durationMs: Date.now() - start,
+    ...endData(result),
+  });
+  return result;
+}
 
 function prBody(t: Ticket): string {
   return [

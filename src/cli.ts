@@ -12,6 +12,7 @@ import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
+import { EVT, JsonlEventLog } from "./events.ts";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
 import pkg from "../package.json";
 
@@ -318,20 +319,14 @@ export async function main(argv: string[]): Promise<number> {
   const seedFailed = ticketsWithStatus(state, "failed");
   const seedSkipped = ticketsWithStatus(state, "skipped");
 
-  const branch = new ShellBranch(a.cwd);
-  const pullRequest = new ShellPullRequest(a.cwd);
-  const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd);
-  const ctx: RunContext = {
-    agent,
-    pullRequest,
-    baseBranch,
-    maxFixRounds: a.maxFixRounds,
-    mergeStrategy: a.mergeStrategy,
-    autoMerge: a.noAutoMerge ? false : a.autoMerge ? true : true,
-    requireChecks: a.requireChecks,
-    dryRun: a.dryRun,
-    log,
-  };
+  // Structured event log (issue #19): append-only JSONL alongside state.json.
+  // Always on (including dry-run / resume). No existing stderr line is altered:
+  // the event file is the sibling of state.json (same `<runId>/` dir, shown in
+  // the existing `state:` line), so it stays discoverable without a new log line.
+  // `log` is passed so a persistently failing write surfaces one warn instead
+  // of silently dropping the post-mortem channel.
+  const events = new JsonlEventLog(runId, a.cwd, log);
+  await events.ensure();
 
   // Acquire the repo-wide run lock so a concurrent dag-tickets on this
   // checkout can't fight over the shared dag-<n> worktrees/branches. --dry-run
@@ -369,12 +364,44 @@ export async function main(argv: string[]): Promise<number> {
     process.once("SIGTERM", onSignal);
   }
 
+  // try/finally flushes staged event appends on throw / exit / SIGTERM so the
+  // trace stays complete and ordered (SIGKILL is a best-effort ordered prefix;
+  // see events.ts), and releases the run lock + detaches the signal handlers
+  // on every exit path.
+  let exitCode = 0;
   try {
+    events.emit(EVT.RUN_START, undefined, {
+      target: describeTarget(a),
+      ticketCount: actionable.length,
+      concurrency: a.concurrency,
+      autoMerge: a.noAutoMerge ? false : true,
+      baseBranch,
+      dryRun: a.dryRun,
+      resume: !!a.resume,
+    });
+
+    const branch = new ShellBranch(a.cwd);
+    const pullRequest = new ShellPullRequest(a.cwd);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
+    const ctx: RunContext = {
+      agent,
+      pullRequest,
+      baseBranch,
+      maxFixRounds: a.maxFixRounds,
+      mergeStrategy: a.mergeStrategy,
+      autoMerge: a.noAutoMerge ? false : a.autoMerge ? true : true,
+      requireChecks: a.requireChecks,
+      dryRun: a.dryRun,
+      log,
+      events,
+    };
+
     const result = await runBatch(graph, {
       concurrency: a.concurrency,
       seedCompleted,
       seedFailed,
       seedSkipped,
+      events,
       process: async (n) => {
         const t = graph.byNumber.get(n)!;
         const outcome = await processTicket(t, ctx);
@@ -390,19 +417,28 @@ export async function main(argv: string[]): Promise<number> {
 
     if (!a.dryRun) await saveState(state, a.cwd);
 
+    exitCode = result.failed.length > 0 ? 1 : 0;
+    events.emit(EVT.RUN_END, undefined, {
+      completed: result.completed,
+      failed: result.failed,
+      skipped: result.skipped,
+      exitCode,
+    });
+
     log("ok", `done: ${result.completed.length} merged/complete, ${result.failed.length} failed, ${result.skipped.length} skipped`);
     if (result.failed.length > 0) {
       log("error", `failed tickets: ${result.failed.map((n) => "#" + n).join(", ")}`);
     }
     log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
-    return result.failed.length > 0 ? 1 : 0;
   } finally {
+    await events.flush();
     if (onSignal) {
       process.removeListener("SIGINT", onSignal);
       process.removeListener("SIGTERM", onSignal);
     }
     if (lockHandle) await lockHandle.release();
   }
+  return exitCode;
 }
 
 function defaultRunId(a: ParsedArgs): string {

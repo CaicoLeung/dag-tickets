@@ -24,6 +24,11 @@
  *  - {@link Logger} lives here too: both the orchestrator and the real adapters
  *    log through it, so a rate-limit retry inside PaseoAgent can surface the
  *    same `warn` line the orchestrator would — no silent retries.
+ *    {@link EventSink} follows the same rule: a structured post-mortem channel
+ *    shared by the orchestrator AND the real adapter ({@link PaseoAgent}), so it
+ *    lives beside {@link Logger}, not in its own module. The file-backed adapter
+ *    ({@link JsonlEventLog}) stays in events.ts; only the seam + the null fake
+ *    are domain-level here — mirrors Logger being here while its writers are not.
  */
 import type { ReviewVerdict, Ticket } from "./types.ts";
 
@@ -32,6 +37,27 @@ export type MergeStrategy = "squash" | "merge" | "rebase";
 /** Severity for the shared logger. Used by the orchestrator and both adapters. */
 export type LogLevel = "info" | "ok" | "warn" | "error" | "dim";
 export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => void;
+
+// ---------------------------------------------------------------------------
+// EventSink — structured post-mortem channel (issue #19)
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured event emission seam, shared by the orchestrator
+ * (lifecycle/scheduler/cli) and the real agent adapter ({@link PaseoAgent}) —
+ * the same cross-seam property that puts {@link Logger} here. The real adapter
+ * is `JsonlEventLog` (events.ts, append-only file); tests pass {@link NULL_SINK}
+ * or a capturing fake. `emit` never throws and never blocks the caller: it
+ * stages a line; the adapter decides when/where to flush.
+ */
+export interface EventSink {
+  emit(type: string, ticket: number | undefined, data?: Record<string, unknown>): void;
+}
+
+/** Drop-all sink. Default for unit tests and for `events`-optional seams. */
+export const NULL_SINK: EventSink = Object.freeze({
+  emit() {},
+});
 
 export interface CheckResult {
   /** "pass" | "fail" | "none" (no CI configured). */

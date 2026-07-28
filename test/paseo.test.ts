@@ -13,6 +13,7 @@ import type {
   Logger,
 } from "../src/ports.ts";
 import type { Ticket } from "../src/types.ts";
+import { EVT, RecordingSink } from "../src/events.ts";
 
 describe("isRateLimited", () => {
   test("detects the real claude 429 quota string from the field", () => {
@@ -440,5 +441,84 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     expect(r).toEqual({ ok: false, commits: 0, reason: "empty" });
     // proves the count was taken against origin/main, not the stale local main
     expect(branch.commitCountBases).toEqual(["origin/main"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured event log (issue #19): the agent adapter emits provider.switch on
+// every rate-limit fallback. The human warn line is unchanged; this is the
+// machine-readable twin.
+// ---------------------------------------------------------------------------
+
+const NOOP_LOG: Logger = () => {};
+
+describe("PaseoAgent — provider.switch event", () => {
+  test("review fallback emits provider.switch {skill:review, from, to, reason}", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [
+      { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true },
+      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+    ];
+    const sink = new RecordingSink();
+    const a = new PaseoAgent(
+      new FakeBranch(),
+      PREFS,
+      ["claude/opus"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      sink,
+    );
+    const v = await a.review(ticket(), "b1", "main");
+    expect(v.kind).toBe("clean"); // fallback succeeded
+    const sw = sink.events.find((e) => e.type === EVT.PROVIDER_SWITCH);
+    expect(sw).toBeDefined();
+    expect(sw!.ticket).toBe(11);
+    expect(sw!.data).toEqual({
+      skill: "review",
+      from: "claude/review",
+      to: "claude/opus",
+      reason: "rate-limited",
+    });
+  });
+
+  test("implement fallback emits provider.switch {skill:implement, from, to}", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [
+      { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true },
+      // second dispatch on the fallback succeeds with commits (FakeBranch counts=3)
+      { ok: true, output: "", timedOut: false, rateLimited: false },
+    ];
+    const sink = new RecordingSink();
+    const a = new PaseoAgent(
+      new FakeBranch(),
+      PREFS,
+      ["omp/zai"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      sink,
+    );
+    const r = await a.implement(ticket(), "b1", "main");
+    expect(r.ok).toBe(true);
+    const sw = sink.events.find((e) => e.type === EVT.PROVIDER_SWITCH);
+    expect(sw).toBeDefined();
+    expect(sw!.data).toEqual({
+      skill: "implement",
+      from: "codex/impl",
+      to: "omp/zai",
+      reason: "rate-limited",
+    });
+  });
+
+  test("no rate-limiting emits no provider.switch", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false }];
+    const sink = new RecordingSink();
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, sink);
+    await a.review(ticket(), "b1", "main");
+    expect(sink.events.some((e) => e.type === EVT.PROVIDER_SWITCH)).toBe(false);
   });
 });

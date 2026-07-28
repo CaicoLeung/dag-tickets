@@ -1,6 +1,9 @@
 import type { Graph } from "./graph.ts";
 import { frontier, cascadeDependents } from "./graph.ts";
 import type { TicketStatus } from "./types.ts";
+import { EVT } from "./events.ts";
+import type { EventSink } from "./ports.ts";
+import { NULL_SINK } from "./ports.ts";
 
 export interface BatchResult {
   completed: number[];
@@ -31,12 +34,19 @@ export async function runBatch(
     seedSkipped?: Iterable<number>;
     /** Called as each ticket settles, for logging/state persistence. */
     onSettle?: (number: number, status: TicketStatus) => void;
+    /** Machine-readable event channel (issue #19). Optional so the many
+     *  scheduler tests that don't assert events can omit it; resolved to
+     *  NULL_SINK once at the top of runBatch (no per-site `?.`). */
+    events?: EventSink;
   },
 ): Promise<BatchResult> {
   const completed = new Set<number>(opts.seedCompleted ?? []);
   const failed = new Set<number>(opts.seedFailed ?? []);
   const skipped = new Set<number>(opts.seedSkipped ?? []);
   const inflight = new Map<number, Promise<{ number: number; status: TicketStatus }>>();
+  // Resolve once: the event channel is optional on opts (most scheduler tests
+  // omit it) but guaranteed from here on — no per-site `?.` below.
+  const events = opts.events ?? NULL_SINK;
 
   // Cascade a terminal-blocker status (failed | skipped) from every settled
   // ticket of that status to its not-yet-started dependents, persisting each
@@ -54,6 +64,12 @@ export async function runBatch(
       if (inflight.has(dep) || completed.has(dep) || failed.has(dep) || skipped.has(dep)) continue;
       acc.add(dep);
       opts.onSettle?.(dep, status);
+      // Record which terminal blocker(s) doomed this dependent so the post-
+      // mortem trace links the cascade to its root cause.
+      const from = (graph.byNumber.get(dep)?.blockedBy ?? []).filter(
+        (b) => failed.has(b) || skipped.has(b),
+      );
+      events.emit(EVT.TICKET_CASCADE, dep, { status, from });
     }
   };
 
@@ -64,7 +80,10 @@ export async function runBatch(
   cascade("failed", failed);
   cascade("skipped", skipped);
 
+  const startedAt = new Map<number, number>();
   const launch = (n: number): void => {
+    startedAt.set(n, Date.now());
+    events.emit(EVT.TICKET_START, n);
     const p = Promise.resolve(n)
       .then(opts.process)
       .then((status) => ({ number: n, status }))
@@ -94,6 +113,10 @@ export async function runBatch(
       failed.add(settled.number);
     }
     opts.onSettle?.(settled.number, settled.status);
+    const endData: Record<string, unknown> = { status: settled.status };
+    const started = startedAt.get(settled.number);
+    if (started !== undefined) endData.durationMs = Date.now() - started;
+    events.emit(EVT.TICKET_END, settled.number, endData);
     // Persist cascaded dependents after the root cause, so a killed run records
     // the doomed branch without waiting for resume to self-heal it.
     if (settled.status === "failed") cascade("failed", failed);
