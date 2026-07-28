@@ -9,15 +9,28 @@
  * Behaviour is driven entirely by two files whose paths arrive via env:
  *   DAG_E2E_SCENARIO — read-only fixtures: issues, label→numbers, parents,
  *                      checks outcome (pass|fail|none), verdicts, etc.
- *   DAG_E2E_STATE    — mutable per-run scratch: PR counter, merged set, and
- *                      the paseo shim's verdict pointer (shared so a review
- *                      `paseo run` advances the verdict that `paseo logs`
- *                      then serves stably across polling).
+ *   DAG_E2E_STATE    — mutable per-run scratch shared with the paseo shim:
+ *                      PR counter, merged set, per-ticket verdict pointer,
+ *                      merge strategy, closed issues, checks sequence index,
+ *                      and the overlap watch-release latch. See shims/util.js
+ *                      DEFAULT_STATE for the full shape.
  *
- * Self-contained: only Bun globals (Bun.file/Bun.write/process) so the file
- * runs identically whether executed by name on PATH or re-shebang'd by the
- * harness with an absolute bun path.
+ * Served commands: repo view, issue view|list|close, api graphql (sub-issues),
+ * pr create|checks(--watch|--json)|merge.
+ *
+ * Self-contained at runtime (only Bun globals + ./util.js). The harness copies
+ * util.js next to the installed `gh` so the import resolves from the temp bin.
  */
+import {
+  DEFAULT_STATE,
+  readJson,
+  writeJson,
+  withStateLock,
+  withDefaults,
+  ticketFromHead,
+  sleep,
+} from "./util.ts";
+
 (async () => {
   const argv = process.argv.slice(2);
   const SCEN = process.env.DAG_E2E_SCENARIO;
@@ -27,26 +40,7 @@
   const err = (s) => process.stderr.write(s);
   const exit = (c) => process.exit(c);
 
-  const readJson = async (p, fb) => {
-    if (!p) return fb;
-    try {
-      return JSON.parse(await Bun.file(p).text());
-    } catch {
-      return fb;
-    }
-  };
-  const writeJson = async (p, v) => {
-    if (p) await Bun.write(p, JSON.stringify(v, null, 2));
-  };
-
   const scen = await readJson(SCEN, {});
-  const state = await readJson(STATE, {
-    prCounter: 1000,
-    merged: [],
-    prHeads: {},
-    reviewIdx: {},
-    currentVerdict: {},
-  });
 
   const cmd = argv[0];
   const sub = argv[1];
@@ -99,18 +93,63 @@
   if (cmd === "pr" && sub === "create") {
     const i = argv.indexOf("--head");
     const head = i >= 0 ? argv[i + 1] : "";
-    state.prCounter = (state.prCounter || 1000) + 1;
-    const pr = state.prCounter;
-    state.prHeads = state.prHeads || {};
-    state.prHeads[String(pr)] = head;
-    await writeJson(STATE, state);
-    out(`https://github.com/e2e/test/pull/${pr}\n`);
+    const num = ticketFromHead(head);
+    await withStateLock(STATE, async () => {
+      const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+      state.prCounter = (state.prCounter || 1000) + 1;
+      const pr = state.prCounter;
+      state.prHeads = state.prHeads || {};
+      state.prTickets = state.prTickets || {};
+      state.prHeads[String(pr)] = head;
+      if (num) state.prTickets[String(pr)] = num;
+      await writeJson(STATE, state);
+      out(`https://github.com/e2e/test/pull/${pr}\n`);
+    });
     exit(0);
   }
 
   // gh pr checks <n> --watch --fail-fast --interval 30
+  // Outcome, per PR's ticket (looked up via prTickets):
+  //   - checksSeq[<n>] = ["fail","pass",...] → serve one per watch call (transient CI)
+  //   - holdWatch[<n>]   → block until state.releaseWatch flips true (overlap choreography)
+  //   - else            → scen.checks ("pass"|"fail"|"none")
   if (cmd === "pr" && sub === "checks" && argv.includes("--watch")) {
-    const outcome = scen.checks || "none";
+    const pr = parseInt(argv[2], 10);
+    let outcome = scen.checks || "none";
+
+    // Resolve the ticket this PR belongs to, then apply per-ticket scripting.
+    const state0 = withDefaults(await readJson(STATE, DEFAULT_STATE));
+    const num = state0.prTickets[String(pr)] || 0;
+
+    if (num && scen.checksSeq && Array.isArray(scen.checksSeq[String(num)])) {
+      // Advance the per-ticket pointer under the lock so concurrent watchers
+      // (not used today, but the shape matches pr create) can't double-read.
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.checksIdx = s.checksIdx || {};
+        const idx = s.checksIdx[String(num)] || 0;
+        const seq = scen.checksSeq[String(num)];
+        outcome = seq[Math.min(idx, seq.length - 1)];
+        s.checksIdx[String(num)] = idx + 1;
+        await writeJson(STATE, s);
+      });
+    } else if (num && scen.holdWatch && scen.holdWatch.includes(num)) {
+      // Block until the overlap-dependent's implement has actually run
+      // (state.dependentLaunched). Holding on the dependent's implement — not
+      // a pacer's merge — removes the race where the blocker would settle
+      // before the dependent overlap-launched. Bounded (~30s) so a broken
+      // choreography fails loudly instead of hanging the test.
+      for (let i = 0; i < 6000; i++) {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        if (s.dependentLaunched) {
+          outcome = "pass";
+          break;
+        }
+        await sleep(5);
+      }
+      outcome = "pass";
+    }
+
     if (outcome === "none") {
       err("No checks.\n");
       exit(0);
@@ -126,16 +165,36 @@
   }
 
   // gh pr merge <n> squash|merge|rebase --delete-branch
+  // Records the merged PR + the strategy flag gh received (asserts
+  // --merge-strategy). When the merged PR's ticket is the overlap pacer, also
+  // flips state.releaseWatch so the held base ticket's CI watch unblocks.
   if (cmd === "pr" && sub === "merge") {
     const n = parseInt(argv[2], 10);
-    state.merged = state.merged || [];
-    if (!state.merged.includes(n)) state.merged.push(n);
-    await writeJson(STATE, state);
+    // mergePr sends the strategy as a `--squash`/`--merge`/`--rebase` flag; pull
+    // it out so a test can assert --merge-strategy reached the subprocess.
+    const strat =
+      argv.find((a, idx) => idx > 2 && /^--(squash|merge|rebase)$/.test(a))?.slice(2) ||
+      "squash";
+    await withStateLock(STATE, async () => {
+      const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+      state.merged = state.merged || [];
+      if (!state.merged.includes(n)) state.merged.push(n);
+      state.mergedStrategies = state.mergedStrategies || {};
+      state.mergedStrategies[String(n)] = strat;
+      await writeJson(STATE, state);
+    });
     exit(0);
   }
 
   // gh issue close <n> --comment ...
   if (cmd === "issue" && sub === "close") {
+    const n = parseInt(argv[2], 10);
+    await withStateLock(STATE, async () => {
+      const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+      state.closed = state.closed || [];
+      if (!state.closed.includes(n)) state.closed.push(n);
+      await writeJson(STATE, state);
+    });
     exit(0);
   }
 

@@ -6,22 +6,39 @@
  * src/paseo.ts (paseo run / paseo logs / paseo ls / paseo stop) is exercised
  * for real through `Bun.spawn` — no module mocking.
  *
- * Two jobs:
+ * Three jobs:
  *   1. `paseo run` (branch-off, implement/single-shot): create a REAL git
- *      branch carrying one commit ahead of base, using commit-tree + update-ref
- *      so the working tree and index are never touched (concurrency-safe, and
- *      matches what PaseoAgent.implement verifies via BranchPort.commitCount).
+ *      branch carrying one commit ahead of base, using commit-tree +
+ *      update-ref so the working tree and index are never touched
+ *      (concurrency-safe, and matches what PaseoAgent.implement verifies via
+ *      BranchPort.commitCount).
  *   2. Review verdicts: a review `paseo run` advances the per-ticket verdict
  *      pointer in DAG_E2E_STATE; `paseo logs dag-<n>-review` then serves that
  *      verdict STABLY across the stable-log polling loop (dispatch polls until
  *      output stops changing), so one review = one verdict — and the next
  *      review run advances to the next verdict in the scripted sequence
  *      (driving the fix-loop: ["issues:2","clean"]).
+ *   3. Rate-limit simulation: a primary-provider implement/review dispatch for
+ *      a ticket in `rateLimited` emits a 429 body on its FIRST call (so
+ *      dispatch.rateLimited flips true and runWithFallback retries on the
+ *      fallback), then proceeds normally. `paseo run` also records the
+ *      --provider argv it received (proves --provider / --review-provider
+ *      override wiring through the real subprocess).
  *
  * Shares DAG_E2E_SCENARIO (read-only) + DAG_E2E_STATE (mutable, same file the
- * gh shim writes) so PR/verdict counters stay coherent. Self-contained: Bun
- * globals only.
+ * gh shim writes) so PR/verdict/counter state stays coherent. Self-contained at
+ * runtime (Bun globals + ./util.js); the harness installs util.js next to the
+ * `paseo` executable.
  */
+import {
+  DEFAULT_STATE,
+  readJson,
+  writeJson,
+  withStateLock,
+  withDefaults,
+  sleep,
+} from "./util.ts";
+
 (async () => {
   const argv = process.argv.slice(2);
   const SCEN = process.env.DAG_E2E_SCENARIO;
@@ -32,18 +49,6 @@
   const err = (s) => process.stderr.write(s);
   const exit = (c) => process.exit(c);
 
-  const readJson = async (p, fb) => {
-    if (!p) return fb;
-    try {
-      return JSON.parse(await Bun.file(p).text());
-    } catch {
-      return fb;
-    }
-  };
-  const writeJson = async (p, v) => {
-    if (p) await Bun.write(p, JSON.stringify(v, null, 2));
-  };
-
   // Synchronous git (the shim is a short-lived process; spawnSync keeps the
   // commit-tree dance sequential and simple). Returns parsed stdout.
   const git = (args) => {
@@ -53,13 +58,6 @@
   };
 
   const scen = await readJson(SCEN, {});
-  const state = await readJson(STATE, {
-    prCounter: 1000,
-    merged: [],
-    prHeads: {},
-    reviewIdx: {},
-    currentVerdict: {},
-  });
 
   const cmd = argv[0];
 
@@ -82,6 +80,7 @@
     const slug = pick("--worktree-slug") || "agent";
     const wtMode = pick("--worktree-mode");
     const title = pick("--title") || "";
+    const provider = pick("--provider") || "";
     const base = pick("--base") || "origin/main";
     const branch = wtMode === "branch-off" ? pick("--new-branch") : pick("--branch");
 
@@ -91,25 +90,98 @@
     const skill = tm ? tm[1] : "";
     const num = tm ? parseInt(tm[2], 10) : 0;
 
+    // Record the provider the dispatcher actually passed through argv, so a test
+    // can assert --provider / --review-provider overrides reached the subprocess.
+    if (num && skill) {
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.providers = s.providers || {};
+        s.providers[String(num)] = s.providers[String(num)] || {};
+        s.providers[String(num)][skill] = provider;
+        await writeJson(STATE, s);
+      });
+    }
+
+    // Overlap choreography pacer: a ticket in `pacerUntil` blocks its implement
+    // dispatch until some other ticket has pushed its head (a loop/<that>- branch
+    // exists in prHeads). This deterministically orders "blocker pushes head
+    // before pacer settles", which is what lets a dependent overlap-launch.
+    if (
+      wtMode === "branch-off" &&
+      skill === "implement" &&
+      num &&
+      scen.pacerUntil &&
+      scen.pacerUntil[String(num)]
+    ) {
+      const waitHead = `loop/${scen.pacerUntil[String(num)]}-`;
+      for (let i = 0; i < 6000; i++) {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        const heads = Object.values(s.prHeads || {});
+        if (heads.some((h) => typeof h === "string" && h.startsWith(waitHead))) break;
+        await sleep(5);
+      }
+    }
+
     // branch-off (implement / single-shot): materialise the branch with one
     // commit ahead of base, unless the scenario scripts an empty implement.
-    if (wtMode === "branch-off" && branch) {
-      const emptyImpl =
-        Array.isArray(scen.implementFails) && scen.implementFails.includes(num);
-      if (!emptyImpl) {
-        const baseSha = git(["rev-parse", base]).stdout.trim();
-        const tree = baseSha ? git(["rev-parse", `${base}^{tree}`]).stdout.trim() : "";
-        if (baseSha && tree) {
-          const commit = git([
-            "commit-tree",
-            tree,
-            "-p",
-            baseSha,
-            "-m",
-            `e2e shim impl #${num}`,
-          ]).stdout.trim();
-          if (commit) git(["update-ref", `refs/heads/${branch}`, commit]);
-        }
+    const emptyImpl =
+      Array.isArray(scen.implementFails) && scen.implementFails.includes(num);
+    const failRun =
+      Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "";
+
+    // Overlap choreography: a dependent's implement flipping dependentLaunched
+    // is the release signal for a held `holdWatch` blocker. Set it before the
+    // commit materialisation so the blocker unblocks the moment the dependent
+    // is genuinely in flight (its implement dispatch ran).
+    if (
+      wtMode === "branch-off" &&
+      skill === "implement" &&
+      num &&
+      Array.isArray(scen.dependentImpl) &&
+      scen.dependentImpl.includes(num)
+    ) {
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.dependentLaunched = true;
+        await writeJson(STATE, s);
+      });
+    }
+
+    if (wtMode === "branch-off" && branch && !emptyImpl && !failRun) {
+      const baseSha = git(["rev-parse", base]).stdout.trim();
+      const tree = baseSha ? git(["rev-parse", `${base}^{tree}`]).stdout.trim() : "";
+      if (baseSha && tree) {
+        const commit = git([
+          "commit-tree",
+          tree,
+          "-p",
+          baseSha,
+          "-m",
+          `e2e shim impl #${num}`,
+        ]).stdout.trim();
+        if (commit) git(["update-ref", `refs/heads/${branch}`, commit]);
+      }
+    }
+
+    // Rate-limit simulation: the FIRST primary dispatch for a ticket in
+    // `rateLimited` emits a 429 body (non-JSON → dispatch keeps status
+    // "completed" but isRateLimited(output) flips true → runWithFallback
+    // retries on the fallback provider). The latch records that we've hit it so
+    // the fallback dispatch proceeds normally.
+    if (num && skill && Array.isArray(scen.rateLimited) && scen.rateLimited.includes(num)) {
+      let hit = false;
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.rateLimitedHit = s.rateLimitedHit || {};
+        hit = !!s.rateLimitedHit[String(num)];
+        if (!hit) s.rateLimitedHit[String(num)] = true;
+        await writeJson(STATE, s);
+      });
+      if (!hit) {
+        // Non-JSON body: dispatch's JSON.parse throws → output stays this string,
+        // status stays "completed", and isRateLimited(output) matches the 429.
+        out("Error: 429 Too Many Requests — rate limit exceeded (quota).\n");
+        exit(0);
       }
     }
 
@@ -120,18 +192,19 @@
     if (skill === "review" && num) {
       const seq = (scen.verdicts || {})[String(num)];
       if (Array.isArray(seq) && seq.length) {
-        state.reviewIdx = state.reviewIdx || {};
-        const idx = state.reviewIdx[String(num)] || 0;
-        const v = seq[Math.min(idx, seq.length - 1)];
-        state.reviewIdx[String(num)] = idx + 1;
-        state.currentVerdict = state.currentVerdict || {};
-        state.currentVerdict[String(num)] = v;
-        await writeJson(STATE, state);
+        await withStateLock(STATE, async () => {
+          const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+          s.reviewIdx = s.reviewIdx || {};
+          const idx = s.reviewIdx[String(num)] || 0;
+          const v = seq[Math.min(idx, seq.length - 1)];
+          s.reviewIdx[String(num)] = idx + 1;
+          s.currentVerdict = s.currentVerdict || {};
+          s.currentVerdict[String(num)] = v;
+          await writeJson(STATE, s);
+        });
       }
     }
 
-    const failRun =
-      Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "";
     out(JSON.stringify({ agentId: slug, status: failRun ? "failed" : "completed" }) + "\n");
     exit(0);
   }
@@ -142,6 +215,7 @@
     const m = /^dag-(\d+)-review$/.exec(agentId || "");
     if (m) {
       const num = m[1];
+      const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
       const v = (state.currentVerdict || {})[num] ?? "clean";
       out(verdictText(v) + "\n");
       exit(0);
