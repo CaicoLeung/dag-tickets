@@ -6,12 +6,15 @@ import type {
   Dispatcher,
   DispatchOpts,
   DispatchResult,
+  EventSink,
   ImplResult,
   Logger,
   StepResult,
 } from "./ports.ts";
 import { normalizeBase, remoteRef } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
+import { EVT } from "./events.ts";
+import { NULL_SINK } from "./ports.ts";
 
 /**
  * Provider selection mirrors Paseo's `orchestration-preferences.json`:
@@ -303,17 +306,34 @@ export class PaseoAgent implements AgentPort {
     private readonly cwd?: string,
     private readonly timeoutMs: number = DEFAULT_RUN_MS,
     private readonly dispatcher: Dispatcher = realDispatcher,
+    // Defaulted (not required like RunContext.events) for two reasons: TS forbids
+    // a required param after optional ones, and the dispatch-mechanics tests
+    // above intentionally stay focused on dispatch — they rely on this NULL_SINK
+    // default. Prod wiring and the event-asserting tests pass an explicit sink.
+    private readonly events: EventSink = NULL_SINK,
   ) {}
 
   /**
    * Rate-limit-retry hook shared by review() and fix(): log the provider switch
    * and free the branch so the checkout-branch retry isn't blocked by a stale
    * worktree. implement() builds its own callback (a branch-off retry also has
-   * to delete the branch before re-creating it).
+   * to delete the branch before re-creating it). Each switch is also emitted
+   * as a structured `provider.switch` event (issue #19).
    */
-  private onRateLimited(reason: string, t: Ticket, branch: string): (next: string) => Promise<void> {
+  private onRateLimited(
+    skill: string,
+    fromProvider: string,
+    t: Ticket,
+    branch: string,
+  ): (next: string) => Promise<void> {
     return async (next) => {
-      this.log("warn", `${reason} rate-limited; retrying on ${next}`, t.number);
+      this.log("warn", `${skill} rate-limited; retrying on ${next}`, t.number);
+      this.events.emit(EVT.PROVIDER_SWITCH, t.number, {
+        skill,
+        from: fromProvider,
+        to: next,
+        reason: "rate-limited",
+      });
       await this.branch.cleanBranch(branch);
     };
   }
@@ -356,6 +376,12 @@ export class PaseoAgent implements AgentPort {
         // A branch-off retry must re-create the branch: clear any linked
         // worktree (git forbids a branch in >1 worktree) then drop the branch.
         this.log("warn", `implement rate-limited; retrying on ${next}`, t.number);
+        this.events.emit(EVT.PROVIDER_SWITCH, t.number, {
+          skill: "implement",
+          from: this.prefs.impl,
+          to: next,
+          reason: "rate-limited",
+        });
         await this.branch.cleanBranch(branch);
         await this.branch.deleteBranch(branch);
       },
@@ -390,7 +416,7 @@ export class PaseoAgent implements AgentPort {
         branch,
       },
       this.fallbacks,
-      this.onRateLimited("review", t, branch),
+      this.onRateLimited("review", this.prefs.review, t, branch),
     );
     if (!r.ok) {
       this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
@@ -413,7 +439,7 @@ export class PaseoAgent implements AgentPort {
         branch,
       },
       this.fallbacks,
-      this.onRateLimited("fix", t, branch),
+      this.onRateLimited("fix", this.prefs.impl, t, branch),
     );
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
   }

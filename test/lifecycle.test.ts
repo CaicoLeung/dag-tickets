@@ -10,6 +10,8 @@ import type {
   StepResult,
 } from "../src/ports.ts";
 import type { ReviewVerdict, Ticket } from "../src/types.ts";
+import { EVT, RecordingSink } from "../src/events.ts";
+import { NULL_SINK } from "../src/ports.ts";
 
 function ticket(n = 1, title = "Do the thing"): Ticket {
   return {
@@ -85,6 +87,7 @@ function ctx(agent: FakeAgent, pr: FakePullRequest, over: Partial<RunContext> = 
     requireChecks: false,
     dryRun: false,
     log: () => {},
+    events: NULL_SINK,
     ...over,
   };
 }
@@ -280,5 +283,110 @@ describe("routing & dry-run", () => {
     expect(plan.some((l) => l.includes("fake/research"))).toBe(true);
     expect(plan.some((l) => l.includes("fake/review"))).toBe(false); // single-shot: no review line
     expect(repo.prs).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structured event log (issue #19): the lifecycle emits step.start/step.end
+// pairs (with durationMs) for each agent pass, plus pr.created / ci.result /
+// merge point events. The human log is unchanged; this is the replayable trace.
+// ---------------------------------------------------------------------------
+
+describe("lifecycle — structured event log", () => {
+  test("happy path: implement→review→pr→ci→merge steps all emitted, start before end", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    const out = await processTicket(ticket(), ctx(agent, repo, { events: sink }));
+    expect(out.status).toBe("done");
+
+    const types = sink.types();
+    // Each step.end is preceded by its step.start.
+    expect(types.indexOf(EVT.STEP_START)).toBeLessThan(types.indexOf(EVT.STEP_END));
+    expect(types).toContain(EVT.PR_CREATED);
+    expect(types).toContain(EVT.CI_RESULT);
+    expect(types).toContain(EVT.MERGE);
+
+    const implEnd = sink.events.find((e) => e.type === EVT.STEP_END && e.data?.step === "implement");
+    expect(implEnd?.data).toMatchObject({ step: "implement", ok: true, commits: 3 });
+    expect(typeof implEnd?.data?.durationMs).toBe("number");
+
+    const reviewEnd = sink.events.find((e) => e.type === EVT.STEP_END && e.data?.step === "review");
+    expect(reviewEnd?.data).toMatchObject({ step: "review", verdict: "clean", issueCount: 0 });
+
+    const pr = sink.events.find((e) => e.type === EVT.PR_CREATED);
+    expect(pr?.data).toMatchObject({ pr: 1001, base: "main" });
+
+    const ci = sink.events.find((e) => e.type === EVT.CI_RESULT);
+    expect(ci?.data).toMatchObject({ state: "pass", failed: [] });
+
+    const merge = sink.events.find((e) => e.type === EVT.MERGE);
+    expect(merge?.data).toMatchObject({ strategy: "squash", ok: true });
+  });
+
+  test("fix-loop: one fix round emits review(issues)→fix(round1)→review(clean)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [issues(2), CLEAN];
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    await processTicket(ticket(), ctx(agent, repo, { events: sink }));
+
+    const reviewEnds = sink.events.filter((e) => e.type === EVT.STEP_END && e.data?.step === "review");
+    expect(reviewEnds).toHaveLength(2);
+    expect(reviewEnds[0]!.data).toMatchObject({ verdict: "issues", issueCount: 2 });
+    expect(reviewEnds[1]!.data).toMatchObject({ verdict: "clean" });
+
+    const fixEnds = sink.events.filter((e) => e.type === EVT.STEP_END && e.data?.step === "fix");
+    expect(fixEnds).toHaveLength(1);
+    expect(fixEnds[0]!.data).toMatchObject({ step: "fix", round: 1, ok: true });
+  });
+
+  test("failing CI emits ci.result(fail) and NO merge event", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    repo.checks = { state: "fail", failed: ["build"] };
+    const sink = new RecordingSink();
+    const out = await processTicket(ticket(), ctx(agent, repo, { events: sink }));
+    expect(out.status).toBe("failed");
+    expect(sink.types()).toContain(EVT.CI_RESULT);
+    expect(sink.events.find((e) => e.type === EVT.CI_RESULT)?.data).toMatchObject({
+      state: "fail",
+      failed: ["build"],
+    });
+    expect(sink.types().some((t) => t === EVT.MERGE)).toBe(false);
+  });
+
+  test("autoMerge off: merge event records manual:true, ok:false", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    await processTicket(ticket(), ctx(agent, repo, { autoMerge: false, events: sink }));
+    const merge = sink.events.find((e) => e.type === EVT.MERGE);
+    expect(merge?.data).toMatchObject({ strategy: "squash", ok: false, manual: true });
+  });
+
+  test("unknown-kind skip emits no step events", async () => {
+    const agent = new FakeAgent();
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    const t = ticket();
+    t.kind = "unknown";
+    await processTicket(t, ctx(agent, repo, { events: sink }));
+    expect(sink.events).toHaveLength(0);
+  });
+
+  test("single-shot (triage) emits one step.start/step.end pair", async () => {
+    const agent = new FakeAgent();
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    const t = ticket();
+    t.kind = "triage";
+    await processTicket(t, ctx(agent, repo, { events: sink }));
+    expect(sink.events.filter((e) => e.type === EVT.STEP_START)).toHaveLength(1);
+    expect(sink.events.filter((e) => e.type === EVT.STEP_END)).toHaveLength(1);
+    expect(sink.events.find((e) => e.type === EVT.STEP_END)?.data?.step).toBe("triage");
   });
 });
