@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { processTicket, type RunContext } from "../src/lifecycle.ts";
+import { processTicket, type RunContext, type OverlapContext } from "../src/lifecycle.ts";
 import type {
   AgentPort,
   CheckResult,
@@ -36,10 +36,14 @@ class FakeAgent implements AgentPort {
   impl: ImplResult = { ok: true, commits: 3 };
   reviewCalls = 0;
   fixCalls = 0;
-  async implement(): Promise<ImplResult> {
+  implementBase: string | undefined;
+  reviewBase: string | undefined;
+  async implement(_t: Ticket, _branch: string, base: string): Promise<ImplResult> {
+    this.implementBase = base;
     return this.impl;
   }
-  async review(): Promise<ReviewVerdict> {
+  async review(_t: Ticket, _branch: string, base: string): Promise<ReviewVerdict> {
+    this.reviewBase = base;
     return this.reviews[this.reviewCalls++] ?? CLEAN;
   }
   async fix(): Promise<StepResult> {
@@ -518,5 +522,89 @@ describe("implement lifecycle — failure reason classification (issue #21)", ()
     expect(out.status).toBe("failed");
     expect(out.reason).toBe("merge-race");
     expect(out.pr).toBe(1001); // PR left for a human
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #29 overlap: an overlapped dependent composes on its blocker's head, then a
+// pull-model reconcile (between dispatches, before createPr) lands it onto the
+// merged integration base. A conflicting rebase fails the dependent; a clean
+// createPr marks the head pushed so this ticket's own dependents can overlap.
+// ---------------------------------------------------------------------------
+
+describe("implement lifecycle — #29 overlap", () => {
+  test("overlap: branches off blockerHead, reconciles before PR, marks head pushed", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const reconciled: Array<{ sha: string; base: string }> = [];
+    agent.reconcile = async (_t, sha, base) => {
+      reconciled.push({ sha, base });
+      return { ok: true };
+    };
+    const repo = new FakePullRequest();
+    const pushed: number[] = [];
+    const overlap: OverlapContext = {
+      blockerHead: "origin/loop/1-foo",
+      blockerTipSha: "abc123",
+    };
+    const out = await processTicket(
+      ticket(2),
+      ctx(agent, repo, { markHeadPushed: (n) => pushed.push(n) }),
+      overlap,
+    );
+    expect(out.status).toBe("done");
+    // implement + review branched/diffed off the blocker head, not "main".
+    expect(agent.implementBase).toBe("origin/loop/1-foo");
+    expect(agent.reviewBase).toBe("origin/loop/1-foo");
+    // reconcile fired before the PR with the captured tip + integration base.
+    expect(reconciled).toEqual([{ sha: "abc123", base: "main" }]);
+    // PR opened against the integration base (post-rebase).
+    expect(repo.prs[0]?.base).toBe("main");
+    // head-pushed signal fired so this ticket's own dependents can overlap on it.
+    expect(pushed).toEqual([2]);
+  });
+
+  test("overlap: a conflicting reconcile fails the dependent (overlap-rebase), no PR", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: false, reason: "overlap-rebase" });
+    const repo = new FakePullRequest();
+    const overlap: OverlapContext = {
+      blockerHead: "origin/loop/1-foo",
+      blockerTipSha: "abc123",
+    };
+    const out = await processTicket(ticket(2), ctx(agent, repo), overlap);
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("overlap-rebase");
+    expect(repo.prs).toHaveLength(0); // no PR after a failed reconcile
+  });
+
+  test("overlap: a stale-base reconcile fails the dependent (stale-base)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: false, reason: "stale-base" });
+    const repo = new FakePullRequest();
+    const overlap: OverlapContext = {
+      blockerHead: "origin/loop/1-foo",
+      blockerTipSha: "abc123",
+    };
+    const out = await processTicket(ticket(2), ctx(agent, repo), overlap);
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("stale-base");
+  });
+
+  test("no overlap → no reconcile call, base is the integration branch", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    let reconcileCalled = false;
+    agent.reconcile = async () => {
+      reconcileCalled = true;
+      return { ok: true };
+    };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo)); // no overlap arg
+    expect(out.status).toBe("done");
+    expect(reconcileCalled).toBe(false);
+    expect(agent.implementBase).toBe("main");
   });
 });
