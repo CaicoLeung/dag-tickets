@@ -32,8 +32,9 @@ const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investig
  *  are caps: base 30s ± jitter, doubling, capped at 5 min. Long enough that a
  *  rate-limit window / CI queue drains, short enough that a batch still
  *  converges in a working session. */
+const MS_PER_MINUTE = 60_000;
 const TICKET_RETRY_BASE_MS = 30_000;
-const TICKET_RETRY_MAX_MS = 5 * 60_000;
+const TICKET_RETRY_MAX_MS = 5 * MS_PER_MINUTE;
 
 /** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
  *  completing check otherwise polls indefinitely and starves a concurrency slot
@@ -143,6 +144,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   };
+  // Like num(), but also admits 0 — for flags where 0 is a valid "disable"
+  // sentinel (--max-ticket-retries, --ci-watch-timeout-minutes), distinct from
+  // the strictly-positive --concurrency / --max-fix-rounds.
+  const nonNegInt = (v: string): number | undefined => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     const next = (): string | undefined => argv[++i];
@@ -171,19 +179,14 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.concurrency = num(next()!) ?? a.concurrency; break;
       case "--max-fix-rounds":
         a.maxFixRounds = num(next()!) ?? a.maxFixRounds; break;
-      case "--max-ticket-retries": {
-        // 0 is valid (disables retry), so allow >= 0 — distinct from num()
-        // which rejects non-positive values for --concurrency / --max-fix-rounds.
-        const r = parseInt(next()!, 10);
-        if (Number.isFinite(r) && r >= 0) a.maxTicketRetries = r;
+      case "--max-ticket-retries":
+        // 0 disables retry — nonNegInt admits 0 where num() would not.
+        a.maxTicketRetries = nonNegInt(next()!) ?? a.maxTicketRetries;
         break;
-      }
-      case "--ci-watch-timeout-minutes": {
-        // 0 is valid (disables the ceiling → indefinite watch), so allow >= 0.
-        const m = parseInt(next()!, 10);
-        if (Number.isFinite(m) && m >= 0) a.ciWatchTimeoutMinutes = m;
+      case "--ci-watch-timeout-minutes":
+        // 0 disables the ceiling (indefinite watch) — nonNegInt admits 0.
+        a.ciWatchTimeoutMinutes = nonNegInt(next()!) ?? a.ciWatchTimeoutMinutes;
         break;
-      }
       case "--merge-strategy": {
         const s = next() as MergeStrategy;
         if (s === "squash" || s === "merge" || s === "rebase") a.mergeStrategy = s;
@@ -504,9 +507,11 @@ export async function main(argv: string[]): Promise<number> {
     });
 
     const branch = new ShellBranch(a.cwd);
-    // Only a positive minute budget becomes a ms ceiling; 0 (or any non-positive
-    // fallback) leaves the watch unbounded, preserving the pre-flag behaviour.
-    const ciWatchMs = a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * 60_000 : undefined;
+    // Only a positive budget becomes a ms ceiling. 0 → undefined → unbounded
+    // watch (the pre-flag behaviour); negatives never reach here because
+    // nonNegInt rejects them at parse time, leaving the default in place.
+    const ciWatchMs =
+      a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * MS_PER_MINUTE : undefined;
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
