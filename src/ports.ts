@@ -82,6 +82,58 @@ export interface AgentPort {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatcher — the Paseo dispatch seam
+// ---------------------------------------------------------------------------
+
+/** Options for one Paseo agent run. Mirrors `paseo run` flags. */
+export interface DispatchOpts {
+  provider: string;
+  title: string;
+  /** Paseo worktree slug — groups the run in the UI. */
+  slug: string;
+  cwd?: string;
+  /** Max wall time for the agent run (paseo --wait-timeout). */
+  timeoutMs?: number;
+  mode?: string;
+  branchMode: "branch-off" | "checkout-branch";
+  /** branch-off: new branch to create. */
+  newBranch?: string;
+  /** branch-off: base ref. */
+  base?: string;
+  /** checkout-branch: existing branch to check out. */
+  branch?: string;
+}
+
+/** Result of one Paseo agent dispatch. */
+export interface DispatchResult {
+  ok: boolean;
+  output: string;
+  timedOut: boolean;
+  /** True when the agent output indicates provider rate-limiting / quota exhaustion. */
+  rateLimited: boolean;
+}
+
+/**
+ * The Paseo dispatch seam consumed by the real agent adapter ({@link PaseoAgent}).
+ *
+ * The real adapter binds the module-level `dispatch` (stable-log polling) into a
+ * rate-limit fallback loop so prod behaviour is unchanged.
+ * Tests pass a fake that returns scripted {@link DispatchResult}s — letting the
+ * adapter's dispatch-result → {@link ImplResult}/verdict mappings be unit-tested
+ * without spawning a real `paseo run`. The two consumers (prod wiring in cli.ts,
+ * focused unit tests) share one interface, exactly like AgentPort/BranchPort.
+ */
+export interface Dispatcher {
+  dispatch(prompt: string, opts: DispatchOpts): Promise<DispatchResult>;
+  dispatchWithFallback(
+    prompt: string,
+    opts: DispatchOpts,
+    fallbacks: string[],
+    onSwitch?: (nextProvider: string) => Promise<void>,
+  ): Promise<DispatchResult>;
+}
+
+// ---------------------------------------------------------------------------
 // BranchPort + PullRequestPort
 // ---------------------------------------------------------------------------
 
