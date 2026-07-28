@@ -1,6 +1,6 @@
 import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
-import { processTicket, type RunContext } from "./lifecycle.ts";
+import { processTicket, type OverlapContext, type RunContext } from "./lifecycle.ts";
 import { loadPrefs, PaseoAgent, type ProviderPrefs } from "./paseo.ts";
 import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
@@ -9,8 +9,8 @@ import {
   searchByLabel,
   fetchIssues,
 } from "./discover.ts";
-import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
-import type { Logger, MergeStrategy } from "./ports.ts";
+import { branchFor, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
 import type { FailureReason, SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog } from "./events.ts";
@@ -420,6 +420,24 @@ export async function main(argv: string[]): Promise<number> {
     const branch = new ShellBranch(a.cwd);
     const pullRequest = new ShellPullRequest(a.cwd);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
+    // #29: overlap bookkeeping shared across the run. `pushedHeads` admits a
+    // dependent to launch once its blocker has pushed its head (createPr) — the
+    // canOverlap policy reads it. `settled` + `blockerWaiters` gate an overlap-
+    // dependent's createPr on its blocker merging (no premature PR). Seeded from
+    // the resume sets so a dependent overlapping an already-done blocker resolves.
+    const pushedHeads = new Set<number>();
+    const settled = new Set<number>([...seedCompleted, ...seedFailed, ...seedSkipped]);
+    const blockerWaiters = new Map<number, Array<() => void>>();
+    const waitForBlocker = (n: number): Promise<void> =>
+      settled.has(n)
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            const arr = blockerWaiters.get(n) ?? [];
+            arr.push(resolve);
+            blockerWaiters.set(n, arr);
+          });
+    const canOverlap = (dep: Ticket, blocker: Ticket): boolean =>
+      dep.kind === "implement" && blocker.kind === "implement" && pushedHeads.has(blocker.number);
     const ctx: RunContext = {
       agent,
       pullRequest,
@@ -431,6 +449,10 @@ export async function main(argv: string[]): Promise<number> {
       dryRun: a.dryRun,
       log,
       events,
+      markHeadPushed: (n) => {
+        pushedHeads.add(n);
+      },
+      waitForBlockers: (blockers) => Promise.all(blockers.map(waitForBlocker)).then(() => {}),
     };
 
     const result = await runBatch(graph, {
@@ -439,8 +461,22 @@ export async function main(argv: string[]): Promise<number> {
       seedFailed,
       seedSkipped,
       events,
-      process: async (n) => {
+      canOverlap,
+      process: async (n, info) => {
         const t = graph.byNumber.get(n)!;
+        // #29: a launch via overlap composes on the blocker's pushed head +
+        // captures its tip for the pre-createPr reconcile. A missing tip (lost
+        // race: blocker head not resolvable) falls back to a strict launch off
+        // the integration base. Dry-run dispatches nothing, so skip overlap.
+        let overlap: OverlapContext | undefined;
+        if (info?.overlapBlocker !== undefined && !a.dryRun) {
+          const blocker = graph.byNumber.get(info.overlapBlocker);
+          if (blocker) {
+            const head = branchFor(blocker.number, blocker.title);
+            const tip = await branch.resolveRemoteTip(head);
+            if (tip) overlap = { blockerHead: remoteRef(head), blockerTipSha: tip };
+          }
+        }
         // Wrap one processTicket() pass in the transient-retry loop (issue #21):
         // a transient failure (CI flake / rate-limit / merge race) backs off and
         // retries up to --max-ticket-retries times before settling terminal and
@@ -463,7 +499,7 @@ export async function main(argv: string[]): Promise<number> {
             ? priorAttempts + 1
             : undefined;
         const outcome = await runWithRetry(
-          () => processTicket(t, ctx),
+          () => processTicket(t, ctx, overlap),
           {
             maxRetries: a.maxTicketRetries,
             baseDelayMs: TICKET_RETRY_BASE_MS,
@@ -509,6 +545,15 @@ export async function main(argv: string[]): Promise<number> {
         if (t) await agent.abort(t);
       },
       onSettle: async (n, status, reason) => {
+        // #29: this ticket settled — unblock any overlap-dependent waiting in
+        // its pre-createPr gate (waitForBlockers). Recorded before state persist
+        // so a dependent resumed after a kill sees the blocker as settled too.
+        settled.add(n);
+        const waiters = blockerWaiters.get(n);
+        if (waiters) {
+          blockerWaiters.delete(n);
+          for (const w of waiters) w();
+        }
         // A cascade-abort `reason` is persisted on its own field (not overloaded
         // onto `error`) so a resumed run distinguishes a killed dependent from a
         // genuine error or an unknown-kind skip without scraping `error`.

@@ -29,6 +29,11 @@ export interface RunContext {
    *  ran), so the cli's `canOverlap` policy can admit `n`'s dependents to
    *  overlap on it. Optional — absent in tests / when overlap is disabled. */
   markHeadPushed?: (n: number) => void;
+  /** #29: resolve once every blocker in `blockers` has settled (done/failed/
+   *  skipped). Gates an overlapped dependent's createPr on its blocker merging
+   *  so reconcile lands on the merged base (no premature PR). Absent in tests /
+   *  when overlap is disabled. */
+  waitForBlockers?: (blockers: number[]) => Promise<void>;
 }
 
 /** #29: per-ticket overlap state for a dependent launched while its blocker was
@@ -158,6 +163,13 @@ async function runImplementLifecycle(
     return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}` }, branch);
   }
   ctx.log("ok", "review clean; opening PR", t.number);
+
+  // #29: gate createPr on all blockers settling — an overlapped dependent must
+  // not open its PR until its blocker has merged (so the reconcile below lands
+  // on the merged base). A strict launch's blockers are already done → no-op.
+  // Overlap can't trigger at concurrency 1, so this can't deadlock: the
+  // blocker always holds its own concurrency slot while the dependent waits.
+  if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
 
   // #29 (pull-model reconcile): before opening a PR, land an overlapped
   // dependent onto the merged integration base. Safe here — between dispatches,

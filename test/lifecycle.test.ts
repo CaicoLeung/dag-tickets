@@ -607,4 +607,35 @@ describe("implement lifecycle — #29 overlap", () => {
     expect(reconcileCalled).toBe(false);
     expect(agent.implementBase).toBe("main");
   });
+
+  test("overlap: createPr is gated on waitForBlockers(blockers) before reconcile", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const waitedFor: number[][] = [];
+    const t = ticket(3);
+    t.blockedBy = [1, 2];
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      resolveGate = r;
+    });
+    const running = processTicket(
+      t,
+      ctx(agent, repo, { waitForBlockers: async (bs) => {
+        waitedFor.push(bs);
+        await gate;
+      } }),
+      overlap,
+    );
+    // createPr hasn't run yet (gate unresolved), but the gate was called with the blockers.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(repo.prs).toHaveLength(0);
+    expect(waitedFor).toEqual([[1, 2]]);
+    resolveGate();
+    const out = await running;
+    expect(out.status).toBe("done");
+    expect(repo.prs).toHaveLength(1);
+  });
 });
