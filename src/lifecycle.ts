@@ -177,6 +177,11 @@ async function runImplementLifecycle(
   if (overlap && ctx.agent.reconcile) {
     const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
     if (!rec.ok) {
+      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
+        ok: false,
+        reason: rec.reason ?? "overlap-rebase",
+        onto: ctx.baseBranch,
+      });
       return fail(
         t,
         ctx,
@@ -184,6 +189,11 @@ async function runImplementLifecycle(
         branch,
       );
     }
+    ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
+      ok: true,
+      onto: ctx.baseBranch,
+      from: overlap.blockerTipSha,
+    });
     ctx.log("ok", `overlap reconcile landed ${branch} onto ${ctx.baseBranch}`, t.number);
   }
 

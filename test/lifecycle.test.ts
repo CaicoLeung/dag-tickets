@@ -608,6 +608,18 @@ describe("implement lifecycle — #29 overlap", () => {
     expect(agent.implementBase).toBe("main");
   });
 
+  test("overlap: emits ticket.reconcile {ok:true} on a clean rebase", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const sink = new RecordingSink();
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc123" };
+    await processTicket(ticket(2), ctx(agent, repo, { events: sink }), overlap);
+    const rec = sink.events.find((e) => e.type === EVT.TICKET_RECONCILE);
+    expect(rec?.data).toMatchObject({ ok: true, onto: "main", from: "abc123" });
+  });
+
   test("overlap: createPr is gated on waitForBlockers(blockers) before reconcile", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
