@@ -1,14 +1,15 @@
 import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
-import { processTicket, type RunContext, type Logger } from "./lifecycle.ts";
-import { loadPrefs, type ProviderPrefs } from "./paseo.ts";
+import { processTicket, type RunContext } from "./lifecycle.ts";
+import { loadPrefs, PaseoAgent, type ProviderPrefs } from "./paseo.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
   listSubIssues,
   searchByLabel,
   fetchIssues,
 } from "./discover.ts";
-import { repoInfo, type MergeStrategy } from "./gitgh.ts";
+import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
 import pkg from "../package.json";
@@ -309,16 +310,18 @@ export async function main(argv: string[]): Promise<number> {
     .filter(([, s]) => s.status === "failed")
     .map(([n]) => parseInt(n, 10));
 
+  const branch = new ShellBranch(a.cwd);
+  const pullRequest = new ShellPullRequest(a.cwd);
+  const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd);
   const ctx: RunContext = {
-    prefs,
+    agent,
+    pullRequest,
     baseBranch,
-    cwd: a.cwd,
     maxFixRounds: a.maxFixRounds,
     mergeStrategy: a.mergeStrategy,
     autoMerge: a.noAutoMerge ? false : a.autoMerge ? true : true,
     requireChecks: a.requireChecks,
     dryRun: a.dryRun,
-    fallbackProviders: a.fallbackProviders,
     log,
   };
 
