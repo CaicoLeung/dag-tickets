@@ -42,8 +42,14 @@ export function buildGraph(tickets: Ticket[]): Graph {
 
 /**
  * Resolve title-based "Blocked by" references to issue numbers within the
- * batch, merging them into each ticket's `blockedBy`. Normalization strips all
- * non-alphanumerics so dashes, spacing, and case can't defeat a match.
+ * batch, merging them into each ticket's `blockedBy`.
+ *
+ * Two tiers: an exact (case-insensitive) title match wins first; the
+ * normalized match (all non-alphanumerics stripped) is a fallback so dashes,
+ * spacing, and minor punctuation can't defeat a reference. The exact pass
+ * exists because `normKey` is aggressive — "Fix login bug" and "Fix-login-bug"
+ * both collapse to "fixloginbug", so without it two same-prefix tickets would
+ * cross-link via whichever entry survived the normalized map.
  *
  * Title refs that match nothing in the batch are left as out-of-batch
  * (satisfied) — they point at closed/external work.
@@ -52,13 +58,17 @@ export function resolveTitleEdges(
   tickets: Ticket[],
   titleRefsByNumber: Map<number, string[]>,
 ): Ticket[] {
+  const byExact = new Map<string, number>();
   const byNorm = new Map<string, number>();
-  for (const t of tickets) byNorm.set(normKey(t.title), t.number);
+  for (const t of tickets) {
+    byExact.set(exactKey(t.title), t.number);
+    byNorm.set(normKey(t.title), t.number);
+  }
   return tickets.map((t) => {
     const refs = titleRefsByNumber.get(t.number) ?? [];
     const extra: number[] = [];
     for (const r of refs) {
-      const hit = byNorm.get(normKey(r));
+      const hit = byExact.get(exactKey(r)) ?? byNorm.get(normKey(r));
       if (hit !== undefined && hit !== t.number) extra.push(hit);
     }
     if (extra.length === 0) return t;
@@ -67,6 +77,12 @@ export function resolveTitleEdges(
   });
 }
 
+/** Exact-match key: lowercased + trimmed, structure (spaces/dashes) intact. */
+function exactKey(s: string): string {
+  return s.toLowerCase().trim();
+}
+
+/** Normalized key: lowercased with every run of non-alphanumerics removed. */
 function normKey(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "");
 }

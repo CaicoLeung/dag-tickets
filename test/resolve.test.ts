@@ -52,4 +52,19 @@ describe("resolveTitleEdges", () => {
     const g = buildGraph(resolveTitleEdges(tickets, refs));
     expect(frontier(g, new Set(), new Set(), new Set())).toEqual([25]);
   });
+
+  test("exact title wins over a normalized collision", () => {
+    // Two titles collapse to the same normKey ("fixloginbug") but are distinct
+    // strings. Before an exact-match pass, byNorm kept only one and a ref to
+    // either could cross-link to the wrong ticket. Each ref must resolve to its
+    // exact-title counterpart, not the normalized survivor.
+    const tickets = [
+      ticket(1, "Fix login bug"),
+      ticket(2, "Fix-login-bug"),
+      ticket(3, "Work item"),
+    ];
+    const refs = new Map<number, string[]>([[3, ["Fix login bug", "Fix-login-bug"]]]);
+    const resolved = resolveTitleEdges(tickets, refs);
+    expect(resolved.find((t) => t.number === 3)!.blockedBy).toEqual([1, 2]);
+  });
 });
