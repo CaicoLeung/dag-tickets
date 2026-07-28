@@ -5,9 +5,11 @@ import type { Ticket } from "./types.ts";
  *
  * Edges come from each ticket's `blockedBy`. A ticket is on the **frontier**
  * when every one of its blockers is satisfied. A blocker is satisfied when it
- * is `completed` (merged/done in this run) OR it is not part of this batch
+ * is `completed` (merged/done in this run), OR it is not part of this batch
  * (already closed before the run, or external) — the graph cannot wait on
- * tickets it wasn't asked to process.
+ * tickets it wasn't asked to process. Under frontier relaxation (#29) an
+ * in-flight blocker may also satisfy a dependent when the caller's
+ * `canOverlap` policy permits it (see {@link frontier}).
  */
 export interface Graph {
   byNumber: Map<number, Ticket>;
@@ -89,7 +91,9 @@ function normKey(s: string): string {
 
 /**
  * Tickets eligible to start now: not completed, not running, not failed, and
- * with every in-batch blocker completed.
+ * with every in-batch blocker completed — or, under frontier relaxation
+ * (#29), with every blocker either completed or overlap-permitted while
+ * still in flight.
  *
  * Out-of-batch blockers are treated as satisfied (they're closed/external).
  *
@@ -105,13 +109,28 @@ export function frontier(
   completed: Set<number>,
   running: Set<number>,
   failed: Set<number>,
+  /** #29: frontier relaxation. When provided, an in-flight (present in
+   *  `running`) blocker `blocker` may satisfy a dependent `dep` without being
+   *  `completed`. Absent (or returning `false`) → strict frontier: a blocker
+   *  satisfies only by being `completed` or out-of-batch (current behaviour).
+   *  The policy is caller-owned (the scheduler builds it from ticket kinds +
+   *  branch state) so `frontier` stays pure and unit-testable. */
+  canOverlap?: (dep: Ticket, blocker: Ticket) => boolean,
 ): number[] {
   const ready: number[] = [];
   for (const t of graph.byNumber.values()) {
     if (completed.has(t.number)) continue;
     if (running.has(t.number)) continue;
     if (failed.has(t.number)) continue;
-    const satisfied = t.blockedBy.every((b) => completed.has(b) || !graph.byNumber.has(b));
+    const satisfied = t.blockedBy.every((b) => {
+      if (completed.has(b) || !graph.byNumber.has(b)) return true;
+      // #29: a real, not-yet-completed blocker can still satisfy this dependent
+      // if it is genuinely in flight and the caller's overlap policy allows it.
+      // `running` is the caller's in-flight set; a skipped blocker folded into
+      // it never reaches here because its dependents are cascade-skipped first.
+      if (!running.has(b)) return false;
+      return canOverlap?.(t, graph.byNumber.get(b)!) ?? false;
+    });
     if (satisfied) ready.push(t.number);
   }
 

@@ -59,6 +59,33 @@ describe("frontier", () => {
     const g = buildGraph([ticket(2, [999])]);
     expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2]);
   });
+
+  test("#29 overlap: an in-flight blocker satisfies a dependent when canOverlap permits", () => {
+    // 1 → 2. Blocker 1 is running (in flight), not completed.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    // Strict frontier (no policy): 2 is NOT ready — 1 is neither completed nor overlap-allowed.
+    expect(frontier(g, new Set(), new Set([1]), new Set())).toEqual([]);
+    // Relaxed: 1 is in flight and the policy allows it → 2 becomes ready.
+    expect(frontier(g, new Set(), new Set([1]), new Set(), () => true)).toEqual([2]);
+  });
+
+  test("#29 overlap: canOverlap=false keeps the strict frontier", () => {
+    // 1 → 2 → 3. Blocker 1 in flight.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    // Deny-all policy → nothing ready (same as no policy).
+    expect(frontier(g, new Set(), new Set([1]), new Set(), () => false)).toEqual([]);
+    // Allow 2 to overlap 1 only → 2 ready; 3 still blocked (its blocker 2 is not in flight).
+    expect(
+      frontier(g, new Set(), new Set([1]), new Set(), (dep, blocker) =>
+        dep.number === 2 && blocker.number === 1),
+    ).toEqual([2]);
+  });
+
+  test("#29 overlap: a completed blocker satisfies regardless of canOverlap", () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    // 1 completed → 2 ready even under a deny policy; the overlap path is never consulted.
+    expect(frontier(g, new Set([1]), new Set(), new Set(), () => false)).toEqual([2]);
+  });
 });
 
 describe("frontier ordering (fan-in / critical path)", () => {
