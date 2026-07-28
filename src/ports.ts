@@ -105,6 +105,17 @@ export interface AgentPort {
   singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult>;
   /** Human-readable provider that would serve this skill (dry-run display only). */
   providerLabel(skill: "implement" | "review" | "triage" | "research"): string;
+  /**
+   * Abort an in-flight ticket: stop its running agent dispatch and clean its
+   * worktree (#20). Called by the scheduler when a running dependent's blocker
+   * settles failed/skipped, so the dependent doesn't burn a full
+   * implement→review→fix→CI cycle on a doomed branch. Must be safe to call on a
+   * ticket whose dispatch already finished (lost race) and must not throw — the
+   * scheduler records the dependent cascade-skipped regardless. Optional so
+   * fakes (and tests that never exercise abort) need not implement it; an
+   * absent abort leaves in-flight dependents to settle on their own.
+   */
+  abort?(t: Ticket): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

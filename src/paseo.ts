@@ -15,6 +15,7 @@ import { normalizeBase, remoteRef } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 import { EVT } from "./events.ts";
 import { NULL_SINK } from "./ports.ts";
+import { branchFor } from "./gitgh.ts";
 
 /**
  * Provider selection mirrors Paseo's `orchestration-preferences.json`:
@@ -285,6 +286,46 @@ Run /${skill} for this issue. When finished, post any required comment/output on
 const SLUG = (n: number) => `dag-${n}`;
 
 /**
+ * Stop every running Paseo agent whose worktree belongs to ticket `ticketNumber`
+ * (#20). Paseo places a ticket's agent in a worktree dir derived from its
+ * `--worktree-slug` (`dag-<n>` for implement/fix, `dag-<n>-review` for review),
+ * optionally with a `-<counter>` suffix when a slug is reused. Matching the
+ * worktree's final path segment — `dag-<n>` exactly or `dag-<n>-…` — pins the
+ * ticket AND disambiguates siblings: `dag-1` / `dag-1-review` never match
+ * `dag-12-1` or `dag-11-review-1`, because the segment is split on `/` and the
+ * ticket number is followed by either end-of-string or `-`.
+ *
+ * Best-effort and never throws: a lookup that finds nothing (the dispatch
+ * already finished — lost race) is a no-op; the caller still cleans the branch.
+ */
+export async function stopRunningAgent(
+  cwd: string | undefined,
+  ticketNumber: number,
+): Promise<void> {
+  const r = await run(["paseo", "ls", "--json"], { cwd });
+  if (!r.ok) return;
+  let agents: Array<{ id?: string; status?: string; cwd?: string }> = [];
+  try {
+    const j = JSON.parse(r.stdout) as unknown;
+    agents = Array.isArray(j) ? (j as typeof agents) : ((j as { agents?: typeof agents }).agents ?? []);
+  } catch {
+    return; // malformed `paseo ls` output — nothing to stop
+  }
+  const plain = `dag-${ticketNumber}`;
+  const prefixed = `dag-${ticketNumber}-`;
+  const ownsWorktree = (dir: string): boolean => {
+    const seg = dir.split("/").pop() ?? "";
+    return seg === plain || seg.startsWith(prefixed);
+  };
+  const running = agents.filter(
+    (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktree(a.cwd),
+  );
+  for (const a of running) {
+    if (a.id) await run(["paseo", "stop", a.id], { cwd });
+  }
+}
+
+/**
  * Real {@link AgentPort} adapter. Owns the worktree-cleanup invariant (each
  * step starts on a clean branch), the rate-limit fallback chain, and verdict
  * parsing — so the lifecycle orchestrator branches on outcomes, never on
@@ -311,6 +352,11 @@ export class PaseoAgent implements AgentPort {
     // above intentionally stay focused on dispatch — they rely on this NULL_SINK
     // default. Prod wiring and the event-asserting tests pass an explicit sink.
     private readonly events: EventSink = NULL_SINK,
+    /** #20: stop the running Paseo agent for a ticket number. Injected so the
+     *  abort path is unit-testable without `paseo ls|stop`; defaults to the
+     *  module-level {@link stopRunningAgent} bound to this agent's cwd. */
+    private readonly stopAgent: (ticketNumber: number) => Promise<void> = (n) =>
+      stopRunningAgent(this.cwd, n),
   ) {}
 
   /**
@@ -475,5 +521,28 @@ export class PaseoAgent implements AgentPort {
       case "research":
         return this.prefs.research;
     }
+  }
+
+  /**
+   * #20: abort an in-flight ticket — stop its running agent dispatch and clean
+   * its worktree so a cascade-doomed dependent doesn't burn a full
+   * implement→review→fix→CI cycle. Called by the scheduler when a dependent's
+   * blocker settles failed/skipped. Best-effort and never throws: the scheduler
+   * has ALREADY recorded the dependent cascade-skipped, so a stop/clean that
+   * finds nothing (lost race) or fails leaves the persisted state correct.
+   */
+  async abort(t: Ticket): Promise<void> {
+    try {
+      await this.stopAgent(t.number);
+    } catch {
+      /* best-effort: scheduler already recorded cascade-skipped */
+    }
+    const branch = branchFor(t.number, t.title);
+    try {
+      await this.branch.cleanBranch(branch);
+    } catch {
+      /* a stale/missing worktree is fine — the agent stop is the load-bearing part */
+    }
+    this.log("warn", `cascade-abort: stopped agent + cleaned worktree ${branch}`, t.number);
   }
 }

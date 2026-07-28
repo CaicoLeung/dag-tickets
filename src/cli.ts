@@ -409,8 +409,21 @@ export async function main(argv: string[]): Promise<number> {
         if (!a.dryRun) await saveState(state, a.cwd);
         return outcome.status;
       },
-      onSettle: async (n, status) => {
-        state.tickets[n] = stateFromOutcome(status, state.tickets[n]);
+      // #20: when a running dependent's blocker settles failed/skipped, kill the
+      // dependent's agent dispatch + clean its worktree instead of letting it
+      // burn a full implement→review→fix→CI cycle on a doomed branch. Wired
+      // unconditionally to mirror the sibling `onSettle` shape; the internal
+      // dry-run guard matches `saveState`'s (nothing dispatched → nothing to
+      // kill, and the scheduler's dry-run cascade never reaches the abort path).
+      abort: async (n: number) => {
+        if (a.dryRun) return;
+        const t = graph.byNumber.get(n);
+        if (t) await agent.abort(t);
+      },
+      onSettle: async (n, status, reason) => {
+        // `reason` (set on a cascade-abort) is persisted as `error` so a resumed
+        // run can distinguish a killed dependent from an unknown-kind skip.
+        state.tickets[n] = stateFromOutcome(status, { ...state.tickets[n], ...(reason ? { error: reason } : {}) });
         if (!a.dryRun) await saveState(state, a.cwd);
       },
     });

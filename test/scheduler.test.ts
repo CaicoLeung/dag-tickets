@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { runBatch } from "../src/scheduler.ts";
+import { runBatch, planCascade } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
 import { fanInHeavyGraph } from "./helpers.ts";
 import type { Ticket, TicketStatus } from "../src/types.ts";
@@ -444,5 +444,115 @@ describe("runBatch — structured event log", () => {
     });
     expect(sink.of(1)).toEqual([]);
     expect(sink.of(2).find((e) => e.type === EVT.TICKET_CASCADE)?.data?.from).toEqual([1]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #20 — abort in-flight dependents on cascade failure.
+//
+// Under the scheduler's strict frontier a dependent can only be in-flight once
+// *all* its blockers are `completed`, so a failing blocker can never have a
+// genuinely in-flight dependent through runBatch's normal flow. The abort
+// branch is forward-compat for when dependents can overlap blockers; the pure
+// {@link planCascade} is the surface that proves it correct, so it is unit-
+// tested directly. The runBatch tests below prove the applier wires the plan to
+// opts.abort (and that the mark path never accidentally aborts).
+// ---------------------------------------------------------------------------
+
+describe("planCascade — mark vs abort decision (#20)", () => {
+  const sets = (over: Partial<{ completed: number[]; failed: number[]; skipped: number[]; inflight: number[] }> = {}) => ({
+    completed: new Set(over.completed ?? []),
+    failed: new Set(over.failed ?? []),
+    skipped: new Set(over.skipped ?? []),
+    inflight: new Set(over.inflight ?? []),
+  });
+
+  test("a not-yet-started dependent plans a MARK with the blocker's status", () => {
+    // 1 failed -> 2 (depends on 1), not started. Plan marks 2 failed from [1].
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1] }));
+    expect(plan).toEqual([{ dep: 2, kind: "mark", status: "failed", from: [1] }]);
+  });
+
+  test("an in-flight dependent plans an ABORT recorded cascade-skipped", () => {
+    // 1 failed -> 2 (depends on 1), 2 currently in-flight. Plan aborts 2.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1], inflight: [2] }));
+    expect(plan).toEqual([{ dep: 2, kind: "abort", status: "skipped", from: [1] }]);
+  });
+
+  test("a skipped blocker cascades skip (mark), never abort for a not-started dependent", () => {
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const plan = planCascade(g, new Set([1]), "skipped", sets({ skipped: [1] }));
+    expect(plan).toEqual([{ dep: 2, kind: "mark", status: "skipped", from: [1] }]);
+  });
+
+  test("transitive `from` links the immediately-doomed blocker (2 mark from [1], 3 mark from [2])", () => {
+    // Proves the local-mirror: each dep is recorded before the next dep's `from`
+    // is read, so 3 (depends on 2) reports from [2] not [].
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1] }));
+    expect(plan).toEqual([
+      { dep: 2, kind: "mark", status: "failed", from: [1] },
+      { dep: 3, kind: "mark", status: "failed", from: [2] },
+    ]);
+  });
+
+  test("an aborted dependent dooms its own dependents (3 mark from [2] now skipped)", () => {
+    // 1 failed -> 2 in-flight (aborted -> skipped) -> 3 (depends on 2). 3 is
+    // doomed by the now-skipped 2, so its from is [2]. Confirms the abort path
+    // feeds the local mirror just like the mark path.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1], inflight: [2] }));
+    expect(plan).toEqual([
+      { dep: 2, kind: "abort", status: "skipped", from: [1] },
+      { dep: 3, kind: "mark", status: "failed", from: [2] },
+    ]);
+  });
+
+  test("first-wins: an already-terminal dependent is never re-decided", () => {
+    // 1 failed this pass; 2 already completed last run (seeded). 2 keeps done.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1], completed: [2] }));
+    expect(plan).toEqual([]);
+  });
+
+  test("first-wins: an in-flight dependent already skipped is not re-aborted", () => {
+    // 1 failed; 2 in-flight but already cascade-skipped (e.g. doomed by another
+    // blocker that settled first). A second failing blocker must not re-abort.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const plan = planCascade(g, new Set([1]), "failed", sets({ failed: [1], inflight: [2], skipped: [2] }));
+    expect(plan).toEqual([]);
+  });
+
+  test("a seed with no dependents plans nothing", () => {
+    const g = buildGraph([ticket(1), ticket(2)]); // independent
+    expect(planCascade(g, new Set([1]), "failed", sets({ failed: [1] }))).toEqual([]);
+  });
+});
+
+describe("runBatch — in-flight abort wiring (#20)", () => {
+  test("opts.abort is never called for a not-started cascade (mark path only)", async () => {
+    // 1 fails -> 2 (not started) cascades failed. With an abort hook wired, the
+    // mark path must NOT invoke it: 2 was never in flight, so there's nothing
+    // to kill. Guards against the applier mis-routing mark -> abort.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const aborted: number[] = [];
+    await runBatch(g, {
+      concurrency: 2,
+      process: makeFake({ 1: "failed" }).process,
+      abort: async (n) => {
+        aborted.push(n);
+      },
+    });
+    expect(aborted).toEqual([]);
+  });
+
+  test("without an abort hook, a failing blocker still cascades (pre-#20 behaviour)", async () => {
+    // No abort wired: in-flight dependents (none reachable today, but the
+    // guard) are left to settle, and not-started dependents cascade as before.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const out = await runBatch(g, { concurrency: 3, process: makeFake({ 1: "failed" }).process });
+    expect(out.failed).toEqual([1, 2, 3]);
   });
 });

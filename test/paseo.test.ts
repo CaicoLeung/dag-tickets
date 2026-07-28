@@ -14,6 +14,7 @@ import type {
 } from "../src/ports.ts";
 import type { Ticket } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
+import { NULL_SINK } from "../src/ports.ts";
 
 describe("isRateLimited", () => {
   test("detects the real claude 429 quota string from the field", () => {
@@ -520,5 +521,82 @@ describe("PaseoAgent — provider.switch event", () => {
     const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, sink);
     await a.review(ticket(), "b1", "main");
     expect(sink.events.some((e) => e.type === EVT.PROVIDER_SWITCH)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #20 — PaseoAgent.abort: kill the running agent for a ticket + clean its
+// worktree when a cascade dooms it. stopAgent is injected (the constructor's
+// last param) so the kill is unit-testable without `paseo ls|stop`; the branch
+// clean reuses the tested BranchPort.cleanBranch.
+// ---------------------------------------------------------------------------
+
+describe("PaseoAgent.abort (#20)", () => {
+  test("stops the agent for the ticket number and cleans its branch worktree", async () => {
+    const stopped: number[] = [];
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      [],
+      cap.log,
+      undefined,
+      1000,
+      new ScriptedDispatcher(),
+      NULL_SINK,
+      async (n) => {
+        stopped.push(n);
+      },
+    );
+    await a.abort(ticket(11));
+    // stopAgent invoked with the ticket number (the dispatch kill)
+    expect(stopped).toEqual([11]);
+    // worktree for the ticket's branch cleaned (branchFor(11, "Inject dispatch"))
+    expect(branch.cleaned).toEqual(["loop/11-inject-dispatch"]);
+    // one human warn line so an operator sees the abort in stderr
+    expect(logged(cap.lines, "warn", /cascade-abort/)).toBe(true);
+  });
+
+  test("a failing stopAgent is swallowed — the branch is still cleaned, abort never throws", async () => {
+    // The scheduler has already recorded the dependent cascade-skipped, so a
+    // kill that fails must not propagate; the worktree clean still runs.
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      [],
+      cap.log,
+      undefined,
+      1000,
+      new ScriptedDispatcher(),
+      NULL_SINK,
+      async () => {
+        throw new Error("paseo stop exploded");
+      },
+    );
+    await expect(a.abort(ticket(11))).resolves.toBeUndefined();
+    expect(branch.cleaned).toEqual(["loop/11-inject-dispatch"]); // clean still ran
+  });
+
+  test("a failing cleanBranch is swallowed — abort never throws", async () => {
+    // A missing/stale worktree (lost race) must not surface as a throw.
+    const branch = new FakeBranch();
+    branch.cleanBranch = async () => {
+      throw new Error("worktree busy");
+    };
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      [],
+      NOOP_LOG,
+      undefined,
+      1000,
+      new ScriptedDispatcher(),
+      NULL_SINK,
+      async () => {},
+    );
+    await expect(a.abort(ticket(11))).resolves.toBeUndefined();
   });
 });
