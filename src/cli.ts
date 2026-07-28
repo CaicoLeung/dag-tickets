@@ -2,6 +2,7 @@ import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
 import { processTicket, type RunContext } from "./lifecycle.ts";
 import { loadPrefs, PaseoAgent, type ProviderPrefs } from "./paseo.ts";
+import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
   listSubIssues,
@@ -10,7 +11,7 @@ import {
 } from "./discover.ts";
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
-import type { SettleReason, Ticket, TicketStatus } from "./types.ts";
+import type { FailureReason, SettleReason, Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog } from "./events.ts";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
@@ -26,6 +27,14 @@ import pkg from "../package.json";
 const EXIT_LOCK_HELD = 75; // EX_TEMPFAIL — another live run owns the lock; retry shortly.
 const EXIT_LOCK_FAILED = 76; // couldn't settle the lock after retries; investigate.
 
+/** Exponential-backoff schedule for transient whole-ticket retries (issue #21).
+ *  Full-jitter is applied on top (delay = random() * computeBackoff), so these
+ *  are caps: base 30s ± jitter, doubling, capped at 5 min. Long enough that a
+ *  rate-limit window / CI queue drains, short enough that a batch still
+ *  converges in a working session. */
+const TICKET_RETRY_BASE_MS = 30_000;
+const TICKET_RETRY_MAX_MS = 5 * 60_000;
+
 interface ParsedArgs {
   parent?: number;
   label?: string;
@@ -33,6 +42,8 @@ interface ParsedArgs {
   numbers: number[];
   concurrency: number;
   maxFixRounds: number;
+  /** Whole-ticket retries after a transient failure (issue #21). 0 disables. */
+  maxTicketRetries: number;
   autoMerge: boolean;
   noAutoMerge: boolean;
   mergeStrategy: MergeStrategy;
@@ -70,6 +81,9 @@ OPTIONS
   --frontier              Process the open implement-label frontier (default).
   --concurrency <n>       Max tickets in flight (default 3).
   --max-fix-rounds <n>    implement<->review fix iterations (default 2).
+  --max-ticket-retries <n> Whole-ticket retries after a transient failure
+                         (CI flake / rate-limit / merge race) with exponential
+                         backoff. 0 disables. Default 2.
   --auto-merge            Merge when review clean + CI green (default).
   --no-auto-merge         Stop before merge; leave PRs for you to merge.
   --merge-strategy <s>    squash | merge | rebase (default squash).
@@ -97,6 +111,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     numbers: [],
     concurrency: 3,
     maxFixRounds: 2,
+    maxTicketRetries: 2,
     autoMerge: false,
     noAutoMerge: false,
     mergeStrategy: "squash",
@@ -138,6 +153,13 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.concurrency = num(next()!) ?? a.concurrency; break;
       case "--max-fix-rounds":
         a.maxFixRounds = num(next()!) ?? a.maxFixRounds; break;
+      case "--max-ticket-retries": {
+        // 0 is valid (disables retry), so allow >= 0 — distinct from num()
+        // which rejects non-positive values for --concurrency / --max-fix-rounds.
+        const r = parseInt(next()!, 10);
+        if (Number.isFinite(r) && r >= 0) a.maxTicketRetries = r;
+        break;
+      }
       case "--merge-strategy": {
         const s = next() as MergeStrategy;
         if (s === "squash" || s === "merge" || s === "rebase") a.mergeStrategy = s;
@@ -216,13 +238,23 @@ function makeLogger(dryRun: boolean): Logger {
 
 function stateFromOutcome(
   status: TicketStatus,
-  o?: { branch?: string; pr?: number; rounds?: number; error?: string; skipReason?: SettleReason },
+  o?: {
+    branch?: string;
+    pr?: number;
+    rounds?: number;
+    attempts?: number;
+    reason?: FailureReason;
+    error?: string;
+    skipReason?: SettleReason;
+  },
 ): TicketState {
   return {
     status,
     branch: o?.branch,
     pr: o?.pr,
     rounds: o?.rounds,
+    attempts: o?.attempts,
+    reason: o?.reason,
     error: o?.error,
     skipReason: o?.skipReason,
   };
@@ -297,7 +329,7 @@ export async function main(argv: string[]): Promise<number> {
     throw e;
   }
 
-  log("info", `planned ${actionable.length} ticket(s); concurrency ${a.concurrency}; base ${baseBranch}; ${a.dryRun ? "DRY RUN" : a.noAutoMerge ? "manual merge" : "auto-merge " + a.mergeStrategy}`);
+  log("info", `planned ${actionable.length} ticket(s); concurrency ${a.concurrency}; base ${baseBranch}; ${a.dryRun ? "DRY RUN" : a.noAutoMerge ? "manual merge" : "auto-merge " + a.mergeStrategy}${a.maxTicketRetries > 0 ? `; transient-retry ×${a.maxTicketRetries}` : ""}`);
 
   const runId = a.runId ?? a.resume ?? defaultRunId(a);
   let state: RunState;
@@ -382,6 +414,7 @@ export async function main(argv: string[]): Promise<number> {
       baseBranch,
       dryRun: a.dryRun,
       resume: !!a.resume,
+      maxTicketRetries: a.maxTicketRetries,
     });
 
     const branch = new ShellBranch(a.cwd);
@@ -408,7 +441,58 @@ export async function main(argv: string[]): Promise<number> {
       events,
       process: async (n) => {
         const t = graph.byNumber.get(n)!;
-        const outcome = await processTicket(t, ctx);
+        // Wrap one processTicket() pass in the transient-retry loop (issue #21):
+        // a transient failure (CI flake / rate-limit / merge race) backs off and
+        // retries up to --max-ticket-retries times before settling terminal and
+        // cascading. onAttempt persists `attempts` after each pass so a killed
+        // run records how far it got; the scheduler only ever sees the final
+        // terminal status, so a cascade still fires exactly once the budget is
+        // exhausted. Dry-run returns `done` immediately, so no retry/sleep ever
+        // happens there.
+        // Resume continuity (issue #21, between-attempt kill): a ticket killed
+        // mid-backoff is persisted `running` with its attempt count + transient
+        // reason. Carry that count forward as startAttempt so the loop's
+        // numbering stays cumulative and the configured --max-ticket-retries cap
+        // holds across the resume (a resumed ticket can't gain a fresh budget).
+        // Killing the agent *mid-attempt* (no attempt to persist) is the harder
+        // cancel-semantics case and remains T05.
+        const prior = state.tickets[n];
+        const priorAttempts = prior?.status === "running" ? prior.attempts : undefined;
+        const startAttempt =
+          typeof priorAttempts === "number" && isTransient(prior?.reason)
+            ? priorAttempts + 1
+            : undefined;
+        const outcome = await runWithRetry(
+          () => processTicket(t, ctx),
+          {
+            maxRetries: a.maxTicketRetries,
+            baseDelayMs: TICKET_RETRY_BASE_MS,
+            maxDelayMs: TICKET_RETRY_MAX_MS,
+            log,
+            events,
+            ticketNumber: n,
+            startAttempt,
+            onAttempt: async (attempt, o) => {
+              // A transient failure that still has retry budget is in-flight
+              // (about to back off and retry), NOT terminal. Persist it as
+              // `running` with the attempt count so a run killed during the
+              // sleep resumes by re-launching the ticket instead of wrongly
+              // cascading it as a permanent failure. The final pass (terminal
+              // reason, or budget exhausted) fails the guard and persists its
+              // real status. Budget continuity across resume is handled via
+              // startAttempt above; the remaining cancel-semantics work (T05)
+              // is killing the agent *mid-attempt*, which has no completed
+              // attempt to persist.
+              const inflight =
+                o.status === "failed" &&
+                attempt <= a.maxTicketRetries &&
+                isTransient(o.reason);
+              const persistStatus = inflight ? "running" : o.status;
+              state.tickets[n] = stateFromOutcome(persistStatus, { ...o, attempts: attempt });
+              if (!a.dryRun) await saveState(state, a.cwd);
+            },
+          },
+        );
         state.tickets[n] = stateFromOutcome(outcome.status, outcome);
         if (!a.dryRun) await saveState(state, a.cwd);
         return outcome.status;

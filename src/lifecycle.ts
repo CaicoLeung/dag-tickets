@@ -1,6 +1,6 @@
-import type { ReviewVerdict, Ticket } from "./types.ts";
+import type { FailureReason, ReviewVerdict, Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
-import type { AgentPort, EventSink, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
+import type { AgentPort, EventSink, ImplFailReason, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 import { EVT } from "./events.ts";
 
@@ -32,6 +32,16 @@ export interface TicketOutcome {
   branch?: string;
   pr?: number;
   rounds?: number;
+  /**
+   * How many whole-ticket attempts were made (issue #21). 1 on a clean first
+   * run; up to `maxRetries + 1` after backoffs. Set by the retry wrapper, not
+   * a single attempt, so it is absent from bare processTicket() output.
+   */
+  attempts?: number;
+  /** Machine-readable failure classification (issue #21). Absent unless the
+   *  ticket settled `failed`. The retry policy branches on this; the free-form
+   *  `error` below carries the human detail. */
+  reason?: FailureReason;
   error?: string;
 }
 
@@ -70,13 +80,13 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
     (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason }),
   );
   if (!impl.ok) {
-    const why =
-      impl.reason === "empty" ? "produced no commits (agent may have failed silently)" :
-      impl.reason === "rate-limited" ? "rate-limited, no fallback succeeded" :
-      impl.reason === "timeout" ? "agent timed out" :
-      impl.reason === "stale-base" ? "base ref could not be refreshed (offline?); refusing a stale branch-off" :
-      "agent failed";
-    return fail(t, ctx, `implement ${why}`, branch);
+    // One exhaustive lookup replaces two parallel ternary cascades (the human
+    // `why` + the machine `reason`) that each duplicated the ImplFailReason
+    // taxonomy from ports.ts. The Record forces every ImplFailReason to be
+    // decided once; the transient/terminal split is encoded here (rate-limited
+    // / stale-base / timeout are transient; empty / failed are terminal).
+    const f = IMPL_FAIL[impl.reason ?? "failed"];
+    return fail(t, ctx, { reason: f.reason, error: `implement ${f.error}` }, branch);
   }
   ctx.log("ok", `implement complete (${impl.commits} commit${impl.commits === 1 ? "" : "s"}); running review`, t.number);
 
@@ -104,13 +114,18 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
       (r) => ({ round: rounds, ok: r.ok }),
       { round: rounds },
     );
-    if (!fix.ok) return fail(t, ctx, `fix round ${rounds} failed`, branch);
+    if (!fix.ok) return fail(t, ctx, { reason: "fix-failed", error: `fix round ${rounds} failed` }, branch);
     verdict = await runReview();
   }
 
   if (verdict.kind !== "clean") {
-    // Either still has issues after rounds, or verdict stayed unknown.
-    return fail(t, ctx, `review not clean after ${rounds} round(s): ${verdict.kind}`, branch);
+    // Distinguish "still has actionable issues after N rounds" (the code is
+    // genuinely incomplete) from "verdict stayed unknown" (the agent never
+    // emitted a REVIEW_VERDICT line) — both used to share one `review not
+    // clean` message. Both are terminal for the ticket, but the post-mortem
+    // reason now tells a human which kind of attention is needed (issue #21).
+    const reason: FailureReason = verdict.kind === "issues" ? "review-issues" : "review-unknown";
+    return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}` }, branch);
   }
   ctx.log("ok", "review clean; opening PR", t.number);
 
@@ -130,7 +145,10 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   const ciOk = checks.state === "pass" || (checks.state === "none" && !ctx.requireChecks);
   if (!ciOk) {
     ctx.log("error", `CI not green (state=${checks.state}${checks.failed.length ? ": " + checks.failed.join(", ") : ""}); leaving PR #${pr} for human`, t.number);
-    return { status: "failed", branch, pr, rounds, error: "ci-failed" };
+    // CI red is the canonical transient cause: a flaky job / momentary infra
+    // failure often clears on a backoff-and-retry, so it's retryable. A retry
+    // re-runs the whole ticket (the PR from this attempt is left for a human).
+    return { status: "failed", branch, pr, rounds, reason: "ci-failed", error: "ci-failed" };
   }
 
   // 5. Merge (or hand off).
@@ -148,7 +166,10 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   } catch (e) {
     const msg = (e as Error).message;
     ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: false, error: msg });
-    return fail(t, ctx, `merge failed: ${msg}`, branch, pr);
+    // A merge failure is usually a race (base moved under us) or a transient
+    // gh 5xx — retryable. A retry re-runs from branch-off, so the stale PR is
+    // abandoned for a human to close.
+    return fail(t, ctx, { reason: "merge-race", error: `merge failed: ${msg}` }, branch, pr);
   }
 }
 
@@ -162,7 +183,7 @@ async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise
     () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch),
     (res) => ({ ok: res.ok, timedOut: res.timedOut }),
   );
-  if (!r.ok) return fail(t, ctx, `${skill} agent failed${r.timedOut ? " (timeout)" : ""}`, branch);
+  if (!r.ok) return fail(t, ctx, { reason: "single-shot-failed", error: `${skill} agent failed${r.timedOut ? " (timeout)" : ""}` }, branch);
   ctx.log("ok", `${skill} complete`, t.number);
   return { status: "done", branch };
 }
@@ -233,7 +254,33 @@ function prBody(t: Ticket): string {
   ].join("\n");
 }
 
-function fail(t: Ticket, ctx: RunContext, error: string, branch?: string, pr?: number): TicketOutcome {
-  ctx.log("error", error, t.number);
-  return { status: "failed", branch, pr, error };
+/** A required reason+detail pair — the two always co-occur on a failed
+ *  outcome, so they travel as one object instead of two positional params
+ *  (the call sites read clearer and the signature stops growing). */
+interface Failure {
+  reason: FailureReason;
+  error: string;
+}
+
+/** Maps the agent adapter's {@link ImplFailReason} onto the retry-classifiable
+ *  {@link FailureReason} plus its human message — the single source of truth
+ *  for that translation. Exhaustive over ImplFailReason, so adding a new
+ *  adapter reason is a compile error until it's decided here. */
+const IMPL_FAIL: Record<ImplFailReason, Failure> = {
+  "rate-limited": { reason: "rate-limited", error: "rate-limited, no fallback succeeded" },
+  "stale-base": { reason: "stale-base", error: "base ref could not be refreshed (offline?); refusing a stale branch-off" },
+  timeout: { reason: "agent-timeout", error: "agent timed out" },
+  empty: { reason: "implement-empty", error: "produced no commits (agent may have failed silently)" },
+  failed: { reason: "implement-failed", error: "agent failed" },
+};
+
+function fail(
+  t: Ticket,
+  ctx: RunContext,
+  failure: Failure,
+  branch?: string,
+  pr?: number,
+): TicketOutcome {
+  ctx.log("error", failure.error, t.number);
+  return { status: "failed", branch, pr, reason: failure.reason, error: failure.error };
 }

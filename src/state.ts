@@ -1,4 +1,4 @@
-import type { SettleReason, TicketStatus } from "./types.ts";
+import type { FailureReason, SettleReason, TicketStatus } from "./types.ts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -14,6 +14,12 @@ export interface TicketState {
   pr?: number;
   /** Fix-loop rounds completed. */
   rounds?: number;
+  /** Whole-ticket attempts made (issue #21). 1 on a clean first run; up to
+   *  `maxTicketRetries + 1` after backoffs. Absent on pre-#21 state files. */
+  attempts?: number;
+  /** Machine-readable failure classification (issue #21). Absent unless the
+   *  ticket settled `failed`. */
+  reason?: FailureReason;
   error?: string;
   /** Non-natural settle marker (e.g. `"cascade-abort"` for a cascade-killed
    *  dependent, #20). Distinct from `error` (a genuine failure) so a resumed

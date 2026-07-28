@@ -44,6 +44,7 @@ export const EVT = {
   TICKET_START: "ticket.start",
   TICKET_END: "ticket.end",
   TICKET_CASCADE: "ticket.cascade",
+  TICKET_RETRY: "ticket.retry",
   PROVIDER_SWITCH: "provider.switch",
   STEP_START: "step.start",
   STEP_END: "step.end",

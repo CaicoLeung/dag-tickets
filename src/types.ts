@@ -59,3 +59,32 @@ export interface RoutingRule {
   /** Whether the lifecycle produces a PR that must be created, checked, merged. */
   expectPr: boolean;
 }
+
+/**
+ * Why a ticket settled `failed`, as a machine-readable classification (issue #21).
+ *
+ * The free-form `error` string stays for the human detail ("merge failed: <gh
+ * error>"); `reason` is the enum a retry policy branches on. Splitting them
+ * stops the post-mortem from conflating "issues remain after N rounds" with
+ * "verdict unknown" — the two used to share the same `review not clean`
+ * message — and lets a transient failure (CI flake, momentary rate-limit, merge
+ * race) be retried while a terminal one (issues that won't resolve) cascades.
+ *
+ * Retryability is policy, not intrinsic to the label, so it lives in retry.ts
+ * (`isTransient`) rather than baked into this union. The split is: transient
+ * causes may clear on a backoff-and-retry; terminal causes will not.
+ */
+export type FailureReason =
+  // transient (a backoff-and-retry may clear them):
+  | "ci-failed" // CI red — often a flake / momentary infra failure
+  | "rate-limited" // provider quota exhausted every fallback
+  | "stale-base" // origin/<base> fetch failed (offline?); refusing a stale branch-off
+  | "merge-race" // gh merge failed (base moved / conflict / transient 5xx)
+  | "agent-timeout" // an agent run exceeded its wall budget
+  // terminal (retrying the whole ticket won't change the outcome):
+  | "review-issues" // review still has actionable findings after maxFixRounds
+  | "review-unknown" // review verdict stayed unknown (no ISSUES/CLEAN emitted)
+  | "implement-empty" // agent completed but produced no commits
+  | "implement-failed" // agent run failed (non-transient)
+  | "fix-failed" // a fix round failed
+  | "single-shot-failed"; // a triage/research single-shot agent failed

@@ -390,3 +390,133 @@ describe("lifecycle — structured event log", () => {
     expect(sink.events.find((e) => e.type === EVT.STEP_END)?.data?.step).toBe("triage");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Failure reason classification (issue #21): the structured `reason` stops the
+// post-mortem from conflating "issues remain after N rounds" with "verdict
+// unknown", and tags each failure site with a retry-classifiable label. The
+// retry policy (isTransient in retry.ts) branches on these; a single attempt
+// here never sets `attempts` (that's the retry wrapper's job).
+// ---------------------------------------------------------------------------
+
+describe("implement lifecycle — failure reason classification (issue #21)", () => {
+  test("review with issues after rounds → reason review-issues (terminal)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [issues(3), issues(3), issues(3)];
+    agent.fixes = [{ ok: true }, { ok: true }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("review-issues");
+    expect(out.attempts).toBeUndefined(); // a single attempt doesn't set it
+  });
+
+  test("review verdict unknown → reason review-unknown, DISTINCT from issues", async () => {
+    // The two used to share the `review not clean` message; reason now tells a
+    // human whether the code is incomplete (issues) or the agent rambled
+    // (unknown) — different kinds of attention.
+    const agent = new FakeAgent();
+    agent.reviews = [{ kind: "unknown", issueCount: 0, raw: "rambled" }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("review-unknown");
+    expect(out.reason).not.toBe("review-issues");
+  });
+
+  test("failing CI → reason ci-failed (transient / retryable)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    repo.checks = { state: "fail", failed: ["build"] };
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("ci-failed");
+  });
+
+  test("empty implement → reason implement-empty (terminal)", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "empty" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.reason).toBe("implement-empty");
+  });
+
+  test("rate-limited implement → reason rate-limited (transient)", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "rate-limited" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.reason).toBe("rate-limited");
+  });
+
+  test("timeout implement → reason agent-timeout (transient)", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "timeout" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.reason).toBe("agent-timeout");
+  });
+
+  test("stale-base implement → reason stale-base (transient)", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "stale-base" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.reason).toBe("stale-base");
+  });
+
+  test("plain failed implement → reason implement-failed (terminal)", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "failed" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.reason).toBe("implement-failed");
+  });
+
+  test("a fix round that fails → reason fix-failed (terminal)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [issues(2)];
+    agent.fixes = [{ ok: false }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("fix-failed");
+  });
+
+  test("a failed single-shot → reason single-shot-failed (terminal)", async () => {
+    const agent = new FakeAgent();
+    const repo = new FakePullRequest();
+    const t = ticket();
+    t.kind = "triage";
+    // FakeAgent.singleShot returns ok by default; force a failure by overriding
+    // the method on the instance (a class-method spread would drop the other
+    // prototype methods, so override in place instead).
+    agent.singleShot = async () => ({ ok: false });
+    const out = await processTicket(t, ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("single-shot-failed");
+  });
+
+  test("a successful ticket sets NO reason", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("done");
+    expect(out.reason).toBeUndefined();
+  });
+
+  test("a merge that throws → reason merge-race (transient)", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    repo.mergePr = async () => {
+      throw new Error("base moved under us");
+    };
+    const out = await processTicket(ticket(), ctx(agent, repo, { autoMerge: true }));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("merge-race");
+    expect(out.pr).toBe(1001); // PR left for a human
+  });
+});

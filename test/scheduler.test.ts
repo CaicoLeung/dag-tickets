@@ -1,10 +1,12 @@
 import { test, expect, describe } from "bun:test";
 import { runBatch, planCascade, applyCascadePlan } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
-import { fanInHeavyGraph } from "./helpers.ts";
-import type { Ticket, TicketStatus } from "../src/types.ts";
+import { fanInHeavyGraph, retryableOutcome } from "./helpers.ts";
+import type { FailureReason, Ticket, TicketStatus } from "../src/types.ts";
 import type { CascadeAction } from "../src/scheduler.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
+import { NULL_SINK } from "../src/ports.ts";
+import { runWithRetry, type RetryableOutcome } from "../src/retry.ts";
 
 function ticket(n: number, blockedBy: number[] = []): Ticket {
   return {
@@ -671,5 +673,123 @@ describe("applyCascadePlan — abort side-effect machinery (#20)", () => {
       status: "failed",
       from: [1],
     });
+  });
+});
+
+// Transient retry integration (issue #21): the cli wraps processTicket in
+// runWithRetry and hands the composed function to runBatch as `process`. The
+// scheduler itself never sees intermediate transient attempts — they're
+// absorbed inside runWithRetry — so this composes exactly the cli wiring and
+// asserts the two end-to-end behaviours the issue cares about:
+//   1. a transient failure that later succeeds completes (no cascade), and
+//   2. a terminal failure (or exhausted transient budget) still cascades.
+// Each attempt yields so concurrent tickets genuinely overlap.
+// ---------------------------------------------------------------------------
+
+describe("runBatch — transient retry integration (issue #21)", () => {
+  /** Builds a `process` fn = runWithRetry over a per-ticket outcome script.
+   *  `script[n]` is the list of (status, reason?) outcomes returned by
+   *  successive attempts; the ticket keeps retrying while they're transient
+   *  failed, stopping on the first done/skipped/terminal. */
+  function retriableProcess(
+    script: Record<number, Array<{ status: RetryableOutcome["status"]; reason?: FailureReason }>>,
+    maxRetries: number,
+    settled?: Array<[number, TicketStatus]>,
+    attempts?: Record<number, number>,
+  ) {
+    const idx: Record<number, number> = {};
+    return async (n: number): Promise<TicketStatus> => {
+      const outcome = await runWithRetry(
+        async () => {
+          await Promise.resolve(); // yield so concurrent tickets overlap
+          const seq = script[n] ?? [{ status: "done" as const }];
+          const step = seq[idx[n] = (idx[n] ?? 0)] ?? seq[seq.length - 1]!;
+          idx[n]++;
+          return retryableOutcome(step.status, step.reason);
+        },
+        {
+          maxRetries,
+          baseDelayMs: 0, // no real waiting in tests
+          maxDelayMs: 0,
+          sleep: async () => {},
+          events: NULL_SINK,
+          onAttempt: (a, o) => {
+            if (attempts) attempts[n] = a;
+          },
+        },
+      );
+      settled?.push([n, outcome.status]);
+      return outcome.status;
+    };
+  }
+
+  test("transient CI flake retried then succeeds: completes, dependents still run", async () => {
+    // #1 flakes once (ci-failed) then merges on attempt 2; #2 depends on #1.
+    // The scheduler sees #1 settle `done` — it never learns about the flake —
+    // so #2 runs normally instead of being cascaded-skipped.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const settled: Array<[number, TicketStatus]> = [];
+    const attempts: Record<number, number> = {};
+    const process = retriableProcess(
+      { 1: [{ status: "failed", reason: "ci-failed" }, { status: "done" }] },
+      3,
+      settled,
+      attempts,
+    );
+    const out = await runBatch(g, { concurrency: 2, process });
+    expect(out.completed).toEqual([1, 2]);
+    expect(out.failed).toEqual([]);
+    expect(attempts[1]).toBe(2); // flaked once, succeeded on the retry
+    expect(attempts[2]).toBe(1);
+  });
+
+  test("terminal review-issues is NOT retried: cascades immediately", async () => {
+    // #1 fails terminally (review-issues) on the first attempt; runWithRetry
+    // returns it at once, the scheduler cascades #2/#3 as failed.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const attempts: Record<number, number> = {};
+    const process = retriableProcess(
+      { 1: [{ status: "failed", reason: "review-issues" }] },
+      3,
+      undefined,
+      attempts,
+    );
+    const out = await runBatch(g, { concurrency: 3, process });
+    expect(out.failed).toEqual([1, 2, 3]);
+    expect(attempts[1]).toBe(1); // terminal → no retry budget spent
+  });
+
+  test("transient budget exhausted: still cascades after maxRetries", async () => {
+    // #1 keeps CI-failing; after maxRetries+1 attempts it's declared terminal
+    // and cascades to #2. Proves retries don't suppress the eventual cascade.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const attempts: Record<number, number> = {};
+    const process = retriableProcess(
+      { 1: [{ status: "failed", reason: "ci-failed" }] }, // always flakes
+      2, // → up to 3 total attempts
+      undefined,
+      attempts,
+    );
+    const out = await runBatch(g, { concurrency: 2, process });
+    expect(out.failed).toEqual([1, 2]);
+    expect(attempts[1]).toBe(3); // 1 initial + 2 retries, then cascade
+  });
+
+  test("retried ticket emits ticket.end(done) once and NO cascade for it", async () => {
+    // Event-trace check: a transient-then-success ticket settles done exactly
+    // once (the flaky attempt is internal to runWithRetry, so the scheduler
+    // emits one ticket.start/ticket.end(done) and zero ticket.cascade).
+    const g = buildGraph([ticket(1)]);
+    const sink = new RecordingSink();
+    const process = retriableProcess(
+      { 1: [{ status: "failed", reason: "rate-limited" }, { status: "done" }] },
+      3,
+    );
+    await runBatch(g, { concurrency: 1, process, events: sink });
+    const one = sink.of(1);
+    expect(one.filter((e) => e.type === EVT.TICKET_START)).toHaveLength(1);
+    expect(one.filter((e) => e.type === EVT.TICKET_END)).toHaveLength(1);
+    expect(one.find((e) => e.type === EVT.TICKET_END)?.data?.status).toBe("done");
+    expect(one.some((e) => e.type === EVT.TICKET_CASCADE)).toBe(false);
   });
 });
