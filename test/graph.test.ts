@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import { buildGraph, frontier, cascadeDependents, CycleError } from "../src/graph.ts";
+import { fanInHeavyGraph } from "./helpers.ts";
 import type { Ticket } from "../src/types.ts";
 
 function ticket(n: number, blockedBy: number[] = [], labels = ["ready-for-agent"]): Ticket {
@@ -64,12 +65,7 @@ describe("frontier ordering (fan-in / critical path)", () => {
   test("a ticket blocking more dependents launches before one blocking fewer", () => {
     // #2 blocks 5 dependents; #1 blocks none. Both ready. Higher fan-in first,
     // even though #1 < #2 under plain issue-number sort.
-    const g = buildGraph([
-      ticket(1),
-      ticket(2),
-      ticket(3, [2]), ticket(4, [2]), ticket(5, [2]), ticket(6, [2]), ticket(7, [2]),
-    ]);
-    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2, 1]);
+    expect(frontier(fanInHeavyGraph(), new Set(), new Set(), new Set())).toEqual([2, 1]);
   });
 
   test("critical-path depth breaks a fan-in tie (deeper chain first)", () => {
