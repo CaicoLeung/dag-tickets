@@ -33,12 +33,26 @@ export async function runBatch(
 ): Promise<BatchResult> {
   const completed = new Set<number>(opts.seedCompleted ?? []);
   const failed = new Set<number>(opts.seedFailed ?? []);
+  const skipped = new Set<number>();
+  const inflight = new Map<number, Promise<{ number: number; status: TicketStatus }>>();
+
+  // Cascade failure from every failed ticket to its not-yet-started dependents,
+  // persisting each cascaded dependent via onSettle so a killed run records it
+  // immediately rather than recovering only on the next resume. In-flight
+  // dependents are left to settle on their own; already-failed tickets are
+  // skipped so the callback fires exactly once per dependent.
+  const cascade = (): void => {
+    for (const dep of cascadeFailures(graph, completed, failed)) {
+      if (inflight.has(dep) || failed.has(dep)) continue;
+      failed.add(dep);
+      opts.onSettle?.(dep, "failed");
+    }
+  };
+
   // A blocker that failed before this run still dooms its not-yet-completed
   // dependents — cascade at startup so a resumed run mirrors in-run failures
   // (otherwise dependents of a seeded failure are silently dropped).
-  for (const dep of cascadeFailures(graph, completed, failed)) failed.add(dep);
-  const skipped = new Set<number>();
-  const inflight = new Map<number, Promise<{ number: number; status: TicketStatus }>>();
+  cascade();
 
   const launch = (n: number): void => {
     const p = Promise.resolve(n)
@@ -68,11 +82,11 @@ export async function runBatch(
     } else {
       // failed — cascade to not-yet-started dependents only.
       failed.add(settled.number);
-      for (const dep of cascadeFailures(graph, completed, failed)) {
-        if (!inflight.has(dep)) failed.add(dep);
-      }
     }
     opts.onSettle?.(settled.number, settled.status);
+    // Persist cascaded dependents after the root cause, so a killed run records
+    // the doomed branch without waiting for resume to self-heal it.
+    if (settled.status === "failed") cascade();
   }
 
   return {
