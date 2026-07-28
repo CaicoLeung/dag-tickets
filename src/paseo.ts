@@ -4,7 +4,6 @@ import type {
   AgentPort,
   BranchPort,
   Dispatcher,
-  DispatchFn,
   DispatchOpts,
   DispatchResult,
   ImplResult,
@@ -152,10 +151,11 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
 }
 
 /**
- * The rate-limit fallback loop, factored out so it can run over ANY dispatch
- * function. Prod binds it to the real {@link dispatch}; tests bind it to a fake
- * so the retry ordering (onSwitch per fallback, stop on first success, skip the
- * primary if it reappears in the fallback list) is exercised without spawning a
+ * The rate-limit fallback loop — single source of truth shared by the real
+ * {@link Dispatcher} (bound to {@link dispatch}) and by test fakes bound to a
+ * scripted dispatch. Running the real loop over a fake dispatch is what lets
+ * the retry ordering (onSwitch per fallback, stop on first success, skip the
+ * primary if it reappears in the fallback list) be exercised without a
  * `paseo run`.
  *
  * `onSwitch` runs before each retry so the caller can reset worktree/branch
@@ -163,7 +163,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
  * rate-limited after exhausting fallbacks is marked !ok.
  */
 export async function runWithFallback(
-  dispatchFn: DispatchFn,
+  dispatchFn: Dispatcher["dispatch"],
   prompt: string,
   opts: DispatchOpts,
   fallbacks: string[],
@@ -181,29 +181,21 @@ export async function runWithFallback(
 }
 
 /**
- * Dispatch with provider fallback. Thin wrapper over {@link runWithFallback}
- * bound to the real {@link dispatch}; behaviour is byte-identical to the
- * pre-injection implementation. Direct callers and the injected {@link Dispatcher}
- * share this single loop.
+ * Real {@link Dispatcher}: `dispatch` is the module-level run (stable-log
+ * polling + JSON-envelope parsing); `dispatchWithFallback` binds that same
+ * dispatch into {@link runWithFallback}, so prod behaviour is byte-identical to
+ * the pre-injection implementation. Frozen so the default wiring is constant.
+ * Passed as the default dispatcher to {@link PaseoAgent}.
  */
-export async function dispatchWithFallback(
-  prompt: string,
-  opts: DispatchOpts,
-  fallbacks: string[],
-  onSwitch?: (nextProvider: string) => Promise<void>,
-): Promise<DispatchResult> {
-  return runWithFallback(dispatch, prompt, opts, fallbacks, onSwitch);
-}
-
-/**
- * Real {@link Dispatcher}: wraps the module-level {@link dispatch} and
- * {@link dispatchWithFallback} unchanged, so prod wiring gets byte-identical
- * behaviour. Passed as the default dispatcher to {@link PaseoAgent}.
- */
-export const realDispatcher: Dispatcher = {
+export const realDispatcher: Dispatcher = Object.freeze({
   dispatch,
-  dispatchWithFallback,
-};
+  dispatchWithFallback: (
+    prompt: string,
+    opts: DispatchOpts,
+    fallbacks: string[],
+    onSwitch?: (nextProvider: string) => Promise<void>,
+  ): Promise<DispatchResult> => runWithFallback(dispatch, prompt, opts, fallbacks, onSwitch),
+});
 
 // ---------------------------------------------------------------------------
 // Prompt builders. The receiving Paseo agent starts with zero context, so each

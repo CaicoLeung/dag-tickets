@@ -113,14 +113,11 @@ export interface DispatchResult {
   rateLimited: boolean;
 }
 
-/** A dispatch function: runs one Paseo agent and yields its {@link DispatchResult}. */
-export type DispatchFn = (prompt: string, opts: DispatchOpts) => Promise<DispatchResult>;
-
 /**
  * The Paseo dispatch seam consumed by the real agent adapter ({@link PaseoAgent}).
  *
- * The real adapter wraps the module-level `dispatch` / `dispatchWithFallback`
- * (stable-log polling + rate-limit fallback) so prod behaviour is unchanged.
+ * The real adapter binds the module-level `dispatch` (stable-log polling) into a
+ * rate-limit fallback loop so prod behaviour is unchanged.
  * Tests pass a fake that returns scripted {@link DispatchResult}s — letting the
  * adapter's dispatch-result → {@link ImplResult}/verdict mappings be unit-tested
  * without spawning a real `paseo run`. The two consumers (prod wiring in cli.ts,
