@@ -96,17 +96,21 @@ export function frontier(
 
 /**
  * Every ticket that can never become ready because it (transitively) depends
- * on a failed ticket. Computed as the closure of reverse-adjacency (`blocks`)
- * edges from the failed set. The driver marks all of these failed in one pass
- * so the run can't hang on a doomed branch.
+ * on a ticket in `seed` — a terminal blocker that won't produce a mergeable
+ * result (failed or skipped). Computed as the closure of reverse-adjacency
+ * (`blocks`) edges from the seed set. The driver assigns each of these the
+ * seed's status in one pass so the run can't hang on a doomed branch.
+ *
+ * Pure over status: it only answers "which dependents are blocked by `seed`?",
+ * leaving the caller to decide what to mark them.
  */
-export function cascadeFailures(
+export function cascadeDependents(
   graph: Graph,
   completed: Set<number>,
-  failed: Set<number>,
+  seed: Set<number>,
 ): number[] {
   const doomed = new Set<number>();
-  const stack: number[] = [...failed];
+  const stack: number[] = [...seed];
   while (stack.length > 0) {
     const f = stack.pop()!;
     for (const blocked of graph.blocks.get(f) ?? new Set<number>()) {

@@ -176,6 +176,103 @@ describe("runBatch — cascade reaches the settle callback", () => {
   });
 });
 
+describe("runBatch — skip cascade", () => {
+  test("a skipped ticket cascades skip to its unstarted dependents (multi-hop)", async () => {
+    // 1 skips (unknown kind) -> 2 (depends on 1) and 3 (depends on 2) never run
+    // and are reported skipped, not silently dropped nor failed.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const fake = makeFake({ 1: "skipped" });
+    const out = await runBatch(g, { concurrency: 3, process: fake.process });
+    expect(out.skipped).toEqual([1, 2, 3]);
+    expect(out.failed).toEqual([]);
+    expect(out.completed).toEqual([]);
+    expect(fake.order()).toEqual([1]); // dependents never processed
+  });
+
+  test("a skipped join cascades through a diamond", async () => {
+    // 1 skips -> {2,3} -> 4 all skip transitively.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [1]), ticket(4, [2, 3])]);
+    const fake = makeFake({ 1: "skipped" });
+    const out = await runBatch(g, { concurrency: 3, process: fake.process });
+    expect(out.skipped).toEqual([1, 2, 3, 4]);
+    expect(fake.order()).toEqual([1]);
+  });
+
+  test("an independent sibling of a skip still completes", async () => {
+    // 1 skips; 2 depends on 1 (cascades skip); 3 is independent (survives).
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3)]);
+    const fake = makeFake({ 1: "skipped" });
+    const out = await runBatch(g, { concurrency: 3, process: fake.process });
+    expect(out.completed).toEqual([3]);
+    expect(out.skipped).toEqual([1, 2]);
+  });
+});
+
+describe("runBatch — skip cascade reaches the settle callback", () => {
+  test("a mid-run skip reports each cascaded dependent as skipped via onSettle", async () => {
+    // 1 skips -> 2 and 3 cascade. Each must reach onSettle as 'skipped' so a
+    // killed run persists them without waiting for resume.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 3,
+      process: makeFake({ 1: "skipped" }).process,
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    expect(settled).toContainEqual([1, "skipped"]);
+    expect(settled).toContainEqual([2, "skipped"]);
+    expect(settled).toContainEqual([3, "skipped"]);
+    // root cause recorded before its dependents
+    expect(settled.findIndex((e) => e[0] === 1)).toBeLessThan(
+      settled.findIndex((e) => e[0] === 2),
+    );
+  });
+
+  test("a mid-run skip fires onSettle exactly once per dependent", async () => {
+    // 1 skips (cascades 2); 3 is independent and completes afterwards. The
+    // cascade recompute on 3's settle must not re-fire for 2.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3)]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 1, // serialize: 1 settles, then 3 settles
+      process: makeFake({ 1: "skipped" }).process,
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    const twoSkips = settled.filter((e) => e[0] === 2 && e[1] === "skipped");
+    expect(twoSkips).toHaveLength(1);
+  });
+
+  test("a seeded-skip cascade at startup reports each cascaded dependent via onSettle", async () => {
+    // Resumed run: 1 already skipped (persisted). Its dependents 2,3 cascade
+    // at startup and must be persisted immediately, not only on next resume.
+    const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);
+    const settled: Array<[number, TicketStatus]> = [];
+    await runBatch(g, {
+      concurrency: 3,
+      process: makeFake().process,
+      seedSkipped: [1],
+      onSettle: (n, s) => settled.push([n, s]),
+    });
+    expect(settled).toContainEqual([2, "skipped"]);
+    expect(settled).toContainEqual([3, "skipped"]);
+    // the seeded skip itself is NOT re-reported (already persisted)
+    expect(settled.find((e) => e[0] === 1)).toBeUndefined();
+  });
+
+  test("an already-completed dependent is not yanked when its blocker later skips", async () => {
+    // 1 skips this run; 2 depends on 1 but was completed last run (seeded).
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const fake = makeFake({ 1: "skipped" });
+    const out = await runBatch(g, {
+      concurrency: 2,
+      process: fake.process,
+      seedCompleted: [2],
+    });
+    expect(out.skipped).toEqual([1]);
+    expect(out.completed).toEqual([2]); // resume correctness: not re-cascaded
+  });
+});
+
 describe("runBatch — skipped and callbacks", () => {
   test("skipped tickets are counted separately and don't block siblings", async () => {
     const g = buildGraph([ticket(1), ticket(2), ticket(3)]);

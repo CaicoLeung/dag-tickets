@@ -11,7 +11,7 @@ import {
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
-import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
+import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import pkg from "../package.json";
 
 interface ParsedArgs {
@@ -303,12 +303,9 @@ export async function main(argv: string[]): Promise<number> {
     };
   }
 
-  const seedCompleted = Object.entries(state.tickets)
-    .filter(([, s]) => s.status === "done")
-    .map(([n]) => parseInt(n, 10));
-  const seedFailed = Object.entries(state.tickets)
-    .filter(([, s]) => s.status === "failed")
-    .map(([n]) => parseInt(n, 10));
+  const seedCompleted = ticketsWithStatus(state, "done");
+  const seedFailed = ticketsWithStatus(state, "failed");
+  const seedSkipped = ticketsWithStatus(state, "skipped");
 
   const branch = new ShellBranch(a.cwd);
   const pullRequest = new ShellPullRequest(a.cwd);
@@ -329,6 +326,7 @@ export async function main(argv: string[]): Promise<number> {
     concurrency: a.concurrency,
     seedCompleted,
     seedFailed,
+    seedSkipped,
     process: async (n) => {
       const t = graph.byNumber.get(n)!;
       const outcome = await processTicket(t, ctx);

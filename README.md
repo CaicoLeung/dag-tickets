@@ -99,14 +99,14 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 ## Safety
 
 - **Auto-merge is gated on a clean review AND green CI.** A failing check leaves the PR open for you. `--require-checks` additionally blocks merge when a repo has no CI.
-- **A failed ticket cascades** to its not-yet-started dependents (marked failed, not retried), so a doomed branch can't hang the run. Dependents already in flight are left to settle.
+- **A failed or skipped ticket cascades** to its not-yet-started dependents (marked the same status, not retried), so a doomed branch can't hang the run. Dependents already in flight are left to settle.
 - **Resume is idempotent.** State lives at `.scratch/dag-tickets/<run-id>/state.json`. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
 - The driver never edits issue bodies; it only opens PRs, merges, and closes with a linking comment.
 
 ## Verify before trusting it
 
 ```bash
-bun test                 # 34 unit tests: DAG, frontier, cascade, cycles, parsing, args
+bun test                 # unit tests: DAG, frontier, cascade, cycles, parsing, args
 bun run typecheck        # tsc --noEmit
 dag-tickets --dry-run --parent 42   # see the plan before any agent runs
 ```
