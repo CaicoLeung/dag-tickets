@@ -11,7 +11,7 @@ import {
 } from "./discover.ts";
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import type { Logger, MergeStrategy } from "./ports.ts";
-import type { Ticket, TicketStatus } from "./types.ts";
+import type { FailureReason, Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog } from "./events.ts";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
@@ -236,7 +236,7 @@ function makeLogger(dryRun: boolean): Logger {
   };
 }
 
-function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: number; rounds?: number; attempts?: number; reason?: import("./types.ts").FailureReason; error?: string }): TicketState {
+function stateFromOutcome(status: TicketStatus, o?: { branch?: string; pr?: number; rounds?: number; attempts?: number; reason?: FailureReason; error?: string }): TicketState {
   return {
     status,
     branch: o?.branch,
@@ -437,6 +437,19 @@ export async function main(argv: string[]): Promise<number> {
         // terminal status, so a cascade still fires exactly once the budget is
         // exhausted. Dry-run returns `done` immediately, so no retry/sleep ever
         // happens there.
+        // Resume continuity (issue #21, between-attempt kill): a ticket killed
+        // mid-backoff is persisted `running` with its attempt count + transient
+        // reason. Carry that count forward as startAttempt so the loop's
+        // numbering stays cumulative and the configured --max-ticket-retries cap
+        // holds across the resume (a resumed ticket can't gain a fresh budget).
+        // Killing the agent *mid-attempt* (no attempt to persist) is the harder
+        // cancel-semantics case and remains T05.
+        const prior = state.tickets[n];
+        const priorAttempts = prior?.status === "running" ? prior.attempts : undefined;
+        const startAttempt =
+          typeof priorAttempts === "number" && isTransient(prior?.reason)
+            ? priorAttempts + 1
+            : undefined;
         const outcome = await runWithRetry(
           () => processTicket(t, ctx),
           {
@@ -446,6 +459,7 @@ export async function main(argv: string[]): Promise<number> {
             log,
             events,
             ticketNumber: n,
+            startAttempt,
             onAttempt: async (attempt, o) => {
               // A transient failure that still has retry budget is in-flight
               // (about to back off and retry), NOT terminal. Persist it as
@@ -453,8 +467,10 @@ export async function main(argv: string[]): Promise<number> {
               // sleep resumes by re-launching the ticket instead of wrongly
               // cascading it as a permanent failure. The final pass (terminal
               // reason, or budget exhausted) fails the guard and persists its
-              // real status. Full retry-resume continuity is the cancel-
-              // semantics work this is blocked by (T05).
+              // real status. Budget continuity across resume is handled via
+              // startAttempt above; the remaining cancel-semantics work (T05)
+              // is killing the agent *mid-attempt*, which has no completed
+              // attempt to persist.
               const inflight =
                 o.status === "failed" &&
                 attempt <= a.maxTicketRetries &&

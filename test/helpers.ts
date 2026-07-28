@@ -1,6 +1,7 @@
 import { buildGraph } from "../src/graph.ts";
 import type { Graph } from "../src/graph.ts";
-import type { Ticket } from "../src/types.ts";
+import type { FailureReason, Ticket } from "../src/types.ts";
+import type { RetryableOutcome } from "../src/retry.ts";
 
 function ticket(n: number, blockedBy: number[] = []): Ticket {
   return {
@@ -13,6 +14,16 @@ function ticket(n: number, blockedBy: number[] = []): Ticket {
     blockedBy,
     kind: "implement",
   };
+}
+
+/** Minimal {@link RetryableOutcome} builder for the retry + scheduler suites: a
+ *  status plus an optional reason, without re-spelling the conditional spread at
+ *  every call site (the two suites used to inline it independently). */
+export function retryableOutcome(
+  status: RetryableOutcome["status"],
+  reason?: FailureReason,
+): RetryableOutcome {
+  return { status, ...(reason ? { reason } : {}) };
 }
 
 /**

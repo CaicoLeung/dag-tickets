@@ -8,13 +8,7 @@ import {
 import type { FailureReason } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
-
-// A minimal outcome shape that satisfies runWithRetry's constraint without
-// pulling in the full lifecycle TicketOutcome — keeps the retry unit tests
-// focused on the loop, not the lifecycle.
-function outcome(status: "done" | "failed" | "skipped", reason?: FailureReason) {
-  return { status, ...(reason ? { reason } : {}) };
-}
+import { retryableOutcome as outcome } from "./helpers.ts";
 
 describe("isTransient", () => {
   test("transient causes are retryable", () => {
@@ -294,5 +288,70 @@ describe("runWithRetry", () => {
       },
     );
     expect(slept).toEqual([250]); // 0.5 * computeBackoff(1,500,10000)=0.5*500
+  });
+});
+
+describe("runWithRetry — startAttempt (resume continuity, issue #21)", () => {
+  test("startAttempt continues numbering cumulatively and the global cap still binds", async () => {
+    // A ticket killed mid-backoff after 2 attempts (maxRetries=2) resumes with
+    // startAttempt=3. The resumed loop runs attempt 3 only: a transient failure
+    // there hits `attempt > maxRetries` (3 > 2) and stops — so the ticket gets
+    // exactly 3 total attempts across both runs, NOT a fresh budget of 3 more.
+    const calls: number[] = [];
+    const out = await runWithRetry(
+      async (attempt) => { calls.push(attempt); return outcome("failed", "ci-failed"); },
+      {
+        maxRetries: 2,
+        baseDelayMs: 1,
+        maxDelayMs: 10,
+        sleep: async () => {},
+        events: NULL_SINK,
+        startAttempt: 3,
+      },
+    );
+    expect(calls).toEqual([3]); // only the resumed attempt, numbered cumulatively
+    expect(out.attempts).toBe(3); // cumulative count — not reset to 1
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("ci-failed");
+  });
+
+  test("startAttempt with budget remaining backs off and retries cumulatively", async () => {
+    // Resumed at attempt 2 (maxRetries=3, budget remains): attempt 2 fails
+    // transiently, backs off, attempt 3 succeeds. Numbering stays cumulative —
+    // the backoff is computed from the cumulative attempt (2 → base*2^1).
+    const calls: number[] = [];
+    const slept: number[] = [];
+    const scripted = [outcome("failed", "ci-failed"), outcome("done")];
+    let i = 0;
+    const out = await runWithRetry(
+      async (attempt) => {
+        calls.push(attempt);
+        return scripted[i++]!;
+      },
+      {
+        maxRetries: 3,
+        baseDelayMs: 100,
+        maxDelayMs: 1000,
+        sleep: async (ms) => { slept.push(ms); },
+        random: () => 1, // delay == computeBackoff
+        events: NULL_SINK,
+        startAttempt: 2,
+      },
+    );
+    expect(calls).toEqual([2, 3]); // resumed at 2, succeeded at 3
+    expect(slept).toEqual([200]); // computeBackoff(2,100,1000)=100*2^1=200
+    expect(out.status).toBe("done");
+    expect(out.attempts).toBe(3);
+  });
+
+  test("omitting startAttempt behaves exactly as before (starts at attempt 1)", async () => {
+    // Regression guard: the default keeps the pre-resume-continuity numbering.
+    const calls: number[] = [];
+    const out = await runWithRetry(
+      async (attempt) => { calls.push(attempt); return outcome("done"); },
+      { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 10, sleep: async () => {}, events: NULL_SINK },
+    );
+    expect(calls).toEqual([1]);
+    expect(out.attempts).toBe(1);
   });
 });

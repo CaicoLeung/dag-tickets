@@ -81,13 +81,24 @@ export interface RetryableOutcome {
   reason?: FailureReason;
 }
 
-export interface RetryOpts {
+/**
+ * The retry *policy*: the budget and its backoff curve. The three values
+ * always travel together (a retry budget + the timing of its waits), so they
+ * get one type — this is the "policy" the module doc says this module owns,
+ * named separately from the injectable seams (sleep/random/events/log) in
+ * {@link RetryOpts}. Built once at the cli and threaded to every call site
+ * without re-spelling the trio.
+ */
+export interface RetryPolicy {
   /** Additional attempts after the first. 0 disables retry entirely. */
   maxRetries: number;
   /** Backoff base (delay for the first retry, pre-jitter). */
   baseDelayMs: number;
   /** Backoff cap (pre-jitter). */
   maxDelayMs: number;
+}
+
+export interface RetryOpts extends RetryPolicy {
   /** Injectable sleeper — tests resolve immediately and record the delay. */
   sleep?: (ms: number) => Promise<void>;
   /** Injectable RNG for full jitter. Default {@link Math.random}. */
@@ -102,6 +113,14 @@ export interface RetryOpts {
    *  with the running 1-based count — the cli uses it to persist `attempts`
    *  between retries so a killed run records how far it got. */
   onAttempt?: (attempt: number, outcome: RetryableOutcome) => void | Promise<void>;
+  /** Resume anchor (issue #21): the 1-based number of the next attempt to run.
+   *  Defaults to 1 (a fresh ticket). A ticket killed mid-backoff is persisted
+   *  `running` with the attempt count of the pass that just failed; on resume
+   *  the cli passes `that count + 1` here so the loop's `attempt` numbering is
+   *  cumulative across both runs. Because the budget check is `attempt >
+   *  maxRetries`, a cumulative count means the configured cap is enforced
+   *  across resume — a resumed ticket can't silently gain a fresh full budget. */
+  startAttempt?: number;
 }
 
 /**
@@ -123,7 +142,10 @@ export async function runWithRetry<T extends RetryableOutcome>(
   const random = opts.random ?? Math.random;
   const events = opts.events ?? NULL_SINK;
 
-  let attempt = 0;
+  // startAttempt carries the cumulative count across a resume: the loop's
+  // `attempt` starts at startAttempt (not 1), so numbering and the maxRetries
+  // cap both span the original run + the resumed one.
+  let attempt = (opts.startAttempt ?? 1) - 1;
   // eslint-disable-next-line no-constant-condition
   for (;;) {
     attempt++;

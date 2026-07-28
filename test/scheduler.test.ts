@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { runBatch } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
-import { fanInHeavyGraph } from "./helpers.ts";
+import { fanInHeavyGraph, retryableOutcome } from "./helpers.ts";
 import type { FailureReason, Ticket, TicketStatus } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
@@ -479,7 +479,7 @@ describe("runBatch — transient retry integration (issue #21)", () => {
           const seq = script[n] ?? [{ status: "done" as const }];
           const step = seq[idx[n] = (idx[n] ?? 0)] ?? seq[seq.length - 1]!;
           idx[n]++;
-          return { status: step.status, ...(step.reason ? { reason: step.reason } : {}) };
+          return retryableOutcome(step.status, step.reason);
         },
         {
           maxRetries,
