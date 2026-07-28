@@ -33,6 +33,10 @@ export async function runBatch(
 ): Promise<BatchResult> {
   const completed = new Set<number>(opts.seedCompleted ?? []);
   const failed = new Set<number>(opts.seedFailed ?? []);
+  // A blocker that failed before this run still dooms its not-yet-completed
+  // dependents — cascade at startup so a resumed run mirrors in-run failures
+  // (otherwise dependents of a seeded failure are silently dropped).
+  for (const dep of cascadeFailures(graph, completed, failed)) failed.add(dep);
   const skipped = new Set<number>();
   const inflight = new Map<number, Promise<{ number: number; status: TicketStatus }>>();
 
@@ -45,7 +49,9 @@ export async function runBatch(
   };
 
   for (;;) {
-    const ready = frontier(graph, completed, new Set(inflight.keys()), failed);
+    // Skipped tickets are terminal but sit in none of completed/failed; without
+    // excluding them here, frontier re-offers them every pass → infinite relaunch.
+    const ready = frontier(graph, completed, new Set([...inflight.keys(), ...skipped]), failed);
     while (inflight.size < opts.concurrency && ready.length > 0) {
       launch(ready.shift()!);
     }
