@@ -7,6 +7,7 @@ import type {
   ImplResult,
   MergeStrategy,
   PullRequestPort,
+  ReconcileResult,
   StepResult,
 } from "../src/ports.ts";
 import type { ReviewVerdict, Ticket } from "../src/types.ts";
@@ -55,6 +56,10 @@ class FakeAgent implements AgentPort {
   providerLabel(s: "implement" | "review" | "triage" | "research"): string {
     return `fake/${s}`;
   }
+  // #29: optional on AgentPort; declared here so the overlap tests can script
+  // it via `agent.reconcile = async (...) => ...`. Undefined by default — the
+  // lifecycle guards on truthiness, and the non-overlap tests never trigger it.
+  reconcile?: (t: Ticket, blockerTipSha: string, base: string) => Promise<ReconcileResult>;
 }
 
 /** Recording PullRequestPort. createPr returns 1000+N; watchChecks returns scripted state. */
