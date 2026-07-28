@@ -60,6 +60,54 @@ describe("frontier", () => {
   });
 });
 
+describe("frontier ordering (fan-in / critical path)", () => {
+  test("a ticket blocking more dependents launches before one blocking fewer", () => {
+    // #2 blocks 5 dependents; #1 blocks none. Both ready. Higher fan-in first,
+    // even though #1 < #2 under plain issue-number sort.
+    const g = buildGraph([
+      ticket(1),
+      ticket(2),
+      ticket(3, [2]), ticket(4, [2]), ticket(5, [2]), ticket(6, [2]), ticket(7, [2]),
+    ]);
+    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2, 1]);
+  });
+
+  test("critical-path depth breaks a fan-in tie (deeper chain first)", () => {
+    // #1 and #2 each block one dependent (equal fan-in), but #2 sits atop a
+    // longer downstream chain (#2 -> #4 -> #5) so it wins on critical depth.
+    const g = buildGraph([
+      ticket(1),
+      ticket(2),
+      ticket(3, [1]),
+      ticket(4, [2]), ticket(5, [4]),
+    ]);
+    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2, 1]);
+  });
+
+  test("completed dependents drop out of the fan-in weight", () => {
+    // #2 blocks three tickets, #1 blocks one. Initially #2 leads.
+    const g = buildGraph([
+      ticket(1),
+      ticket(2),
+      ticket(3, [2]), ticket(4, [2]), ticket(5, [2]),
+      ticket(6, [1]),
+    ]);
+    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([2, 1]);
+    // Once #2's dependents are done it has nothing left to unblock; #1 (still
+    // blocking #6) now has the higher fan-in and launches first.
+    expect(frontier(g, new Set([3, 4, 5]), new Set(), new Set())).toEqual([1, 2]);
+  });
+
+  test("equal fan-in and depth fall back to ascending issue number", () => {
+    // Symmetric leaves: deterministic, human-predictable tie-break.
+    const g = buildGraph([
+      ticket(1), ticket(2),
+      ticket(3, [1]), ticket(4, [2]),
+    ]);
+    expect(frontier(g, new Set(), new Set(), new Set())).toEqual([1, 2]);
+  });
+});
+
 describe("cascadeDependents", () => {
   test("a terminal blocker dooms its dependents transitively", () => {
     const g = buildGraph([ticket(1), ticket(2, [1]), ticket(3, [2])]);

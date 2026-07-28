@@ -68,6 +68,22 @@ describe("runBatch — dependency ordering", () => {
     const out = await runBatch(buildGraph([]), { concurrency: 2, process: makeFake().process });
     expect(out).toEqual({ completed: [], failed: [], skipped: [] });
   });
+
+  test("launch order follows fan-in weight (highest dependents first)", async () => {
+    // #2 blocks 5 dependents; #1 blocks none. With a single worker the first
+    // ticket dispatched is the one that unblocks the most downstream work.
+    // The real dispatch path and `--dry-run` both flow through runBatch →
+    // frontier, so this covers the "launch order / dry-run reflect fan-in"
+    // acceptance criterion at the integration seam.
+    const g = buildGraph([
+      ticket(1),
+      ticket(2),
+      ticket(3, [2]), ticket(4, [2]), ticket(5, [2]), ticket(6, [2]), ticket(7, [2]),
+    ]);
+    const fake = makeFake();
+    await runBatch(g, { concurrency: 1, process: fake.process });
+    expect(fake.order().indexOf(2)).toBeLessThan(fake.order().indexOf(1));
+  });
 });
 
 describe("runBatch — concurrency bound", () => {
