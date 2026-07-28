@@ -79,6 +79,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 | `--auto-merge` / `--no-auto-merge` | auto | merge when review is clean + CI green (`--no-auto-merge` leaves PRs for you) |
 | `--merge-strategy <s>` | `squash` | `squash` \| `merge` \| `rebase` |
 | `--require-checks` | off | a PR with no CI does **not** satisfy the merge gate |
+| `--ci-watch-timeout-minutes <n>` | `30` | ceiling on `gh pr checks --watch`; a stuck check otherwise polls forever and starves a slot. The timeout becomes a transient `ci-failed` (retried with backoff). `0` = no bound |
 | `--provider <p>` | prefs/`codex/gpt-5.4` | override the implement/fix provider |
 | `--review-provider <p>` | prefs/`claude/opus` | override the review provider |
 | `--impl-label` / `--triage-label` / `--research-label` | mattpocock defaults | override routing labels |
