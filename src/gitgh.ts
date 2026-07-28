@@ -91,6 +91,21 @@ export class ShellBranch implements BranchPort {
   async deleteBranch(branch: string): Promise<void> {
     await run(["git", "branch", "-D", branch], { cwd: this.cwd });
   }
+
+  /**
+   * Fetch `base` from origin so `origin/<base>` reflects a same-run blocker
+   * squash-merge. The explicit refspec writes straight to the remote-tracking
+   * ref, so the update holds regardless of the remote's configured fetch
+   * refspecs (odd/shallow configs). Returns false on any failure (offline / no
+   * remote / non-fast-forward) so the run degrades against the last-known tip.
+   */
+  async fetchBase(base: string): Promise<boolean> {
+    const r = await run(
+      ["git", "fetch", "origin", `${base}:refs/remotes/origin/${base}`],
+      { cwd: this.cwd },
+    );
+    return r.ok;
+  }
 }
 
 /**

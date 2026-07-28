@@ -317,7 +317,30 @@ export class PaseoAgent implements AgentPort {
     };
   }
 
+  /**
+   * Resolve the branch-off base ref, fetching first so `origin/<base>` reflects
+   * any same-run blocker squash-merge.
+   *
+   * A dependent ticket that starts after its blocker merged in the same run
+   * must branch off a base containing that merge. `git fetch origin <base>` makes
+   * the merge visible at `origin/<base>`; resolving branch-off (and commit-count)
+   * to that ref guarantees the dependent composes on the blocker's code instead
+   * of a stale local tip. The fetch is best-effort: on failure (offline / no
+   * remote) we warn and still return `origin/<base>` — the last-known tip beats a
+   * stale local ref, so a degraded run proceeds rather than blocking. The name
+   * promises a resolved ref (always returned), not a guaranteed-fresh one.
+   */
+  private async resolveBranchOffBase(t: Ticket, base: string): Promise<string> {
+    const ok = await this.branch.fetchBase(base);
+    if (!ok) {
+      this.log("warn", `could not fetch origin/${base} (offline?); branch-off base may be stale`, t.number);
+    }
+    return `origin/${base}`;
+  }
+
   async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
+    // Fetch once up-front so origin/<base> contains any same-run blocker merge.
+    const baseRef = await this.resolveBranchOffBase(t, base);
     const r = await this.dispatcher.dispatchWithFallback(
       implementPrompt(t, branch),
       {
@@ -328,7 +351,7 @@ export class PaseoAgent implements AgentPort {
         timeoutMs: this.timeoutMs,
         branchMode: "branch-off",
         newBranch: branch,
-        base,
+        base: baseRef,
       },
       this.fallbacks,
       async (next) => {
@@ -347,8 +370,9 @@ export class PaseoAgent implements AgentPort {
       };
     }
     // A rate-limited or empty agent still "completes" with no diff — verify
-    // real commits landed before the lifecycle proceeds to review.
-    const commits = await this.branch.commitCount(base, branch);
+    // real commits landed before review. Count against the fetched origin/<base>
+    // so a stale local main can't mask an empty impl (or over-count real work).
+    const commits = await this.branch.commitCount(baseRef, branch);
     if (commits === 0) return { ok: false, commits: 0, reason: "empty" };
     return { ok: true, commits };
   }
@@ -399,6 +423,7 @@ export class PaseoAgent implements AgentPort {
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
     const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
+    const baseRef = await this.resolveBranchOffBase(t, base);
     const r = await this.dispatcher.dispatch(singleShotPrompt(skill, t), {
       provider,
       title: `${skill} #${t.number}`,
@@ -407,7 +432,7 @@ export class PaseoAgent implements AgentPort {
       timeoutMs: this.timeoutMs,
       branchMode: "branch-off",
       newBranch: branch,
-      base,
+      base: baseRef,
     });
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
   }

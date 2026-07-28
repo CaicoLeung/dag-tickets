@@ -157,6 +157,14 @@ export interface BranchPort {
   commitCount(base: string, branch: string): Promise<number>;
   /** Force-delete a local branch (reset a failed branch-off before retry). */
   deleteBranch(branch: string): Promise<void>;
+  /**
+   * Ensure `origin/<base>` is current so a branch-off from it contains a
+   * blocker's same-run squash-merge. Best-effort: returns false when the fetch
+   * fails (offline / no remote) — a degraded run still proceeds against the
+   * last-known tip rather than blocking. The caller resolves the branch-off
+   * base to `origin/<base>` regardless, so the fetched commit is used.
+   */
+  fetchBase(base: string): Promise<boolean>;
 }
 
 /**

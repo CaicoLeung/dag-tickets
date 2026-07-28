@@ -77,15 +77,29 @@ function ticket(n = 11): Ticket {
 class FakeBranch implements BranchPort {
   cleaned: string[] = [];
   deleted: string[] = [];
+  fetched: string[] = [];
+  /** Bases passed to commitCount, in call order (proves resolution to origin/<base>). */
+  commitCountBases: string[] = [];
   counts: Record<string, number> = {};
+  /** Per-(base,branch) overrides; key `${base}..${branch}`. Used to prove the
+   *  same branch reports a different count under a stale local `main` than under
+   *  the fetched `origin/main`, so commit-count MUST compare against origin/<base>. */
+  countsByBase: Record<string, number> = {};
+  /** Flip to false to simulate an offline / failed fetch. */
+  fetchOk = true;
   async cleanBranch(branch: string): Promise<void> {
     this.cleaned.push(branch);
   }
   async deleteBranch(branch: string): Promise<void> {
     this.deleted.push(branch);
   }
-  async commitCount(_base: string, branch: string): Promise<number> {
-    return this.counts[branch] ?? 3;
+  async fetchBase(base: string): Promise<boolean> {
+    this.fetched.push(base);
+    return this.fetchOk;
+  }
+  async commitCount(base: string, branch: string): Promise<number> {
+    this.commitCountBases.push(base);
+    return this.countsByBase[`${base}..${branch}`] ?? this.counts[branch] ?? 3;
   }
 }
 
@@ -331,5 +345,97 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
     expect(calls).toEqual(["primary"]);
     expect(switches).toEqual([]);
     expect(result.ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Base-ref freshness before branch-off (#15). A dependent ticket that starts
+// after its blocker merged in the same run must branch off a base that
+// contains that merge. The adapter's contract: before every branch-off it
+// fetches origin/<base> (so a same-run squash-merge is visible) and resolves
+// the branch-off base + commit-count to origin/<base>. checkout-branch steps
+// (review/fix) are NOT branch-offs and must not fetch.
+// ---------------------------------------------------------------------------
+
+describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
+  test("implement fetches origin/<base> once and resolves branch-off + commitCount to it", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const r = await a.implement(ticket(), "b1", "main");
+
+    expect(r.ok).toBe(true);
+    // fetched the bare base exactly once, before the dispatch
+    expect(branch.fetched).toEqual(["main"]);
+    // branch-off base is the resolved origin/main, not the stale local main
+    expect(d.calls[0]?.branchMode).toBe("branch-off");
+    expect(d.calls[0]?.base).toBe("origin/main");
+    expect(d.calls[0]?.newBranch).toBe("b1");
+    // commit-count compared against the fetched origin/main so an empty impl
+    // isn't masked by a stale local main (and real commits aren't over-counted)
+    expect(branch.commitCountBases).toEqual(["origin/main"]);
+  });
+
+  test("singleShot fetches origin/<base> and resolves branch-off to it", async () => {
+    const d = new ScriptedDispatcher();
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const r = await a.singleShot("triage", ticket(), "b1", "main");
+
+    expect(r.ok).toBe(true);
+    expect(branch.fetched).toEqual(["main"]);
+    expect(d.calls[0]?.branchMode).toBe("branch-off");
+    expect(d.calls[0]?.base).toBe("origin/main");
+  });
+
+  test("review (checkout-branch) does NOT fetch — it is not a branch-off", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "REVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false }];
+    const branch = new FakeBranch();
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    await a.review(ticket(), "b1", "main");
+
+    expect(branch.fetched).toEqual([]);
+    expect(d.calls[0]?.branchMode).toBe("checkout-branch");
+  });
+
+  test("fetchBase failure: warns, still resolves to origin/<base> and proceeds (degraded, not blocked)", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    const branch = new FakeBranch();
+    branch.fetchOk = false; // simulate offline / unreachable remote
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const r = await a.implement(ticket(), "b1", "main");
+
+    // best-effort: a failed fetch does not block the run
+    expect(r.ok).toBe(true);
+    expect(logged(cap.lines, "warn", /could not fetch origin\/main/)).toBe(true);
+    // still resolved to origin/main (last-known tip beats a stale local main)
+    expect(d.calls[0]?.base).toBe("origin/main");
+    expect(branch.commitCountBases).toEqual(["origin/main"]);
+  });
+
+  test("regression: empty impl is still detected when local main is stale (commit-count must use origin/<base>)", async () => {
+    // The agent produced zero commits, so the branch sits at origin/main.
+    // A stale LOCAL main (behind origin/main) would make `main..b1` report the
+    // gap commits as if they were the agent's — masking the empty impl. Counting
+    // against the fetched origin/main reports 0, so empty is correctly detected.
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    const branch = new FakeBranch();
+    branch.countsByBase[`origin/main..b1`] = 0; // truth: no agent commits vs fetched tip
+    branch.countsByBase[`main..b1`] = 5; // stale local main would over-count
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const r = await a.implement(ticket(), "b1", "main");
+
+    expect(r).toEqual({ ok: false, commits: 0, reason: "empty" });
+    // proves the count was taken against origin/main, not the stale local main
+    expect(branch.commitCountBases).toEqual(["origin/main"]);
   });
 });
