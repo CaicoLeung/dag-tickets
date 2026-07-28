@@ -1,10 +1,7 @@
 import type { Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
-import type { AgentPort, MergeStrategy, PullRequestPort } from "./ports.ts";
+import type { AgentPort, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
-
-export type LogLevel = "info" | "ok" | "warn" | "error" | "dim";
-export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => void;
 
 /**
  * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
@@ -78,7 +75,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
   while (verdict.kind === "issues" && rounds < ctx.maxFixRounds) {
     rounds++;
     ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
-    const fix = await ctx.agent.fix(t, verdict, branch);
+    const fix = await ctx.agent.fix(t, verdict, branch, rounds);
     if (!fix.ok) return fail(t, ctx, `fix round ${rounds} failed`, branch);
     verdict = await ctx.agent.review(t, branch, ctx.baseBranch);
   }

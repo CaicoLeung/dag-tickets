@@ -1,6 +1,6 @@
 import { run } from "./shell.ts";
 import type { ReviewVerdict, Ticket } from "./types.ts";
-import type { AgentPort, BranchPort, ImplResult, StepResult } from "./ports.ts";
+import type { AgentPort, BranchPort, ImplResult, Logger, StepResult } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 
 /**
@@ -285,9 +285,23 @@ export class PaseoAgent implements AgentPort {
     private readonly branch: BranchPort,
     private readonly prefs: ProviderPrefs,
     private readonly fallbacks: string[],
+    private readonly log: Logger,
     private readonly cwd?: string,
     private readonly timeoutMs: number = DEFAULT_RUN_MS,
   ) {}
+
+  /**
+   * Rate-limit-retry hook shared by review() and fix(): log the provider switch
+   * and free the branch so the checkout-branch retry isn't blocked by a stale
+   * worktree. implement() builds its own callback (a branch-off retry also has
+   * to delete the branch before re-creating it).
+   */
+  private onRateLimited(reason: string, t: Ticket, branch: string): (next: string) => Promise<void> {
+    return async (next) => {
+      this.log("warn", `${reason} rate-limited; retrying on ${next}`, t.number);
+      await this.branch.cleanBranch(branch);
+    };
+  }
 
   async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
     const r = await dispatchWithFallback(
@@ -303,9 +317,10 @@ export class PaseoAgent implements AgentPort {
         base,
       },
       this.fallbacks,
-      async () => {
+      async (next) => {
         // A branch-off retry must re-create the branch: clear any linked
         // worktree (git forbids a branch in >1 worktree) then drop the branch.
+        this.log("warn", `implement rate-limited; retrying on ${next}`, t.number);
         await this.branch.cleanBranch(branch);
         await this.branch.deleteBranch(branch);
       },
@@ -340,23 +355,22 @@ export class PaseoAgent implements AgentPort {
         branch,
       },
       this.fallbacks,
-      async () => {
-        await this.branch.cleanBranch(branch);
-      },
+      this.onRateLimited("review", t, branch),
     );
     if (!r.ok) {
+      this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
       return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
     }
     return parseReviewVerdict(r.output);
   }
 
-  async fix(t: Ticket, verdict: ReviewVerdict, branch: string): Promise<StepResult> {
+  async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
     await this.branch.cleanBranch(branch);
     const r = await dispatchWithFallback(
       fixPrompt(t, verdict.raw, branch),
       {
         provider: this.prefs.impl,
-        title: `fix #${t.number}`,
+        title: `fix #${t.number} r${round}`,
         slug: SLUG(t.number),
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
@@ -364,9 +378,7 @@ export class PaseoAgent implements AgentPort {
         branch,
       },
       this.fallbacks,
-      async () => {
-        await this.branch.cleanBranch(branch);
-      },
+      this.onRateLimited("fix", t, branch),
     );
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
   }

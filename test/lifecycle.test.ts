@@ -55,6 +55,7 @@ class FakeAgent implements AgentPort {
 class FakePullRequest implements PullRequestPort {
   prs: CreatePrOpts[] = [];
   merged: number[] = [];
+  strategies: MergeStrategy[] = [];
   closed: number[] = [];
   checks: CheckResult = { state: "pass", failed: [] };
   async createPr(opts: CreatePrOpts): Promise<number> {
@@ -64,8 +65,9 @@ class FakePullRequest implements PullRequestPort {
   async watchChecks(): Promise<CheckResult> {
     return this.checks;
   }
-  async mergePr(n: number): Promise<void> {
+  async mergePr(n: number, strategy: MergeStrategy): Promise<void> {
     this.merged.push(n);
+    this.strategies.push(strategy);
   }
   async closeIssue(n: number): Promise<void> {
     this.closed.push(n);
@@ -96,7 +98,11 @@ describe("implement lifecycle — happy path", () => {
     expect(out.status).toBe("done");
     expect(out.rounds).toBe(0);
     expect(repo.prs).toHaveLength(1);
+    expect(repo.prs[0]?.head).toBeTruthy();
+    expect(repo.prs[0]?.base).toBe("main");
+    expect(repo.prs[0]?.title).toContain("(#1)");
     expect(repo.merged).toEqual([1001]);
+    expect(repo.strategies).toEqual(["squash"]);
     expect(repo.closed).toEqual([1]);
     expect(agent.reviewCalls).toBe(1);
     expect(agent.fixCalls).toBe(0);
@@ -195,6 +201,15 @@ describe("implement lifecycle — CI gate & merge", () => {
     expect(repo.merged).toHaveLength(0);
     expect(repo.closed).toHaveLength(0);
   });
+
+  test("non-default mergeStrategy reaches mergePr", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo, { mergeStrategy: "rebase" }));
+    expect(out.status).toBe("done");
+    expect(repo.strategies).toEqual(["rebase"]);
+  });
 });
 
 describe("implement lifecycle — early failure", () => {
@@ -248,5 +263,22 @@ describe("routing & dry-run", () => {
     expect(out.status).toBe("done");
     expect(repo.prs).toHaveLength(0);
     expect(agent.reviewCalls).toBe(0);
+  });
+
+  test("dry-run routes a research ticket to its own provider label", async () => {
+    const agent = new FakeAgent();
+    const repo = new FakePullRequest();
+    const plan: string[] = [];
+    const t = ticket();
+    t.kind = "research";
+    t.labels = ["needs-research"];
+    const out = await processTicket(
+      t,
+      ctx(agent, repo, { dryRun: true, log: (_lvl, msg) => plan.push(msg) }),
+    );
+    expect(out.status).toBe("done");
+    expect(plan.some((l) => l.includes("fake/research"))).toBe(true);
+    expect(plan.some((l) => l.includes("fake/review"))).toBe(false); // single-shot: no review line
+    expect(repo.prs).toHaveLength(0);
   });
 });

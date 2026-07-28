@@ -21,10 +21,17 @@
  *    branch hygiene, owned by the agent adapter) and {@link PullRequestPort}
  *    (gh PR/CI/merge/issue, owned by the orchestrator). These ops are already
  *    cohesive, so they stay thin methods rather than invented domain verbs.
+ *  - {@link Logger} lives here too: both the orchestrator and the real adapters
+ *    log through it, so a rate-limit retry inside PaseoAgent can surface the
+ *    same `warn` line the orchestrator would — no silent retries.
  */
 import type { ReviewVerdict, Ticket } from "./types.ts";
 
 export type MergeStrategy = "squash" | "merge" | "rebase";
+
+/** Severity for the shared logger. Used by the orchestrator and both adapters. */
+export type LogLevel = "info" | "ok" | "warn" | "error" | "dim";
+export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => void;
 
 export interface CheckResult {
   /** "pass" | "fail" | "none" (no CI configured). */
@@ -65,8 +72,9 @@ export interface AgentPort {
   implement(t: Ticket, branch: string, base: string): Promise<ImplResult>;
   /** Run /code-review on `branch` against `base`. Returns the parsed verdict. */
   review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict>;
-  /** Run one fix pass against the review verdict, on the existing branch. */
-  fix(t: Ticket, verdict: ReviewVerdict, branch: string): Promise<StepResult>;
+  /** Run one fix pass against the review verdict, on the existing branch.
+   *  `round` (1-based) disambiguates repeated fix passes in the agent UI. */
+  fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult>;
   /** Single-shot skill (triage/research) in a fresh worktree — no PR. */
   singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult>;
   /** Human-readable provider that would serve this skill (dry-run display only). */

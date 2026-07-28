@@ -1,6 +1,6 @@
 import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
-import { processTicket, type RunContext, type Logger } from "./lifecycle.ts";
+import { processTicket, type RunContext } from "./lifecycle.ts";
 import { loadPrefs, PaseoAgent, type ProviderPrefs } from "./paseo.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
@@ -9,7 +9,7 @@ import {
   fetchIssues,
 } from "./discover.ts";
 import { repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
-import type { MergeStrategy } from "./ports.ts";
+import type { Logger, MergeStrategy } from "./ports.ts";
 import type { Ticket, TicketStatus } from "./types.ts";
 import { loadState, saveState, type RunState, type TicketState } from "./state.ts";
 import pkg from "../package.json";
@@ -312,7 +312,7 @@ export async function main(argv: string[]): Promise<number> {
 
   const branch = new ShellBranch(a.cwd);
   const pullRequest = new ShellPullRequest(a.cwd);
-  const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, a.cwd);
+  const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd);
   const ctx: RunContext = {
     agent,
     pullRequest,
