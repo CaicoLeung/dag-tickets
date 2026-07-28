@@ -64,6 +64,7 @@ async function runImplementLifecycle(t: Ticket, ctx: RunContext): Promise<Ticket
       impl.reason === "empty" ? "produced no commits (agent may have failed silently)" :
       impl.reason === "rate-limited" ? "rate-limited, no fallback succeeded" :
       impl.reason === "timeout" ? "agent timed out" :
+      impl.reason === "stale-base" ? "base ref could not be refreshed (offline?); refusing a stale branch-off" :
       "agent failed";
     return fail(t, ctx, `implement ${why}`, branch);
   }

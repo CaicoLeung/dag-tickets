@@ -44,7 +44,7 @@ export interface CheckResult {
 // ---------------------------------------------------------------------------
 
 /** Why an implement step did not produce a reviewable branch. */
-export type ImplFailReason = "failed" | "timeout" | "rate-limited" | "empty";
+export type ImplFailReason = "failed" | "timeout" | "rate-limited" | "empty" | "stale-base";
 
 /** Outcome of an implement dispatch. `ok` implies real commits landed. */
 export interface ImplResult {
@@ -157,6 +157,25 @@ export interface BranchPort {
   commitCount(base: string, branch: string): Promise<number>;
   /** Force-delete a local branch (reset a failed branch-off before retry). */
   deleteBranch(branch: string): Promise<void>;
+  /**
+   * Ensure `origin/<base>` is current so a branch-off from it contains a
+   * blocker's same-run squash-merge. Returns false only when the fetch fails
+   * (offline / no remote / non-fast-forward). A dependent ticket cannot safely
+   * start on a stale base, so the caller MUST treat false as a hard failure —
+   * never resolve the branch-off to `origin/<base>` without a confirmed fetch.
+   */
+  ensureBaseRefFresh(base: string): Promise<boolean>;
+}
+
+/** Strip a stray `origin/` prefix so callers can pass either form without
+ *  double-prefixing the fetch refspec (`origin/origin/main`). */
+export function normalizeBase(base: string): string {
+  return base.startsWith("origin/") ? base.slice("origin/".length) : base;
+}
+
+/** The remote-tracking ref for a bare branch name: `main` → `origin/main`. */
+export function remoteRef(base: string): string {
+  return `origin/${normalizeBase(base)}`;
 }
 
 /**
