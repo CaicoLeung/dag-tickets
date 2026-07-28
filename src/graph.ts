@@ -92,6 +92,13 @@ function normKey(s: string): string {
  * with every in-batch blocker completed.
  *
  * Out-of-batch blockers are treated as satisfied (they're closed/external).
+ *
+ * The frontier is ordered to minimize total run wall-time: a ticket that
+ * unblocks more still-pending dependents launches first (fan-in), tie-broken
+ * by the longest remaining downstream chain (critical-path depth). Issue
+ * number ascending is the final, deterministic tie-break so equal-weight
+ * tickets keep a stable, human-predictable order. The scheduler launches in
+ * this order, so the same weighting drives real dispatch and `--dry-run`.
  */
 export function frontier(
   graph: Graph,
@@ -107,7 +114,39 @@ export function frontier(
     const satisfied = t.blockedBy.every((b) => completed.has(b) || !graph.byNumber.has(b));
     if (satisfied) ready.push(t.number);
   }
-  return ready.sort((a, b) => a - b);
+
+  // `running` already folds in skipped tickets (see the scheduler), so the
+  // union below is exactly the set of tickets that are done or in flight —
+  // i.e. no longer pending dependents a frontier ticket could unblock.
+  const done = new Set<number>([...completed, ...running, ...failed]);
+
+  // Direct dependents of `n` that still need to run — the shared edge-walk
+  // both weighting keys derive from.
+  const pendingDependents = (n: number): number[] => {
+    const out: number[] = [];
+    for (const dep of graph.blocks.get(n) ?? []) if (!done.has(dep)) out.push(dep);
+    return out;
+  };
+
+  // Longest chain of still-pending dependents below `n` (memoized for the
+  // lifetime of this call, where `done` is a fixed snapshot).
+  const depth = new Map<number, number>();
+  const criticalDepth = (n: number): number => {
+    const cached = depth.get(n);
+    if (cached !== undefined) return cached;
+    let max = 0;
+    for (const dep of pendingDependents(n)) max = Math.max(max, 1 + criticalDepth(dep));
+    depth.set(n, max);
+    return max;
+  };
+
+  return ready.sort((a, b) => {
+    const fanDelta = pendingDependents(b).length - pendingDependents(a).length;
+    if (fanDelta !== 0) return fanDelta; // higher fan-in first
+    const depthDelta = criticalDepth(b) - criticalDepth(a);
+    if (depthDelta !== 0) return depthDelta; // deeper critical path first
+    return a - b; // stable deterministic tie-break
+  });
 }
 
 /**
