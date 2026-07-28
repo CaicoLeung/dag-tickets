@@ -1,5 +1,6 @@
 import { mustRun, run } from "./shell.ts";
 import type { BranchPort, CheckResult, CreatePrOpts, MergeStrategy, PullRequestPort } from "./ports.ts";
+import { normalizeBase } from "./ports.ts";
 
 export interface RepoInfo {
   owner: string;
@@ -92,16 +93,16 @@ export class ShellBranch implements BranchPort {
     await run(["git", "branch", "-D", branch], { cwd: this.cwd });
   }
 
-  /**
-   * Fetch `base` from origin so `origin/<base>` reflects a same-run blocker
-   * squash-merge. The explicit refspec writes straight to the remote-tracking
-   * ref, so the update holds regardless of the remote's configured fetch
-   * refspecs (odd/shallow configs). Returns false on any failure (offline / no
-   * remote / non-fast-forward) so the run degrades against the last-known tip.
-   */
-  async fetchBase(base: string): Promise<boolean> {
+  /** @see {BranchPort.ensureBaseRefFresh}.
+   *
+   *  Refspec rationale: `+<base>:refs/remotes/origin/<base>` writes straight to
+   *  the remote-tracking ref (independent of the remote's configured fetchspecs)
+   *  and the leading `+` force-updates it on a non-fast-forward, so a rebased /
+   *  force-pushed base still lands instead of being rejected as stale. */
+  async ensureBaseRefFresh(base: string): Promise<boolean> {
+    const bare = normalizeBase(base);
     const r = await run(
-      ["git", "fetch", "origin", `${base}:refs/remotes/origin/${base}`],
+      ["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`],
       { cwd: this.cwd },
     );
     return r.ok;

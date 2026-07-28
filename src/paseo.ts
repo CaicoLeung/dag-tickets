@@ -10,6 +10,7 @@ import type {
   Logger,
   StepResult,
 } from "./ports.ts";
+import { normalizeBase, remoteRef } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 
 /**
@@ -317,30 +318,27 @@ export class PaseoAgent implements AgentPort {
     };
   }
 
-  /**
-   * Resolve the branch-off base ref, fetching first so `origin/<base>` reflects
-   * any same-run blocker squash-merge.
+  /** Fetch `origin/<base>` and return the resolved remote-tracking ref, or
+   *  `null` if the fetch failed (offline / no remote / non-fast-forward).
    *
-   * A dependent ticket that starts after its blocker merged in the same run
-   * must branch off a base containing that merge. `git fetch origin <base>` makes
-   * the merge visible at `origin/<base>`; resolving branch-off (and commit-count)
-   * to that ref guarantees the dependent composes on the blocker's code instead
-   * of a stale local tip. The fetch is best-effort: on failure (offline / no
-   * remote) we warn and still return `origin/<base>` — the last-known tip beats a
-   * stale local ref, so a degraded run proceeds rather than blocking. The name
-   * promises a resolved ref (always returned), not a guaranteed-fresh one.
-   */
-  private async resolveBranchOffBase(t: Ticket, base: string): Promise<string> {
-    const ok = await this.branch.fetchBase(base);
-    if (!ok) {
-      this.log("warn", `could not fetch origin/${base} (offline?); branch-off base may be stale`, t.number);
-    }
-    return `origin/${base}`;
+   *  A dependent ticket that starts after its blocker merged in the same run
+   *  must branch off a base containing that merge; only a confirmed fetch makes
+   *  that merge visible at `origin/<base>`. On `null` the caller MUST fail the
+   *  ticket rather than branch off a possibly-stale tip (issue #15). */
+  private async resolveBranchOffBase(base: string): Promise<string | null> {
+    const bare = normalizeBase(base);
+    const ok = await this.branch.ensureBaseRefFresh(bare);
+    return ok ? remoteRef(bare) : null;
   }
 
   async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
-    // Fetch once up-front so origin/<base> contains any same-run blocker merge.
-    const baseRef = await this.resolveBranchOffBase(t, base);
+    const baseRef = await this.resolveBranchOffBase(base);
+    if (baseRef === null) {
+      // Failing beats a silent stale branch-off: a dependent composing on
+      // pre-merge code is exactly the CI/merge-conflict failure #15 prevents.
+      this.log("warn", `could not fetch ${remoteRef(base)} (offline?); failing implement to avoid a stale branch-off`, t.number);
+      return { ok: false, commits: 0, reason: "stale-base" };
+    }
     const r = await this.dispatcher.dispatchWithFallback(
       implementPrompt(t, branch),
       {
@@ -369,9 +367,8 @@ export class PaseoAgent implements AgentPort {
         reason: r.rateLimited ? "rate-limited" : r.timedOut ? "timeout" : "failed",
       };
     }
-    // A rate-limited or empty agent still "completes" with no diff — verify
-    // real commits landed before review. Count against the fetched origin/<base>
-    // so a stale local main can't mask an empty impl (or over-count real work).
+    // A rate-limited or empty agent still "completes" with no diff — count
+    // against the fetched origin/<base> so a stale local main can't mask it.
     const commits = await this.branch.commitCount(baseRef, branch);
     if (commits === 0) return { ok: false, commits: 0, reason: "empty" };
     return { ok: true, commits };
@@ -423,7 +420,11 @@ export class PaseoAgent implements AgentPort {
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
     const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
-    const baseRef = await this.resolveBranchOffBase(t, base);
+    const baseRef = await this.resolveBranchOffBase(base);
+    if (baseRef === null) {
+      this.log("warn", `could not fetch ${remoteRef(base)} (offline?); failing ${skill} to avoid a stale branch-off`, t.number);
+      return { ok: false, timedOut: false, rateLimited: false };
+    }
     const r = await this.dispatcher.dispatch(singleShotPrompt(skill, t), {
       provider,
       title: `${skill} #${t.number}`,

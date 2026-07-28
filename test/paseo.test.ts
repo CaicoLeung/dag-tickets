@@ -93,7 +93,7 @@ class FakeBranch implements BranchPort {
   async deleteBranch(branch: string): Promise<void> {
     this.deleted.push(branch);
   }
-  async fetchBase(base: string): Promise<boolean> {
+  async ensureBaseRefFresh(base: string): Promise<boolean> {
     this.fetched.push(base);
     return this.fetchOk;
   }
@@ -353,8 +353,9 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
 // after its blocker merged in the same run must branch off a base that
 // contains that merge. The adapter's contract: before every branch-off it
 // fetches origin/<base> (so a same-run squash-merge is visible) and resolves
-// the branch-off base + commit-count to origin/<base>. checkout-branch steps
-// (review/fix) are NOT branch-offs and must not fetch.
+// the branch-off base + commit-count to origin/<base>; if the fetch fails the
+// ticket FAILS (reason 'stale-base') rather than silently composing on a stale
+// tip. checkout-branch steps (review/fix) are NOT branch-offs and must not fetch.
 // ---------------------------------------------------------------------------
 
 describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
@@ -403,7 +404,9 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     expect(d.calls[0]?.branchMode).toBe("checkout-branch");
   });
 
-  test("fetchBase failure: warns, still resolves to origin/<base> and proceeds (degraded, not blocked)", async () => {
+  test("implement fetch fail FAILS the ticket (stale-base) — no silent stale branch-off", async () => {
+    // AC#1/#2: a base we couldn't refresh is not safe to branch off. Proceeding
+    // would silently compose on pre-merge code — the exact failure #15 prevents.
     const d = new ScriptedDispatcher();
     d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
     const branch = new FakeBranch();
@@ -412,12 +415,12 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
     const r = await a.implement(ticket(), "b1", "main");
 
-    // best-effort: a failed fetch does not block the run
-    expect(r.ok).toBe(true);
+    // hard fail, not a degraded proceed
+    expect(r).toEqual({ ok: false, commits: 0, reason: "stale-base" });
     expect(logged(cap.lines, "warn", /could not fetch origin\/main/)).toBe(true);
-    // still resolved to origin/main (last-known tip beats a stale local main)
-    expect(d.calls[0]?.base).toBe("origin/main");
-    expect(branch.commitCountBases).toEqual(["origin/main"]);
+    // the agent was never dispatched, and commit-count never ran (no branch-off)
+    expect(d.calls).toEqual([]);
+    expect(branch.commitCountBases).toEqual([]);
   });
 
   test("regression: empty impl is still detected when local main is stale (commit-count must use origin/<base>)", async () => {
