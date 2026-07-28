@@ -41,9 +41,6 @@ export async function runBatch(
   // immediately rather than recovering only on the next resume. In-flight
   // dependents are left to settle on their own; already-failed tickets are
   // skipped so the callback fires exactly once per dependent.
-  //
-  // Single propagation point: the skip-cascade ticket extends this later
-  // ("make the change easy, then make the easy change").
   const cascade = (): void => {
     for (const dep of cascadeFailures(graph, completed, failed)) {
       if (inflight.has(dep) || failed.has(dep)) continue;
