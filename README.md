@@ -107,10 +107,23 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 - **One run per checkout.** The driver takes a repo-wide lock at `.scratch/dag-tickets/run.lock` before dispatching, so two `dag-tickets` runs can't fight over the shared `dag-<n>` worktrees/branches — the second run aborts with a clear message. A lock left behind by a killed run (the holder pid is dead) is recovered automatically on the next start. The lock is released on normal exit **and** on `SIGINT`/`SIGTERM`. `--dry-run` is lock-free (it dispatches nothing, so it never blocks a real run).
 - The driver never edits issue bodies; it only opens PRs, merges, and closes with a linking comment.
 
+## Environment
+
+A few timings are env-tunable so a host running quick local batches (or the
+self-tests, which collapse the waits) can shrink them. All default to the prod
+caps below when unset.
+
+| Variable | Default | What it bounds |
+| --- | --- | --- |
+| `DAG_PASEO_LOG_POLL_MS` | `2000` | Interval between `paseo logs` reads while waiting for the review transcript to stop changing. Lower it on hosts whose paseo log store updates quickly. |
+| `DAG_RETRY_BASE_MS` | `30000` | Base for the whole-ticket transient-retry backoff (full-jitter is applied on top). |
+| `DAG_RETRY_MAX_MS` | `300000` | Cap for the same backoff curve. |
+
 ## Verify before trusting it
 
 ```bash
-bun test                 # unit tests: DAG, frontier, cascade, cycles, parsing, args
+bun test                 # 284 tests: unit (DAG/frontier/cascade/cycles/parsing/args)
+                         #          + real-CLI e2e (concurrency, overlap, retry, fallback)
 bun run typecheck        # tsc --noEmit
 dag-tickets --dry-run --parent 42   # see the plan before any agent runs
 ```

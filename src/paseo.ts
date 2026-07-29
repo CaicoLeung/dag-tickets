@@ -61,6 +61,11 @@ export async function loadPrefs(): Promise<ProviderPrefs> {
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
 
+/** Interval between `paseo logs` reads while waiting for the agent's transcript
+ *  to stop changing. Read at call time (not module load) so a caller can adjust
+ *  it via env between dispatches — prod leaves it unset → 2000ms (unchanged). */
+const paseoLogPollMs = (): number => Number(process.env.DAG_PASEO_LOG_POLL_MS ?? 2000);
+
 function msToDuration(ms: number): string {
   const m = Math.max(1, Math.round(ms / 60000));
   return m >= 60 ? `${Math.round(m / 60)}h` : `${m}m`;
@@ -140,7 +145,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
           output = cur;
           if (cur.length > 0 && cur === prev) break;
           prev = cur;
-          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 2000));
+          if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, paseoLogPollMs()));
         }
       }
     } catch {

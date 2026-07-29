@@ -26,7 +26,15 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
     stdin: opts.input !== undefined ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: opts.env ? { ...process.env, ...opts.env } : undefined,
+    // Always overlay onto a *live* snapshot of process.env rather than
+    // passing `undefined`. Bun.spawn({ env: undefined }) inherits the env the
+    // bun process *started with* (a startup snapshot), silently ignoring any
+    // runtime mutation of process.env — so a caller that rewrites PATH (e.g.
+    // the e2e harness installing gh/paseo shims, or a wrapper adjusting PATH)
+    // would see its override dropped. Spreading process.env here makes both
+    // branches (opts.env present or absent) behave identically. In prod
+    // nothing mutates process.env at runtime, so this is a no-op there.
+    env: { ...process.env, ...(opts.env ?? {}) },
   });
 
   let timedOut = false;
