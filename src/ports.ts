@@ -47,8 +47,9 @@ export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => vo
  * (lifecycle/scheduler/cli) and the real agent adapter ({@link PaseoAgent}) —
  * the same cross-seam property that puts {@link Logger} here. The real adapter
  * is `JsonlEventLog` (events.ts, append-only file); tests pass {@link NULL_SINK}
- * or a capturing fake. `emit` never throws and never blocks the caller: it
- * stages a line; the adapter decides when/where to flush.
+ * or a capturing fake. `emit` never throws and is durable per-call: each line
+ * is on disk before `emit` returns (issue #41), so mid-run monitoring sees
+ * every event without waiting for a flush.
  */
 export interface EventSink {
   emit(type: string, ticket: number | undefined, data?: Record<string, unknown>): void;

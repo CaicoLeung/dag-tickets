@@ -14,18 +14,22 @@
  *    scheduler, and agent adapter emit through it. This module holds only the
  *    file-backed adapter ({@link JsonlEventLog}); tests pass {@link NULL_SINK}
  *    (also from ports.ts) or the {@link RecordingSink} fake exported below.
- *  - Writes are promise-serialized in emit order and mkdir-safe. Graceful
- *    termination (throw / exit / SIGTERM) is covered by a try/finally `flush()`
- *    at the call site, so the on-disk trace is complete and in-order. A hard
- *    kill (SIGKILL) can drop staged-but-unflushed lines and truncate the
- *    in-flight one; the surviving prefix stays ordered because appends are
- *    line-atomic and serialized.
+ *  - Each emit appends its line SYNCHRONOUSLY (issue #41), so a reader tailing
+ *    the file mid-run — a dashboard, scheduler, or resume check — sees every
+ *    step/ticket event the instant it happens, not only at run end. Sync
+ *    appends are inherently ordered, so burst-ordering and resume-seq hold
+ *    without a promise chain. `flush()` is retained as a no-op shim for the
+ *    cli's try/finally + signal-exit wiring. Because writes are synchronous,
+ *    even SIGKILL can no longer drop a staged line — at most the single
+ *    mid-syscall append is truncated, and the surviving prefix stays ordered
+ *    because appends are line-atomic.
  *  - runId / ts / seq are auto-stamped; callers supply only the discriminating
  *    `type`, an optional ticket number, and optional structured `data`.
  *
  * See docs/agents (issue #19) for the canonical event vocabulary.
  */
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { EventSink, Logger } from "./ports.ts";
 
@@ -83,7 +87,6 @@ export interface EventEnvelope {
 export class JsonlEventLog implements EventSink {
   private seq = 0;
   private readonly full: string;
-  private chain: Promise<void> = Promise.resolve();
   private ensured = false;
   private writeFailed = false;
 
@@ -151,41 +154,41 @@ export class JsonlEventLog implements EventSink {
       ...(data ? { data } : {}),
     };
     const line = JSON.stringify(e) + "\n";
-    // Serialize appends in emit order; mkdir on first write keeps emit
-    // self-sufficient even if ensure() was skipped or raced.
-    this.chain = this.chain
-      .then(async () => {
-        if (!this.ensured) {
-          try {
-            await mkdir(dirname(this.full), { recursive: true });
-            this.ensured = true;
-          } catch {
-            /* directory creation is best-effort; append will surface real errors */
-          }
-        }
-        await appendFile(this.full, line, "utf8");
-      })
-      .catch((e) => {
-        // A failed write must never break the run — the stderr log still
-        // carries it. Surface the first failure once via the human logger so
-        // an operator notices the post-mortem channel is broken.
-        if (!this.writeFailed) {
-          this.writeFailed = true;
-          this.log?.(
-            "warn",
-            `event log write failed (${this.full}): ${(e as Error).message}; events.jsonl may be incomplete`,
-          );
-        }
-      });
+    // #41: durable per-emit. Each line is appended SYNCHRONOUSLY so a reader
+    // tailing the file mid-run — a dashboard, scheduler, or resume check —
+    // sees every step/ticket event the instant it happens, not only at run
+    // end. Sync appends are inherently ordered, so burst-ordering and
+    // resume-seq hold without a promise chain. The cost (blocking the event
+    // loop for one line append) is negligible for an infrequent post-mortem
+    // channel and is the price of the durability guarantee. mkdir on first
+    // write keeps emit self-sufficient even if ensure() was skipped or raced.
+    try {
+      if (!this.ensured) {
+        mkdirSync(dirname(this.full), { recursive: true });
+        this.ensured = true;
+      }
+      appendFileSync(this.full, line, "utf8");
+    } catch (err) {
+      // A failed write must never break the run — the stderr log still
+      // carries it. Surface the first failure once via the human logger so
+      // an operator notices the post-mortem channel is broken.
+      if (!this.writeFailed) {
+        this.writeFailed = true;
+        this.log?.(
+          "warn",
+          `event log write failed (${this.full}): ${(err as Error).message}; events.jsonl may be incomplete`,
+        );
+      }
+    }
   }
 
   /**
-   * Resolve every staged append. Tests use this to observe a coherent file;
-   * the cli wraps the run in try/finally `flush()` so graceful termination
-   * (throw / exit / SIGTERM) still leaves a complete, ordered trace.
+   * No-op since #41: writes are durable per-emit, so there is no staged chain
+   * to drain. Retained (and still awaited by the cli's try/finally and the
+   * signal-exit wiring) for backward compatibility — it resolves immediately.
    */
   async flush(): Promise<void> {
-    await this.chain;
+    /* durable per-emit since #41 — nothing staged to drain */
   }
 }
 

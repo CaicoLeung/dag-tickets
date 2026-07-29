@@ -112,6 +112,47 @@ describe("JsonlEventLog — self-healing directory", () => {
   });
 });
 
+describe("JsonlEventLog — per-emit durability (issue #41)", () => {
+  test("each emit is on disk immediately, observable without flush() (mid-run monitoring)", async () => {
+    const cwd = await tmpCwd();
+    const log = new JsonlEventLog("run-perstep", cwd);
+    await log.ensure();
+    // Emits with NO flush() in between. A reader tailing the file mid-run —
+    // a dashboard, scheduler, or resume check — must already see every line.
+    // This is the structured-monitoring contract from issue #41: per-step
+    // events (step.start, merge, ticket.*) must not wait until run end.
+    log.emit(EVT.RUN_START, undefined, { target: "frontier" });
+    log.emit(EVT.TICKET_START, 7);
+    log.emit(EVT.STEP_START, 7, { step: "implement" });
+    log.emit(EVT.STEP_END, 7, { step: "implement", durationMs: 5 });
+    log.emit(EVT.MERGE, 7, { strategy: "squash", ok: true });
+    const lines = await readEvents(cwd, "run-perstep");
+    expect(lines.map((l) => l.type)).toEqual([
+      EVT.RUN_START,
+      EVT.TICKET_START,
+      EVT.STEP_START,
+      EVT.STEP_END,
+      EVT.MERGE,
+    ]);
+    // Order holds even without an explicit drain.
+    expect(lines.map((l) => l.seq)).toEqual([0, 1, 2, 3, 4]);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  test("run.start alone is visible the instant it is emitted (no later flush)", async () => {
+    const cwd = await tmpCwd();
+    const log = new JsonlEventLog("run-firstline", cwd);
+    await log.ensure();
+    log.emit(EVT.RUN_START, undefined, { target: "frontier" });
+    // No flush, no further emits. The reporter's symptom was seeing ONLY
+    // run.start; the fix is the opposite guarantee — even a single emit is
+    // persisted, so the very first line is durable the moment it happens.
+    const [first] = await readEvents(cwd, "run-firstline");
+    expect(first?.type).toBe(EVT.RUN_START);
+    await rm(cwd, { recursive: true, force: true });
+  });
+});
+
 describe("JsonlEventLog — order coherence", () => {
   test("a rapid burst is serialized in emit order, not append-completion order", async () => {
     const cwd = await tmpCwd();
