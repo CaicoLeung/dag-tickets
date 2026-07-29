@@ -5,6 +5,7 @@ import {
   isRateLimited,
   PaseoAgent,
   runWithFallback,
+  stopRunningAgent,
   type ProviderPrefs,
 } from "../src/paseo.ts";
 import type {
@@ -786,5 +787,232 @@ describe("PaseoAgent.reconcile (#29)", () => {
     const out = await a.reconcile(ticket(11), "abc123", "main");
     expect(out).toEqual({ ok: false, reason: "stale-base" });
     expect(branch.rebased).toEqual([]); // rebase never attempted on a stale base
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #40 — stop the prior (rate-limited) agent BEFORE spawning the fallback.
+// Without this, the rate-limited primary and the fallback both run on the same
+// worktree and clobber each other's edits (the orphan-agent accumulation from
+// the field report). stopAgent is injected (constructor's last param) so the
+// stop is asserted without `paseo ls|stop`; the ordering (stop between the
+// primary and fallback dispatch) is the load-bearing assertion.
+// ---------------------------------------------------------------------------
+
+describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () => {
+  /** Wrap a ScriptedDispatcher so each dispatch records its provider into
+   *  `order`, in call sequence — so a test can assert stop fires BETWEEN the
+   *  primary and the fallback dispatch (the race the fix prevents). */
+  function tracingDispatcher(
+    queue: DispatchResult[],
+    order: string[],
+  ): ScriptedDispatcher {
+    const d = new ScriptedDispatcher();
+    d.queue = queue;
+    const real = d.dispatch.bind(d);
+    d.dispatch = async (_p, opts) => {
+      order.push(`dispatch:${opts.provider}`);
+      return real(_p, opts);
+    };
+    return d;
+  }
+
+  test("review stops the prior agent between the primary and the fallback dispatch", async () => {
+    const order: string[] = [];
+    const stopped: number[] = [];
+    const d = tracingDispatcher(
+      [
+        { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true },
+        { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+      ],
+      order,
+    );
+    const branch = new FakeBranch();
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      ["claude/opus"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      NULL_SINK,
+      async (n) => {
+        order.push(`stop:${n}`);
+        stopped.push(n);
+      },
+    );
+    const v = await a.review(ticket(11), "b1", "main");
+    expect(v.kind).toBe("clean"); // fallback succeeded
+    expect(stopped).toEqual([11]); // prior agent stopped, once
+    // stop fired AFTER the primary dispatch and BEFORE the fallback dispatch —
+    // the exact ordering that prevents two agents on one worktree.
+    expect(order.indexOf("dispatch:claude/review")).toBeLessThan(order.indexOf("stop:11"));
+    expect(order.indexOf("stop:11")).toBeLessThan(order.indexOf("dispatch:claude/opus"));
+  });
+
+  test("implement stops the prior agent between the primary and the fallback dispatch", async () => {
+    const order: string[] = [];
+    const stopped: number[] = [];
+    const d = tracingDispatcher(
+      [
+        { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true },
+        { ok: true, output: "", timedOut: false, rateLimited: false }, // fallback ok, commits land
+      ],
+      order,
+    );
+    const branch = new FakeBranch();
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      ["omp/zai"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      NULL_SINK,
+      async (n) => {
+        order.push(`stop:${n}`);
+        stopped.push(n);
+      },
+    );
+    const r = await a.implement(ticket(11), "b1", "main");
+    expect(r.ok).toBe(true); // fallback produced commits (FakeBranch counts=3)
+    expect(stopped).toEqual([11]);
+    expect(order.indexOf("dispatch:codex/impl")).toBeLessThan(order.indexOf("stop:11"));
+    expect(order.indexOf("stop:11")).toBeLessThan(order.indexOf("dispatch:omp/zai"));
+    // the branch-off retry still cleans + deletes the branch after the stop
+    expect(branch.cleaned).toEqual(["b1"]);
+    expect(branch.deleted).toEqual(["b1"]);
+  });
+
+  test("fix stops the prior agent before the fallback (shares onRateLimited with review)", async () => {
+    const order: string[] = [];
+    const stopped: number[] = [];
+    const d = tracingDispatcher(
+      [
+        { ok: false, output: "429", timedOut: false, rateLimited: true },
+        { ok: true, output: "", timedOut: false, rateLimited: false },
+      ],
+      order,
+    );
+    const a = new PaseoAgent(
+      new FakeBranch(),
+      PREFS,
+      ["omp/zai"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      NULL_SINK,
+      async (n) => {
+        order.push(`stop:${n}`);
+        stopped.push(n);
+      },
+    );
+    const verdict = { kind: "issues" as const, issueCount: 2, raw: "REVIEW_VERDICT: ISSUES 2" };
+    const r = await a.fix(ticket(11), verdict, "b1", 1);
+    expect(r.ok).toBe(true);
+    expect(stopped).toEqual([11]);
+    expect(order.indexOf("dispatch:codex/impl")).toBeLessThan(order.indexOf("stop:11"));
+    expect(order.indexOf("stop:11")).toBeLessThan(order.indexOf("dispatch:omp/zai"));
+  });
+
+  test("a throwing stopAgent is swallowed — the fallback still runs and the branch is still cleaned", async () => {
+    // A stop failure (paseo unreachable / lost race) must NOT block the retry.
+    const d = new ScriptedDispatcher();
+    d.queue = [
+      { ok: false, output: "429", timedOut: false, rateLimited: true },
+      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+    ];
+    const branch = new FakeBranch();
+    const a = new PaseoAgent(
+      branch,
+      PREFS,
+      ["claude/opus"],
+      NOOP_LOG,
+      undefined,
+      1000,
+      d,
+      NULL_SINK,
+      async () => {
+        throw new Error("paseo stop exploded");
+      },
+    );
+    const v = await a.review(ticket(11), "b1", "main");
+    expect(v.kind).toBe("clean"); // fallback still ran despite the throwing stop
+    expect(branch.cleaned).toEqual(["b1", "b1"]); // entry + onSwitch clean both ran
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #40 — stopInFlight: exit-cleanup seam. Called from the cli's try/finally and
+// signal handler to stop every agent this run still has in flight. Best-effort
+// and never throws: a per-ticket failure doesn't skip the rest.
+// ---------------------------------------------------------------------------
+
+describe("PaseoAgent.stopInFlight (#40)", () => {
+  function agentWithStop(stop: (n: number) => Promise<void>): PaseoAgent {
+    return new PaseoAgent(
+      new FakeBranch(),
+      PREFS,
+      [],
+      NOOP_LOG,
+      undefined,
+      1000,
+      new ScriptedDispatcher(),
+      NULL_SINK,
+      stop,
+    );
+  }
+
+  test("stops each in-flight ticket's agent", async () => {
+    const stopped: number[] = [];
+    const a = agentWithStop(async (n) => {
+      stopped.push(n);
+    });
+    await a.stopInFlight([11, 12, 13]);
+    expect(stopped).toEqual([11, 12, 13]);
+  });
+
+  test("accepts a live Set (the cli's inflightTickets)", async () => {
+    const stopped: number[] = [];
+    const a = agentWithStop(async (n) => {
+      stopped.push(n);
+    });
+    await a.stopInFlight(new Set([11, 12, 13]));
+    expect(stopped).toEqual([11, 12, 13]);
+  });
+
+  test("a throwing stop for one ticket doesn't skip the rest — never throws", async () => {
+    const stopped: number[] = [];
+    const a = agentWithStop(async (n) => {
+      if (n === 12) throw new Error("boom");
+      stopped.push(n);
+    });
+    await expect(a.stopInFlight([11, 12, 13])).resolves.toBeUndefined();
+    expect(stopped).toEqual([11, 13]); // 12's throw swallowed; 11 + 13 still stopped
+  });
+
+  test("empty input is a no-op", async () => {
+    const stopped: number[] = [];
+    const a = agentWithStop(async (n) => {
+      stopped.push(n);
+    });
+    await a.stopInFlight([]);
+    expect(stopped).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #40 — stopRunningAgent contract: best-effort and NEVER throws. The unit-test
+// env has no `paseo` executable, so `run()` throws ENOENT. The rate-limit
+// fallback now calls stopAgent by default (the unit tests above that don't
+// inject a stopAgent), so this contract must hold or those tests would throw.
+// ---------------------------------------------------------------------------
+
+describe("stopRunningAgent — never throws (no paseo in unit-test env)", () => {
+  test("returns without throwing when paseo is absent from PATH", async () => {
+    await expect(stopRunningAgent(undefined, 11)).resolves.toBeUndefined();
   });
 });

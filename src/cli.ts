@@ -232,6 +232,121 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return a;
 }
 
+/**
+ * #40: best-effort stop of every agent this run still has in flight. Pure
+ *  helper (captures nothing) so the guard + swallow contract is unit-tested
+ *  directly — the cli wires its live `agentRef` / `inflightTickets` through it.
+ *
+ *  Honours `AgentPort.stopInFlight`'s OPTIONAL contract: a missing agent, or
+ *  one whose fake doesn't implement `stopInFlight`, is a clean no-op (the
+ *  pre-#40 behaviour) rather than a silently-swallowed `TypeError`. Never
+ *  throws — the exit/cleanup that calls this must proceed regardless.
+ */
+export async function stopInFlightAgents(
+  agent: { stopInFlight?(ticketNumbers: Iterable<number>): Promise<void> } | undefined,
+  tickets: Iterable<number>,
+): Promise<void> {
+  if (!agent?.stopInFlight) return;
+  try {
+    await agent.stopInFlight(tickets);
+  } catch {
+    /* best-effort: the exit/cleanup that follows must proceed regardless */
+  }
+}
+
+/** Dependencies RunExit drives on every catchable exit. Each is a thunk so
+ *  the coordinator closes over nothing module-global — main() wires the live
+ *  lock handle / event log / stop helper, and tests wire fakes. */
+interface RunExitDeps {
+  /** #40: stop every agent this run still has in flight. */
+  stop(): Promise<void>;
+  /** Flush the staged event trace so a non-graceful exit leaves an ordered prefix. */
+  flush(): Promise<void>;
+  /** Release the run lock (idempotent). */
+  release(): Promise<void>;
+  /** Human log so an operator sees the exit reason in stderr. */
+  log: Logger;
+  /** Exit action. Defaults to `process.exit`; tests inject a recorder so they
+   *  observe the intended exit code without terminating the test process. */
+  exit?(code: number): void;
+}
+
+/**
+ * #40: coordinates cleanup (stop in-flight agents + flush events + release the
+ *  run lock) across EVERY catchable exit path — signal (SIGINT/SIGTERM) and
+ *  crash (uncaughtException / unhandledRejection). Graceful exit is covered by
+ *  main()'s try/finally, which also calls `detach()` so a later signal keeps
+ *  Node's default behaviour.
+ *
+ *  Extracted from main() so the wiring is unit-tested directly instead of by
+ *  inspection: a regression that drops a handler registration, the stop, the
+ *  flush, or the release fails the RunExit tests — not just an unattended
+ *  orphan-agent run. `process.exit` is injected (defaults to the real one) so
+ *  tests observe the intended exit code without terminating the test process.
+ *
+ *  Handlers use `process.once` (not `.on`): a second crash during the async
+ *  cleanExit window must not re-enter cleanup. `detach()` removeListener's as a
+ *  no-op-if-already-removed safety net (once auto-removes after the first fire).
+ */
+export class RunExit {
+  private readonly exit: (code: number) => void;
+  readonly onSignal: (sig: NodeJS.Signals) => void;
+  readonly onUncaught: () => void;
+  readonly onRejection: () => void;
+
+  constructor(deps: RunExitDeps) {
+    this.exit = deps.exit ?? ((code) => process.exit(code));
+    // Best-effort throughout: a failure in any step must not block the exit
+    // that follows — the .catch swallows, the .finally still exits. Order is
+    // load-bearing: stop the agent BEFORE releasing the lock (a released lock
+    // lets the next run spawn on the same worktree) and flush BEFORE release so
+    // the trace lands even if release throws.
+    const cleanExit = async (code: number): Promise<void> => {
+      await deps.stop();
+      await deps.flush();
+      await deps.release();
+    };
+    this.onSignal = (sig: NodeJS.Signals) => {
+      deps.log("warn", `${sig} received; stopping in-flight agents, releasing run lock and exiting`);
+      // 128 + signal number: 130 for SIGINT, 143 for SIGTERM (shell convention).
+      const code = 128 + (sig === "SIGINT" ? 2 : 15);
+      cleanExit(code)
+        .catch(() => {})
+        .finally(() => this.exit(code));
+    };
+    // The "not graceful" half of "clean up agents on exit (graceful or not)":
+    // an uncaught / unhandled rejection bypasses the try/finally, so these
+    // stop the in-flight agents + release the lock before a non-zero exit.
+    const exitOnCrash = (kind: string): (() => void) => () => {
+      deps.log("warn", `${kind}: stopping in-flight agents, releasing run lock before exit`);
+      cleanExit(1)
+        .catch(() => {})
+        .finally(() => this.exit(1));
+    };
+    this.onUncaught = exitOnCrash("uncaught exception");
+    this.onRejection = exitOnCrash("unhandled rejection");
+  }
+
+  /** Register every catchable-exit handler on process. Uses `.once` so a
+   *  second event during the async cleanExit window can't re-enter cleanup. */
+  register(): void {
+    process.once("SIGINT", this.onSignal);
+    process.once("SIGTERM", this.onSignal);
+    process.once("uncaughtException", this.onUncaught);
+    process.once("unhandledRejection", this.onRejection);
+  }
+
+  /** Remove every handler. Called in main()'s try/finally so a later, unrelated
+   *  signal keeps Node's default behaviour. A no-op for any listener that
+   *  already auto-removed via `.once`. */
+  detach(): void {
+    process.removeListener("SIGINT", this.onSignal);
+    process.removeListener("SIGTERM", this.onSignal);
+    process.removeListener("uncaughtException", this.onUncaught);
+    process.removeListener("unhandledRejection", this.onRejection);
+  }
+}
+
 function buildRouting(a: ParsedArgs): RoutingConfig {
   const cfg: RoutingConfig = {
     implementLabels: [...DEFAULT_ROUTING.implementLabels],
@@ -463,7 +578,22 @@ export async function main(argv: string[]): Promise<number> {
   // checkout can't fight over the shared dag-<n> worktrees/branches. --dry-run
   // dispatches nothing, so it stays lock-free (and never blocks a real run).
   let lockHandle: LockHandle | null = null;
-  let onSignal: ((sig: NodeJS.Signals) => void) | null = null;
+  // #40: tickets currently in flight (launched, not yet settled) so a
+  // graceful / signal / thrown exit can stop the agents this run spawned
+  // instead of orphaning them on the worktree. `agentRef` is assigned inside
+  // the try below; the exit coordinator (registered before try) reads it by ref.
+  const inflightTickets = new Set<number>();
+  let agentRef: PaseoAgent | undefined;
+  // #40: delegate bound to this run's live agentRef + inflightTickets. The
+  // guard + swallow live in the exported stopInFlightAgents() (unit-tested)
+  // so a missing agent / optional stopInFlight is a clean no-op, not a
+  // swallowed TypeError. Never throws; never blocks the next step.
+  const stopInFlight = () => stopInFlightAgents(agentRef, inflightTickets);
+  // #40: the exit-path coordinator (stop + flush + release across signal +
+  // crash exits). Built + registered once the lock is held; detached in the
+  // finally so a later, unrelated signal keeps Node's default behaviour. Null
+  // on dry-run (nothing dispatched → no cleanup to wire).
+  let guard: RunExit | null = null;
   if (!a.dryRun) {
     try {
       lockHandle = await acquireLock({ cwd: a.cwd, runId });
@@ -481,18 +611,18 @@ export async function main(argv: string[]): Promise<number> {
       }
       throw e;
     }
-    // Release on Ctrl-C / SIGTERM too, not just clean exit. The handler is
-    // detached in the finally below so a later, unrelated signal keeps default
-    // behaviour. handle.release() is idempotent, so a double call is harmless.
+    // Release on Ctrl-C / SIGTERM / crash too, not just clean exit. RunExit
+    // owns handler registration + cleanup; detach() in the finally restores
+    // default signal behaviour. handle.release() is idempotent, so a double
+    // call (signal path + finally) is harmless.
     const handle = lockHandle;
-    onSignal = (sig: NodeJS.Signals) => {
-      log("warn", `${sig} received; releasing run lock and exiting`);
-      // 128 + signal number: 130 for SIGINT, 143 for SIGTERM (the shell convention).
-      const code = 128 + (sig === "SIGINT" ? 2 : 15);
-      handle.release().finally(() => process.exit(code));
-    };
-    process.once("SIGINT", onSignal);
-    process.once("SIGTERM", onSignal);
+    guard = new RunExit({
+      stop: stopInFlight,
+      flush: () => events.flush(),
+      release: () => handle.release(),
+      log,
+    });
+    guard.register();
   }
 
   // try/finally flushes staged event appends on throw / exit / SIGTERM so the
@@ -520,6 +650,7 @@ export async function main(argv: string[]): Promise<number> {
       a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * MS_PER_MINUTE : undefined;
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
+    agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
     // main() — see OverlapCoordinator. Seeded from the resume sets so a
@@ -548,6 +679,11 @@ export async function main(argv: string[]): Promise<number> {
       events,
       canOverlap: overlap.canOverlap,
       process: async (n, info) => {
+        // #40: track this ticket as in flight so a graceful/signal exit can
+        // stop its agent. Removed once it settles normally; a throw leaves it
+        // in the set (the scheduler settles it failed externally) so exit
+        // cleanup still stops a possibly-running agent — harmless if not.
+        inflightTickets.add(n);
         const t = graph.byNumber.get(n)!;
         // #29: a launch via overlap composes on the blocker's pushed head +
         // captures its tip for the pre-createPr reconcile. A missing tip (lost
@@ -616,6 +752,7 @@ export async function main(argv: string[]): Promise<number> {
         );
         state.tickets[n] = stateFromOutcome(outcome.status, outcome);
         if (!a.dryRun) await saveState(state, a.cwd);
+        inflightTickets.delete(n); // settled normally → agent dispatch is done
         return outcome.status;
       },
       // #20: when a running dependent's blocker settles failed/skipped, kill the
@@ -658,11 +795,13 @@ export async function main(argv: string[]): Promise<number> {
     }
     log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
   } finally {
+    // #40: stop any agent still in flight (thrown error / a crash whose handler
+    // didn't reach process.exit) so it doesn't keep editing the worktree after
+    // the orchestrator has exited. No-op on a clean run (in-flight is empty once
+    // runBatch returns) and on dry-run (nothing dispatched). Best-effort.
+    await stopInFlight();
     await events.flush();
-    if (onSignal) {
-      process.removeListener("SIGINT", onSignal);
-      process.removeListener("SIGTERM", onSignal);
-    }
+    guard?.detach();
     if (lockHandle) await lockHandle.release();
   }
   return exitCode;

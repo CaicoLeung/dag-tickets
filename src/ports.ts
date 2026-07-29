@@ -141,6 +141,15 @@ export interface AgentPort {
    *  dependent on whatever it branched off (it may conflict at its own PR).
    */
   reconcile?(t: Ticket, blockerTipSha: string, base: string): Promise<ReconcileResult>;
+  /**
+   * #40: stop every agent this run still has in flight — called on graceful
+   *  exit (try/finally) and on signal exit (SIGINT/SIGTERM) so a stopped or
+   *  crashed run doesn't orphan running agents editing a worktree. Best-effort
+   *  and never throws; a per-ticket failure doesn't skip the rest. Optional:
+   *  fakes/tests need not implement it; an absent stopInFlight leaves in-flight
+   *  agents to settle on their own (the pre-#40 behaviour).
+   */
+  stopInFlight?(ticketNumbers: Iterable<number>): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
