@@ -166,6 +166,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
     msToDuration(waitMs),
   ];
   if (opts.mode) args.push("--mode", opts.mode);
+  if (opts.thinking) args.push("--thinking", opts.thinking);
   if (opts.branchMode === "branch-off") {
     args.push("--worktree-mode", "branch-off");
     if (opts.newBranch) args.push("--new-branch", opts.newBranch);
@@ -176,7 +177,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   }
   args.push(prompt);
 
-  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs) });
+  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs), env: opts.env });
   let status = r.ok ? "completed" : "failed";
   let output = r.stdout;
   if (r.ok) {
@@ -448,6 +449,8 @@ export class PaseoAgent implements AgentPort {
     private readonly log: Logger,
     private readonly cwd?: string,
     private readonly timeoutMs: number = DEFAULT_RUN_MS,
+    /** #44: forwarded as `--thinking` to every `paseo run`. */
+    private readonly thinking?: string,
     private readonly dispatcher: Dispatcher = realDispatcher,
     // Defaulted (not required like RunContext.events) for two reasons: TS forbids
     // a required param after optional ones, and the dispatch-mechanics tests
@@ -546,6 +549,7 @@ export class PaseoAgent implements AgentPort {
         slug: SLUG(t.number),
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        thinking: this.thinking,
         branchMode: "branch-off",
         newBranch: branch,
         base: baseRef,
@@ -585,6 +589,7 @@ export class PaseoAgent implements AgentPort {
         slug: `${SLUG(t.number)}-review`,
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        thinking: this.thinking,
         branchMode: "checkout-branch",
         branch,
       },
@@ -608,6 +613,7 @@ export class PaseoAgent implements AgentPort {
         slug: SLUG(t.number),
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        thinking: this.thinking,
         branchMode: "checkout-branch",
         branch,
       },
@@ -630,6 +636,7 @@ export class PaseoAgent implements AgentPort {
       slug: SLUG(t.number),
       cwd: this.cwd,
       timeoutMs: this.timeoutMs,
+      thinking: this.thinking,
       branchMode: "branch-off",
       newBranch: branch,
       base: baseRef,

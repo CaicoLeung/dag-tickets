@@ -91,6 +91,7 @@ interface ParsedArgs {
   mergeStrategy: MergeStrategy;
   requireChecks: boolean;
   dryRun: boolean;
+  thinking?: string;
   provider?: string;
   fallbackProviders: string[];
   reviewProvider?: string;
@@ -151,6 +152,7 @@ OPTIONS
   --cwd <path>            Operate on a different checkout.
   --run-id <id>           Name this run (for the state file).
   --resume <id>           Resume a previous run; skip its merged/failed tickets.
+  --thinking <level>      Forward \`--thinking\` to \`paseo run\` (off|minimal|low|medium|high|xhigh|max).
   --dry-run               Print the per-ticket plan and dispatch nothing.
   -h, --help              Show this help.
   -V, --version           Show the version and exit.
@@ -199,6 +201,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "-V":
       case "--version":
         a.version = true; break;
+      case "--thinking":
+        a.thinking = next(); break;
       case "--dry-run":
         a.dryRun = true; break;
       case "--frontier":
@@ -697,7 +701,7 @@ export async function main(argv: string[]): Promise<number> {
     // collapses the backoff. Prod leaves it unset → the flag/default stands.
     const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
-    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), a.thinking, undefined, events);
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in

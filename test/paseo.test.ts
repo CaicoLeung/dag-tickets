@@ -277,7 +277,7 @@ describe("PaseoAgent.implement — dispatch result → ImplResult.reason", () =>
   // outcome, so each reason maps 1:1 to the scripted DispatchResult.
   function agent(d: ScriptedDispatcher) {
     const cap = capturingLog();
-    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, undefined, d);
     return { a, ...cap };
   }
 
@@ -340,7 +340,7 @@ describe("PaseoAgent.implement — dispatch result → ImplResult.reason", () =>
     const branch = new FakeBranch();
     branch.counts["b1"] = 0;
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     const r = await a.implement(ticket(), "b1", "main");
     expect(r).toEqual({ ok: false, commits: 0, reason: "empty" });
   });
@@ -358,7 +358,7 @@ describe("PaseoAgent.review", () => {
     const d = new ScriptedDispatcher();
     d.queue = [{ ok: false, output: "agent exploded", timedOut: false, rateLimited: false, connectionError: false }];
     const cap = capturingLog();
-    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, undefined, d);
     const v = await a.review(ticket(), "b1", "main");
     expect(v.kind).toBe("unknown");
     expect(v.issueCount).toBe(0);
@@ -370,7 +370,7 @@ describe("PaseoAgent.review", () => {
     const d = new ScriptedDispatcher();
     d.queue = [{ ok: false, output: "", timedOut: true, rateLimited: false, connectionError: false }];
     const cap = capturingLog();
-    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, undefined, d);
     const v = await a.review(ticket(), "b1", "main");
     expect(v.kind).toBe("unknown");
     expect(logged(cap.lines, "warn", /review agent failed \(timeout\)/)).toBe(true);
@@ -382,7 +382,7 @@ describe("PaseoAgent.review", () => {
       { ok: true, output: "Looks good.\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const cap = capturingLog();
-    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, undefined, d);
     const v = await a.review(ticket(), "b1", "main");
     expect(v.kind).toBe("clean");
     expect(v.issueCount).toBe(0);
@@ -399,7 +399,7 @@ describe("PaseoAgent.onRateLimited (exercised via review)", () => {
     ];
     const branch = new FakeBranch();
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, ["claude/opus"], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, ["claude/opus"], cap.log, undefined, 1000, undefined, d);
     const v = await a.review(ticket(), "b1", "main");
 
     // The fallback succeeded, so the verdict was parsed (not unknown).
@@ -514,7 +514,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     const r = await a.implement(ticket(), "b1", "main");
 
     expect(r.ok).toBe(true);
@@ -533,7 +533,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     const d = new ScriptedDispatcher();
     const branch = new FakeBranch();
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     const r = await a.singleShot("triage", ticket(), "b1", "main");
 
     expect(r.ok).toBe(true);
@@ -547,7 +547,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     d.queue = [{ ok: true, output: "REVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     await a.review(ticket(), "b1", "main");
 
     expect(branch.fetched).toEqual([]);
@@ -562,7 +562,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     const branch = new FakeBranch();
     branch.fetchOk = false; // simulate offline / unreachable remote
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     const r = await a.implement(ticket(), "b1", "main");
 
     // hard fail, not a degraded proceed
@@ -584,7 +584,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     branch.countsByBase[`origin/main..b1`] = 0; // truth: no agent commits vs fetched tip
     branch.countsByBase[`main..b1`] = 5; // stale local main would over-count
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, d);
     const r = await a.implement(ticket(), "b1", "main");
 
     expect(r).toEqual({ ok: false, commits: 0, reason: "empty" });
@@ -616,6 +616,7 @@ describe("PaseoAgent — provider.switch event", () => {
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       sink,
     );
@@ -647,6 +648,7 @@ describe("PaseoAgent — provider.switch event", () => {
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       sink,
     );
@@ -666,7 +668,7 @@ describe("PaseoAgent — provider.switch event", () => {
     const d = new ScriptedDispatcher();
     d.queue = [{ ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false }];
     const sink = new RecordingSink();
-    const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, sink);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, undefined, d, sink);
     await a.review(ticket(), "b1", "main");
     expect(sink.events.some((e) => e.type === EVT.PROVIDER_SWITCH)).toBe(false);
   });
@@ -691,6 +693,7 @@ describe("PaseoAgent.abort (#20)", () => {
       cap.log,
       undefined,
       1000,
+      undefined,
       new ScriptedDispatcher(),
       NULL_SINK,
       async (n) => {
@@ -718,6 +721,7 @@ describe("PaseoAgent.abort (#20)", () => {
       cap.log,
       undefined,
       1000,
+      undefined,
       new ScriptedDispatcher(),
       NULL_SINK,
       async () => {
@@ -741,6 +745,7 @@ describe("PaseoAgent.abort (#20)", () => {
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       new ScriptedDispatcher(),
       NULL_SINK,
       async () => {},
@@ -760,7 +765,7 @@ describe("PaseoAgent.reconcile (#29)", () => {
   test("fetches the base and rebases the dependent's branch onto the merged tip", async () => {
     const branch = new FakeBranch();
     const cap = capturingLog();
-    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, new ScriptedDispatcher());
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, undefined, new ScriptedDispatcher());
     const out = await a.reconcile(ticket(11), "abc123", "main");
     expect(out).toEqual({ ok: true });
     // #15 freshness gate ran against the bare base.
@@ -775,7 +780,7 @@ describe("PaseoAgent.reconcile (#29)", () => {
   test("a conflicting rebase returns {ok:false, reason:'overlap-rebase'} and never throws", async () => {
     const branch = new FakeBranch();
     branch.rebaseOk = false;
-    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, new ScriptedDispatcher());
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, undefined, new ScriptedDispatcher());
     const out = await a.reconcile(ticket(11), "abc123", "main");
     expect(out).toEqual({ ok: false, reason: "overlap-rebase" });
   });
@@ -783,7 +788,7 @@ describe("PaseoAgent.reconcile (#29)", () => {
   test("a failed base fetch returns {ok:false, reason:'stale-base'} — refuses a stale rebase", async () => {
     const branch = new FakeBranch();
     branch.fetchOk = false;
-    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, new ScriptedDispatcher());
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, undefined, new ScriptedDispatcher());
     const out = await a.reconcile(ticket(11), "abc123", "main");
     expect(out).toEqual({ ok: false, reason: "stale-base" });
     expect(branch.rebased).toEqual([]); // rebase never attempted on a stale base
@@ -835,6 +840,7 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       NULL_SINK,
       async (n) => {
@@ -869,6 +875,7 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       NULL_SINK,
       async (n) => {
@@ -903,6 +910,7 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       NULL_SINK,
       async (n) => {
@@ -933,6 +941,7 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       d,
       NULL_SINK,
       async () => {
@@ -960,6 +969,7 @@ describe("PaseoAgent.stopInFlight (#40)", () => {
       NOOP_LOG,
       undefined,
       1000,
+      undefined,
       new ScriptedDispatcher(),
       NULL_SINK,
       stop,

@@ -166,6 +166,8 @@ export interface DispatchOpts {
   /** Max wall time for the agent run (paseo --wait-timeout). */
   timeoutMs?: number;
   mode?: string;
+  /** Forwarded as `--thinking <value>` to `paseo run` (#44). */
+  thinking?: string;
   branchMode: "branch-off" | "checkout-branch";
   /** branch-off: new branch to create. */
   newBranch?: string;
@@ -173,6 +175,8 @@ export interface DispatchOpts {
   base?: string;
   /** checkout-branch: existing branch to check out. */
   branch?: string;
+  /** Extra env merged into the child process environment (#44). */
+  env?: Record<string, string>;
 }
 
 /** Result of one Paseo agent dispatch. */
