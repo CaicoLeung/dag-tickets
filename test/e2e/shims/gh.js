@@ -73,12 +73,16 @@ import {
     exit(0);
   }
 
-  // gh api graphql -f query=...  (listSubIssues: parent number parsed from query)
+  // gh api graphql -f query=... -F parent=...  (listSubIssues)
   if (cmd === "api" && sub === "graphql") {
-    const qi = argv.indexOf("-f");
-    const qstr = qi >= 0 ? argv[qi + 1] : "";
-    const m = /issue\(number:\s*(\d+)\)/.exec(qstr);
-    const parent = m ? m[1] : null;
+    // parent is bound via -F parent=<n> (typed GraphQL variable, never interpolated).
+    let parent: string | null = null;
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] === "-F" && argv[i + 1]?.startsWith("parent=")) {
+        parent = argv[i + 1].slice("parent=".length);
+        break;
+      }
+    }
     let nodes = [];
     if (parent && scen.parents && scen.parents[parent]) {
       nodes = scen.parents[parent]

@@ -100,11 +100,10 @@ export async function listSubIssues(
   cfg: RoutingConfig = DEFAULT_ROUTING,
 ): Promise<Ticket[]> {
   const { owner, repo } = await repoInfo(cwd);
-  // Inline literals are safe: owner/repo come from `gh repo view`, parent is a
-  // parsed integer. Avoids GraphQL variable-typing friction with `gh api`.
-  const query = `query {
-    repository(owner: "${owner}", name: "${repo}") {
-      issue(number: ${parent}) {
+  // Values are bound as typed GraphQL variables below, never interpolated into the query.
+  const query = `query($owner: String!, $repo: String!, $parent: Int!) {
+    repository(owner: $owner, name: $repo) {
+      issue(number: $parent) {
         subIssues(first: 100) {
           nodes {
             number title body url state
@@ -114,7 +113,16 @@ export async function listSubIssues(
       }
     }
   }`;
-  const r = await mustRun(["gh", "api", "graphql", "-f", `query=${query}`], { cwd });
+  const r = await mustRun(
+    [
+      "gh", "api", "graphql",
+      "-f", `query=${query}`,
+      "-F", `owner=${owner}`,
+      "-F", `repo=${repo}`,
+      "-F", `parent=${parent}`,
+    ],
+    { cwd },
+  );
   const j = JSON.parse(r.stdout);
   const nodes: RawIssue[] = j?.data?.repository?.issue?.subIssues?.nodes ?? [];
 
