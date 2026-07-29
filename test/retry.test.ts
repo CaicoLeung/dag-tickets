@@ -47,7 +47,7 @@ describe("isTransient", () => {
     // deliberate transient/terminal decision — the set is the retry policy's
     // source of truth, so it must be exhaustive over the transient labels.
     expect([...TRANSIENT_REASONS].sort()).toEqual(
-      ["agent-timeout", "ci-failed", "connection-error", "merge-race", "rate-limited", "stale-base"],
+      ["agent-timeout", "ci-failed", "connection-error", "merge-race", "push-head-failed", "rate-limited", "stale-base"],
     );
   });
 });

@@ -224,7 +224,22 @@ async function runImplementLifecycle(
           pr,
         );
       }
-      await ctx.pullRequest.pushHead(branch);
+      const pushed = await ctx.pullRequest.pushHead(branch);
+      if (!pushed.ok) {
+        ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
+          ok: false,
+          reason: "push-head-failed",
+          onto: ctx.baseBranch,
+          error: pushed.error,
+        });
+        return fail(
+          t,
+          ctx,
+          { reason: "push-head-failed", error: `overlap reconcil push failed: ${pushed.error ?? "unknown"}` },
+          branch,
+          pr,
+        );
+      }
       ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
         ok: true,
         onto: ctx.baseBranch,

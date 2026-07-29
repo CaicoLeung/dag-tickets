@@ -191,22 +191,26 @@ export class ShellPullRequest implements PullRequestPort {
     private readonly timeoutMs?: number,
   ) {}
 
-  /** Force-push the head branch to the remote. See {@link PullRequestPort.pushHead}.
-   *
-   *  Mirrors {@link createPr}'s push (`-u --force head:head`) so a rebased
-   *  branch overwrites the pre-rebase tip an open PR was created from. Drops
-   *  the `-u` upstream tracking (already set by createPr) — the goal here is
-   *  purely to move the remote ref, not to re-bind it. Never throws: a failed
-   *  push returns a non-zero exit via {@link run}; createPr-style parsing is
-   *  unnecessary because there is no gh output to read. */
-  async pushHead(head: string): Promise<void> {
-    await run(["git", "push", "--force", "origin", `${head}:${head}`], { cwd: this.cwd });
+  /** Force-push the head branch to the remote — shared by {@link createPr}
+   *  and {@link pushHead} so the push command shape can't drift. `setUpstream`
+   *  adds `-u` to establish remote tracking (needed once, at PR creation). */
+  async #forcePush(head: string, setUpstream: boolean): Promise<{ ok: boolean; error?: string }> {
+    const args = ["git", "push", "--force"];
+    if (setUpstream) args.push("-u");
+    args.push("origin", `${head}:${head}`);
+    const r = await run(args, { cwd: this.cwd });
+    if (r.ok) return { ok: true };
+    return { ok: false, error: r.stderr.trim() || `git push exited ${r.code}` };
+  }
+
+  async pushHead(head: string): Promise<{ ok: boolean; error?: string }> {
+    return this.#forcePush(head, false);
   }
 
   /** Push the head branch and open a PR for it. Returns the PR number.
    *  Force-pushes so a stale remote branch from a prior batch is overwritten. */
   async createPr(opts: CreatePrOpts): Promise<number> {
-    await run(["git", "push", "-u", "--force", "origin", `${opts.head}:${opts.head}`], { cwd: this.cwd });
+    await this.#forcePush(opts.head, true);
     const args = [
       "gh",
       "pr",

@@ -75,8 +75,9 @@ class FakePullRequest implements PullRequestPort {
     this.prs.push(opts);
     return 1000 + this.prs.length;
   }
-  async pushHead(head: string): Promise<void> {
+  async pushHead(head: string): Promise<{ ok: boolean; error?: string }> {
     this.pushedHeads.push(head);
+    return { ok: true };
   }
   async watchChecks(): Promise<CheckResult> {
     return this.checks;
@@ -561,7 +562,7 @@ describe("implement lifecycle — failure reason classification (issue #21)", ()
 
 // ---------------------------------------------------------------------------
 // #29 overlap: an overlapped dependent composes on its blocker's head, then a
-// pull-model reconcile (between dispatches, before createPr) lands it onto the
+// pull-model reconcile (between dispatches, after createPr) lands it onto the
 // merged integration base. A conflicting rebase fails the dependent; a clean
 // createPr marks the head pushed so this ticket's own dependents can overlap.
 // ---------------------------------------------------------------------------
@@ -728,5 +729,45 @@ describe("implement lifecycle — #29 overlap", () => {
     expect(repo.pushedHeads).toHaveLength(0); // reconcile/push gated on the blocker
     // Don't await `running`: the never-resolving gate would hang the test. The
     // assertion above is the contract — createPr is independent of the gate.
+  });
+
+  test("#38 regression: mergePr does NOT fire while blocker's agent is still in flight — merge is gated behind waitForBlockers", async () => {
+    // Pre-#42, createPr was behind waitForBlockers, so mergePr could only fire
+    // after the blocker settled. Now createPr fires first (#42), so the
+    // structural ordering is createPr → waitForBlockers → reconcile → CI →
+    // merge. This test asserts mergePr stays gated behind the blocker: even
+    // though the PR is open and CI is scripted to pass, mergePr must not fire
+    // until the wait resolves. A rogue merge on the pre-rebase branch would
+    // reintroduce the #38 duplicate-PR bug.
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const t = ticket(2);
+    t.blockedBy = [1];
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
+    let resolveGate!: () => void;
+    const gate = new Promise<void>((r) => {
+      resolveGate = r;
+    });
+    const running = processTicket(
+      t,
+      ctx(agent, repo, { waitForBlockers: async () => gate }),
+      overlap,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    // createPr fired — PR creation is blocker-independent (#42).
+    expect(repo.prs).toHaveLength(1);
+    // mergePr has NOT fired yet — gated behind the unresolved blocker gate.
+    expect(repo.merged).toHaveLength(0);
+    // reconcile + force-push also gated.
+    expect(repo.pushedHeads).toHaveLength(0);
+    // Now release the gate — the blocker has "merged".
+    resolveGate();
+    const out = await running;
+    expect(out.status).toBe("done");
+    // reconcile, pushHead, CI, and merge all proceed after the gate.
+    expect(repo.pushedHeads).toHaveLength(1);
+    expect(repo.merged).toEqual([1001]);
   });
 });

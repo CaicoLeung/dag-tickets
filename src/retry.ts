@@ -50,6 +50,7 @@ export const TRANSIENT_REASONS: ReadonlySet<FailureReason> = Object.freeze(
     "merge-race",
     "agent-timeout",
     "connection-error",
+    "push-head-failed",
   ]),
 );
 

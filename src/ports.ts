@@ -291,8 +291,12 @@ export interface PullRequestPort {
    * the rebased commits on the PR so CI/merge run on the reconciled branch.
    * Like {@link createPr}'s internal push, it force-pushes `head:head` so a
    * rebased history overwrites the pre-rebase tip the PR was opened from.
+   *
+   * Returns `{ok, error?}` so the lifecycle can fail the ticket on a
+   * transient network/credential failure rather than silently proceeding to
+   * CI/merge on the stale pre-rebase tip.
    */
-  pushHead(head: string): Promise<void>;
+  pushHead(head: string): Promise<{ ok: boolean; error?: string }>;
   /** Wait for PR checks to finish, then report pass/fail/none. */
   watchChecks(prNumber: number): Promise<CheckResult>;
   /** Merge a PR with the given strategy. */

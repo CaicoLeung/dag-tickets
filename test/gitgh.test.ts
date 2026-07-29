@@ -279,7 +279,7 @@ describe("ShellPullRequest.pushHead (#42)", () => {
 
     // pushHead force-pushes the rewritten branch onto the remote.
     const pr = new ShellPullRequest(work);
-    await expect(pr.pushHead("loop/42-foo")).resolves.toBeUndefined();
+    await expect(pr.pushHead("loop/42-foo")).resolves.toEqual({ ok: true });
 
     // The remote now holds the rewritten tip (force-updated).
     const remoteTip = (await g(["--git-dir", origin, "rev-parse", "loop/42-foo"])).stdout.trim();
