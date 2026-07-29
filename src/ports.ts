@@ -125,15 +125,19 @@ export interface StepResult {
  * cleanup before each step, and verdict parsing — all hidden behind these calls.
  */
 export interface AgentPort {
-  /** Run /implement in a fresh worktree branched off `base`. Verifies commits landed. */
-  implement(t: Ticket, branch: string, base: string): Promise<ImplResult>;
+  /** Run /implement in a fresh worktree branched off `base`. Verifies commits landed.
+   *  `signal` (#34): when aborted, the dispatch returns a cancelled outcome
+   *  without issuing further agent work. */
+  implement(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ImplResult>;
   /** Run /code-review on `branch` against `base`. Returns the parsed verdict. */
   review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict>;
   /** Run one fix pass against the review verdict, on the existing branch.
    *  `round` (1-based) disambiguates repeated fix passes in the agent UI. */
   fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult>;
-  /** Single-shot skill (triage/research) in a fresh worktree — no PR. */
-  singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult>;
+  /** Single-shot skill (triage/research) in a fresh worktree — no PR.
+   *  `signal` (#34): when aborted, returns a cancelled outcome without
+   *  issuing further agent work. */
+  singleShot(skill: string, t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<StepResult>;
   /** Human-readable provider that would serve this skill (dry-run display only). */
   providerLabel(skill: "implement" | "review" | "triage" | "research"): string;
   /**

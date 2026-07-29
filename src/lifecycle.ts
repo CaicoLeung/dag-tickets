@@ -4,6 +4,7 @@ import type { AgentPort, EventSink, ImplFailReason, Logger, MergeStrategy, PullR
 import { withLog } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 import { EVT } from "./events.ts";
+import { ABORT_ERROR } from "./scheduler.ts";
 
 /**
  * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
@@ -35,6 +36,9 @@ export interface RunContext {
    *  so reconcile lands on the merged base (no premature PR). Absent in tests /
    *  when overlap is disabled. */
   waitForBlockers?: (blockers: number[]) => Promise<void>;
+  /** #34: per-launch AbortSignal exposed at every side-effect boundary so
+   *  callers discover the signal without tracing the full parameter chain. */
+  signal?: AbortSignal;
 }
 
 /** #29: per-ticket overlap state for a dependent launched while its blocker was
@@ -81,19 +85,24 @@ export async function processTicket(
    *  mergePr, closeIssue). */
   signal?: AbortSignal,
 ): Promise<TicketOutcome> {
+  // #34: expose the signal on RunContext so every side-effect boundary can
+  // discover it without tracing the full parameter chain (spec). Merged
+  // locally — the caller's ctx is shared across tickets and must not be
+  // mutated with a per-ticket signal.
+  const runCtx: RunContext = { ...ctx, signal };
   const rule = routingRuleFor(t.kind);
   if (t.kind === "skip") {
-    ctx.log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
+    runCtx.log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
     return { status: "skipped", error: "intentional-skip" };
   }
   if (t.kind === "unknown" || !rule.skill) {
-    ctx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
+    runCtx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
     return { status: "skipped", error: "unknown-kind" };
   }
 
-  if (ctx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, ctx);
-  if (rule.expectPr) return runImplementLifecycle(t, ctx, overlap, signal);
-  return runSingleShot(t, rule.skill, ctx, signal);
+  if (runCtx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, runCtx);
+  if (rule.expectPr) return runImplementLifecycle(t, runCtx, overlap);
+  return runSingleShot(t, rule.skill, runCtx);
 }
 
 // ---------------------------------------------------------------------------
@@ -108,7 +117,6 @@ async function runImplementLifecycle(
   t: Ticket,
   ctx: RunContext,
   overlap?: OverlapContext,
-  signal?: AbortSignal,
 ): Promise<TicketOutcome> {
   const branch = branchFor(t.number, t.title);
   // #29: an overlapped dependent composes on its blocker's head (not the
@@ -126,7 +134,7 @@ async function runImplementLifecycle(
     ctx,
     "implement",
     t.number,
-    () => ctx.agent.implement(t, branch, branchBase),
+    () => ctx.agent.implement(t, branch, branchBase, ctx.signal),
     (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason, ...withLog(r) }),
   );
   if (!impl.ok) {
@@ -223,7 +231,7 @@ async function runImplementLifecycle(
   if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
   // #34: after the potentially long blocker wait the dispatch may have been
   // superseded — check before any further side effects (reconcile, createPr).
-  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
 
   // #29 (pull-model reconcile): before opening a PR, land an overlapped
   // dependent onto the merged integration base. Safe here — between dispatches,
@@ -254,7 +262,7 @@ async function runImplementLifecycle(
 
   // 3. PR.
   // #34: check before side effects — a superseded dispatch must not create a PR.
-  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
   const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
@@ -286,7 +294,7 @@ async function runImplementLifecycle(
     return { status: "done", branch, pr, rounds };
   }
   // #34: check before merge — a superseded dispatch must not merge.
-  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
   try {
     await ctx.pullRequest.mergePr(pr, ctx.mergeStrategy);
     ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: true });
@@ -303,14 +311,18 @@ async function runImplementLifecycle(
   }
 }
 
-async function runSingleShot(t: Ticket, skill: string, ctx: RunContext, signal?: AbortSignal): Promise<TicketOutcome> {
+async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
+  // #34: short-circuit single-shot dispatches when the signal is already
+  // aborted — the spec requires lifecycle side-effect checkpoints treat an
+  // aborted signal as a no-side-effect return (acceptance criterion).
+  if (ctx.signal?.aborted) return { status: "skipped", error: ABORT_ERROR.message };
   const branch = branchFor(t.number, `${t.title}-shot`);
   ctx.log("info", `${skill} (single-shot)`, t.number);
   const r = await emitTimedStep(
     ctx,
     skill,
     t.number,
-    () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch),
+    () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch, ctx.signal),
     (res) => ({ ok: res.ok, timedOut: res.timedOut, ...withLog(res) }),
   );
   if (!r.ok) return fail(t, ctx, { reason: "single-shot-failed", error: `${skill} agent failed${r.timedOut ? " (timeout)" : ""}` }, branch, undefined, r.logPath);

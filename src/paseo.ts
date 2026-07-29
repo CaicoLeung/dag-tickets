@@ -1064,7 +1064,10 @@ export class PaseoAgent implements AgentPort {
     return ok ? remoteRef(bare) : null;
   }
 
-  async implement(t: Ticket, branch: string, base: string): Promise<ImplResult> {
+  async implement(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ImplResult> {
+    // #34: observe the signal at the agent dispatch seam — an already-aborted
+    // signal returns a cancelled outcome without issuing further agent work.
+    if (signal?.aborted) return { ok: false, commits: 0, reason: "failed" };
     const baseRef = await this.resolveBranchOffBase(base);
     if (baseRef === null) {
       // Failing beats a silent stale branch-off: a dependent composing on
@@ -1182,7 +1185,10 @@ export class PaseoAgent implements AgentPort {
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
 
-  async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
+  async singleShot(skill: string, t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<StepResult> {
+    // #34: observe the signal at the agent dispatch seam — an already-aborted
+    // signal returns a cancelled outcome without issuing further agent work.
+    if (signal?.aborted) return { ok: false, timedOut: false, rateLimited: false };
     const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
     const baseRef = await this.resolveBranchOffBase(base);
     if (baseRef === null) {
