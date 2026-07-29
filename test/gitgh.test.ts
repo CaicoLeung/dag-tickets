@@ -94,11 +94,16 @@ describe("ShellBranch.resolveRemoteTip (#29)", () => {
  *  - serverMerged: whether the server-side merge landed → drives
  *    `gh pr view --json state` (MERGED vs OPEN).
  *  - viewFailsBeforeSuccess: how many `gh pr view` calls fail (exit 1) before
- *    the state is returned — exercises mergePr's reconciliation retry. */
+ *    the state is returned — exercises mergePr's reconciliation retry on a
+ *    non-zero exit.
+ *  - viewGarbledBeforeSuccess: how many `gh pr view` calls return malformed
+ *    JSON (exit 0) before the state is returned — exercises the retry on a
+ *    garbled/truncated response, the symmetric half of the transient path. */
 interface GhShimOpts {
   mergeExit: number;
   serverMerged: boolean;
   viewFailsBeforeSuccess?: number;
+  viewGarbledBeforeSuccess?: number;
 }
 
 /** Install an executable `gh` on a temp PATH that simulates a merge whose
@@ -112,7 +117,14 @@ async function installGhShim(opts: GhShimOpts): Promise<{ restore: () => void }>
   // Persistent view-call counter across the separate shim processes, so a test
   // can script "the first N pr-view calls flake, then succeed".
   const views = join(dir, "views.txt");
-  await Bun.write(cfg, JSON.stringify({ ...opts, viewFails: opts.viewFailsBeforeSuccess ?? 0 }));
+  await Bun.write(
+    cfg,
+    JSON.stringify({
+      ...opts,
+      viewFails: opts.viewFailsBeforeSuccess ?? 0,
+      viewGarbled: opts.viewGarbledBeforeSuccess ?? 0,
+    }),
+  );
   await Bun.write(views, "0");
   const ghPath = join(dir, "gh");
   const src =
@@ -132,6 +144,7 @@ async function installGhShim(opts: GhShimOpts): Promise<{ restore: () => void }>
     `  n++;\n` +
     `  writeFileSync(ctr, String(n));\n` +
     `  if (cfg.viewFails && n <= cfg.viewFails) { process.stderr.write("transient gh error\\n"); exit(1); }\n` +
+    `  if (cfg.viewGarbled && n <= cfg.viewGarbled) { out("{ not json\\n"); exit(0); }\n` +
     `  out(JSON.stringify({ state: cfg.serverMerged ? "MERGED" : "OPEN" }) + "\\n");\n` +
     `  exit(0);\n` +
     `}\n` +
@@ -182,13 +195,31 @@ describe("ShellPullRequest.mergePr (#38)", () => {
   });
 
   test("transient gh pr view failure after a landed merge → still resolves (retry)", async () => {
-    // Closes the residual #38 gap: `gh pr view` itself can flake right after a
-    // merge that already landed. prState retries so a transient failure doesn't
-    // make mergePr throw → merge-race → duplicate PR.
+    // Closes the residual #38 gap: `gh pr view` itself can flake (non-zero
+    // exit) right after a merge that already landed. reconcilePrState retries
+    // so a transient failure doesn't make mergePr throw → merge-race → dup PR.
     const { restore } = await installGhShim({
       mergeExit: 1,
       serverMerged: true,
       viewFailsBeforeSuccess: 2, // tolerated by the bounded retry (3 attempts)
+    });
+    try {
+      const pr = new ShellPullRequest();
+      await expect(pr.mergePr(42, "squash")).resolves.toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("transient malformed gh pr view output after a landed merge → still resolves (retry)", async () => {
+    // Symmetric half of the retry: `gh pr view` exits 0 but returns
+    // malformed/truncated JSON. Pre-fix this short-circuited to null → mergePr
+    // threw → merge-race → duplicate PR, so the hardening only covered a
+    // non-zero exit. reconcilePrState now retries a parse failure too.
+    const { restore } = await installGhShim({
+      mergeExit: 1,
+      serverMerged: true,
+      viewGarbledBeforeSuccess: 2, // tolerated by the bounded retry (3 attempts)
     });
     try {
       const pr = new ShellPullRequest();

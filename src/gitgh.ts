@@ -161,17 +161,28 @@ export class ShellBranch implements BranchPort {
  */
 
 /** GitHub's authoritative state for a PR. Narrowed to a union (mirroring
- *  {@link MergeStrategy}) so the {@link ShellPullRequest.prState} contract is a
- *  known enum, not a magic string compared at every call site. */
+ *  {@link MergeStrategy}) so the {@link ShellPullRequest.reconcilePrState}
+ *  contract is a known enum, not a magic string compared at every call site. */
 type PrState = "OPEN" | "MERGED" | "CLOSED";
 
-/** Attempts {@link ShellPullRequest.prState} makes before conceding "unknown".
- *  Guards a merge that already landed: a single transient `gh pr view` failure
- *  would otherwise return null → mergePr throws → merge-race → the duplicate-PR
- *  bug #38. Bounded so a real outage still fails fast-ish. */
+/** Attempts {@link ShellPullRequest.reconcilePrState} makes before conceding
+ *  "unknown". Guards a merge that already landed: a single transient
+ *  `gh pr view` failure would otherwise return null → mergePr throws →
+ *  merge-race → the duplicate-PR bug #38. Bounded so a real outage still fails
+ *  fast-ish. */
 const PR_STATE_ATTEMPTS = 3;
-/** Backoff between {@link ShellPullRequest.prState} retries. */
+/** Backoff between {@link ShellPullRequest.reconcilePrState} retries. */
 const PR_STATE_RETRY_MS = 500;
+
+/** Outcome of {@link ShellPullRequest.reconcilePrState}: the resolved PR
+ *  state, or — when it could not be determined — the last transient failure
+ *  reason, so {@link ShellPullRequest.mergePr}'s thrown error names the real
+ *  culprit (a down/flaky `gh pr view`) instead of mis-blaming a merge that
+ *  likely already landed. */
+interface ReconciledPrState {
+  state: PrState | null;
+  failure?: string;
+}
 
 export class ShellPullRequest implements PullRequestPort {
   constructor(
@@ -260,40 +271,57 @@ export class ShellPullRequest implements PullRequestPort {
       { cwd: this.cwd },
     );
     if (r.ok) return;
-    const state = await this.prState(prNumber);
-    if (state === "MERGED") return; // merge landed despite the non-zero exit
+    const reconciled = await this.reconcilePrState(prNumber);
+    if (reconciled.state === "MERGED") return; // merge landed despite the non-zero exit
     throw new Error(
-      `gh pr merge failed (pr state=${state ?? "?"}, exit ${r.code}): ${r.stderr.trim()}`,
+      `gh pr merge failed (pr state=${reconciled.state ?? "?"}, exit ${r.code}): ${r.stderr.trim()}` +
+        (reconciled.state === null
+          ? ` — reconciliation unavailable: ${reconciled.failure ?? "unknown"}`
+          : ""),
     );
   }
 
   /** GitHub's authoritative state for a PR ({@link PrState}). Used by
    *  {@link mergePr} to decide whether a non-zero `gh pr merge` exit still
-   *  landed the merge. Retries on a transient gh failure (network/5xx) so a
-   *  flaky view right after a successful merge can't re-introduce the #38
-   *  misclassification; returns null only after all attempts fail (caller then
-   *  falls back to the merge-error). */
-  private async prState(prNumber: number): Promise<PrState | null> {
+   *  landed the merge. Retries on ANY transient `gh pr view` failure — a
+   *  non-zero exit (network/5xx) or a malformed/truncated response — so a flaky
+   *  view right after a successful merge can't re-introduce the #38
+   *  misclassification. A well-formed but unrecognized state is terminal, not
+   *  transient (retrying returns the same value), so it concedes immediately.
+   *  Returns null (with the last failure reason) only after all attempts fail,
+   *  so the caller's error names the real culprit rather than the merge. */
+  private async reconcilePrState(prNumber: number): Promise<ReconciledPrState> {
+    const wait = () => new Promise<void>((res) => setTimeout(res, PR_STATE_RETRY_MS));
+    let lastFailure = "no attempt made";
     for (let attempt = 1; attempt <= PR_STATE_ATTEMPTS; attempt++) {
+      const last = attempt === PR_STATE_ATTEMPTS;
       const r = await run(
         ["gh", "pr", "view", String(prNumber), "--json", "state"],
         { cwd: this.cwd },
       );
+      // Non-zero exit is transient (network/5xx) — retry so a flaky view right
+      // after a landed merge can't re-introduce the #38 misclassification.
       if (!r.ok) {
-        if (attempt < PR_STATE_ATTEMPTS) {
-          await new Promise((res) => setTimeout(res, PR_STATE_RETRY_MS));
-        }
+        lastFailure = `gh pr view exit ${r.code}: ${r.stderr.trim() || "<no stderr>"}`;
+        if (!last) await wait();
         continue;
       }
+      // Malformed/truncated stdout is equally transient — retry too, so the
+      // hardening covers the same failure mode as !r.ok (symmetric).
+      let s: string | undefined;
       try {
-        const s = (JSON.parse(r.stdout) as { state?: string }).state;
-        if (s === "OPEN" || s === "MERGED" || s === "CLOSED") return s;
-        return null;
+        s = (JSON.parse(r.stdout) as { state?: string }).state;
       } catch {
-        return null;
+        lastFailure = `gh pr view returned malformed json: ${r.stdout.trim().slice(0, 120) || "<empty>"}`;
+        if (!last) await wait();
+        continue;
       }
+      if (s === "OPEN" || s === "MERGED" || s === "CLOSED") return { state: s };
+      // Well-formed but unrecognized state is terminal — retrying won't change
+      // it — so concede immediately rather than burn the retry budget.
+      return { state: null, failure: `unrecognized pr state: ${s ?? "<missing>"}` };
     }
-    return null;
+    return { state: null, failure: lastFailure };
   }
 
   /** Close an issue with an explanatory comment. */
