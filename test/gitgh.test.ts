@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
-import { branchFor, ShellBranch } from "../src/gitgh.ts";
+import { branchFor, ShellBranch, ShellPullRequest } from "../src/gitgh.ts";
 import { run } from "../src/shell.ts";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -77,5 +77,124 @@ describe("ShellBranch.resolveRemoteTip (#29)", () => {
 
     // A ref never pushed → null (blocker hasn't reached its createPr step).
     expect(await sb.resolveRemoteTip("loop/99-missing")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ShellPullRequest.mergePr (#38): `gh pr merge --delete-branch` exits non-zero
+// when the local branch can't be deleted (checked out in a worktree) even
+// though the server-side merge landed. mergePr must reconcile against GitHub's
+// authoritative PR state and treat a MERGED PR as success — otherwise the
+// lifecycle misclassifies it as a retryable `merge-race` and re-implements the
+// already-merged ticket (duplicate PRs).
+// ---------------------------------------------------------------------------
+
+/** Options for the tiny gh shim installed for mergePr tests.
+ *  - mergeExit: exit code for `gh pr merge` (the local --delete-branch step).
+ *  - serverMerged: whether the server-side merge landed → drives
+ *    `gh pr view --json state` (MERGED vs OPEN).
+ *  - viewFailsBeforeSuccess: how many `gh pr view` calls fail (exit 1) before
+ *    the state is returned — exercises mergePr's reconciliation retry. */
+interface GhShimOpts {
+  mergeExit: number;
+  serverMerged: boolean;
+  viewFailsBeforeSuccess?: number;
+}
+
+/** Install an executable `gh` on a temp PATH that simulates a merge whose
+ *  local --delete-branch step can fail while the server-side merge may still
+ *  have landed. Returns a restore() that puts PATH back. The shim is
+ *  self-contained (reads its behaviour from a JSON cfg) and uses an absolute
+ *  bun shebang so it runs even if bun isn't on the child's PATH. */
+async function installGhShim(opts: GhShimOpts): Promise<{ restore: () => void }> {
+  const dir = await mkdtemp(join(tmpdir(), "dag-ghshim-"));
+  const cfg = join(dir, "cfg.json");
+  // Persistent view-call counter across the separate shim processes, so a test
+  // can script "the first N pr-view calls flake, then succeed".
+  const views = join(dir, "views.txt");
+  await Bun.write(cfg, JSON.stringify({ ...opts, viewFails: opts.viewFailsBeforeSuccess ?? 0 }));
+  await Bun.write(views, "0");
+  const ghPath = join(dir, "gh");
+  const src =
+    `#!${process.execPath}\n` +
+    `import { readFileSync, writeFileSync } from "node:fs";\n` +
+    `const cfg = JSON.parse(readFileSync(${JSON.stringify(cfg)}, "utf8"));\n` +
+    `const a = process.argv.slice(2);\n` +
+    `const out = (s) => process.stdout.write(s);\n` +
+    `const exit = (c) => process.exit(c);\n` +
+    `if (a[0] === "pr" && a[1] === "merge") {\n` +
+    `  out(cfg.mergeExit === 0 ? "" : "delete-branch failed\\n");\n` +
+    `  exit(cfg.mergeExit);\n` +
+    `}\n` +
+    `if (a[0] === "pr" && a[1] === "view" && a.includes("--json")) {\n` +
+    `  const ctr = ${JSON.stringify(views)};\n` +
+    `  let n = parseInt(readFileSync(ctr, "utf8") || "0", 10) || 0;\n` +
+    `  n++;\n` +
+    `  writeFileSync(ctr, String(n));\n` +
+    `  if (cfg.viewFails && n <= cfg.viewFails) { process.stderr.write("transient gh error\\n"); exit(1); }\n` +
+    `  out(JSON.stringify({ state: cfg.serverMerged ? "MERGED" : "OPEN" }) + "\\n");\n` +
+    `  exit(0);\n` +
+    `}\n` +
+    `process.stderr.write("gh-shim: unhandled " + JSON.stringify(process.argv) + "\\n");\n` +
+    `exit(2);\n`;
+  await Bun.write(ghPath, src);
+  await chmod(ghPath, 0o755);
+  const prev = process.env.PATH ?? "";
+  process.env.PATH = `${dir}:${prev}`;
+  return { restore: () => { process.env.PATH = prev; } };
+}
+
+describe("ShellPullRequest.mergePr (#38)", () => {
+  test("non-zero exit but PR MERGED on GitHub → resolves (no throw)", async () => {
+    // The worktree-can't-delete-branch case: gh pr merge exits 1 after the
+    // server-side squash already landed. Reconciling via pr view must turn
+    // this into a success so the ticket isn't re-implemented.
+    const { restore } = await installGhShim({ mergeExit: 1, serverMerged: true });
+    try {
+      const pr = new ShellPullRequest();
+      await expect(pr.mergePr(42, "squash")).resolves.toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("non-zero exit and PR still OPEN → throws (genuine merge failure)", async () => {
+    // A real merge failure (base moved / conflict): the PR is still open, so
+    // the merge-race retry path must be preserved.
+    const { restore } = await installGhShim({ mergeExit: 1, serverMerged: false });
+    try {
+      const pr = new ShellPullRequest();
+      await expect(pr.mergePr(42, "squash")).rejects.toThrow(/gh pr merge failed/);
+    } finally {
+      restore();
+    }
+  });
+
+  test("exit 0 → resolves without consulting pr view", async () => {
+    // Happy path: gh pr merge succeeds outright; no reconciliation needed.
+    const { restore } = await installGhShim({ mergeExit: 0, serverMerged: false });
+    try {
+      const pr = new ShellPullRequest();
+      await expect(pr.mergePr(42, "squash")).resolves.toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  test("transient gh pr view failure after a landed merge → still resolves (retry)", async () => {
+    // Closes the residual #38 gap: `gh pr view` itself can flake right after a
+    // merge that already landed. prState retries so a transient failure doesn't
+    // make mergePr throw → merge-race → duplicate PR.
+    const { restore } = await installGhShim({
+      mergeExit: 1,
+      serverMerged: true,
+      viewFailsBeforeSuccess: 2, // tolerated by the bounded retry (3 attempts)
+    });
+    try {
+      const pr = new ShellPullRequest();
+      await expect(pr.mergePr(42, "squash")).resolves.toBeUndefined();
+    } finally {
+      restore();
+    }
   });
 });

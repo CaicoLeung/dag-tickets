@@ -127,6 +127,47 @@ describe("e2e: implement lifecycle", () => {
     }
   });
 
+  test("merge --delete-branch exits 1 but PR merged on GitHub → done, no duplicate PR (#38)", async () => {
+    // The #38 race: dag-tickets leaves its review worktree on the ticket
+    // branch, so `gh pr merge --squash --delete-branch` exits 1 ("cannot delete
+    // branch used by worktree") even though the squash merge landed on GitHub.
+    // Pre-fix this was misclassified as merge-race → the ticket re-implemented
+    // → duplicate PR. Post-fix mergePr reconciles via `gh pr view --json state`
+    // → MERGED → the ticket settles done with a SINGLE PR.
+    const env = await setup({
+      issues: [issue(38, "Merge race me")],
+      verdicts: { "38": ["clean"] },
+      mergeDeleteBranchFails: [38],
+    });
+    try {
+      expect(await runMain(env, ["38"])).toBe(0);
+
+      const state = (await readState(env))!;
+      const t = ticketOf(state, 38);
+      // The ticket settled done (not failed merge-race), so it was NOT retried.
+      expect(t.status).toBe("done");
+      expect(t.reason).toBeUndefined();
+      expect(t.pr).toBe(1001);
+
+      const shim = await readShimState(env);
+      // Exactly ONE PR was opened (no duplicate from a merge-race retry) and it
+      // was recorded merged despite the non-zero gh exit.
+      expect(shim.prCounter).toBe(1001);
+      expect(shim.merged).toEqual([1001]);
+      // The issue was still closed post-merge (the success path ran to completion).
+      expect(shim.closed).toContain(38);
+
+      // The MERGE event landed ok (not the error variant a merge-race emits).
+      const mergeEvt = (await readEvents(env))!.find(
+        (e) => e.type === EVT.MERGE && e.ticket === 38,
+      );
+      expect(mergeEvt).toBeDefined();
+      expect(mergeEvt!.data?.ok).toBe(true);
+    } finally {
+      await teardown(env);
+    }
+  });
+
   test("review ISSUES → fix → CLEAN → merge (rounds=1)", async () => {
     const env = await setup({
       issues: [issue(2, "Add bar")],

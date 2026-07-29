@@ -164,10 +164,23 @@ import {
     exit(0);
   }
 
+  // gh pr view <n> --json state   (authoritative PR state; used by mergePr
+  // to reconcile a --delete-branch failure against the server-side merge
+  // result. A PR is MERGED iff gh pr merge recorded it, else OPEN.)
+  if (cmd === "pr" && sub === "view" && argv.includes("--json")) {
+    const n = parseInt(argv[2], 10);
+    const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+    const merged = (state.merged || []).includes(n);
+    out(JSON.stringify({ state: merged ? "MERGED" : "OPEN" }) + "\n");
+    exit(0);
+  }
+
   // gh pr merge <n> squash|merge|rebase --delete-branch
   // Records the merged PR + the strategy flag gh received (asserts
-  // --merge-strategy). When the merged PR's ticket is the overlap pacer, also
-  // flips state.releaseWatch so the held base ticket's CI watch unblocks.
+  // --merge-strategy). Scenario flag `mergeDeleteBranchFails` simulates the
+  // #38 race: the server-side merge lands (recorded) but the local
+  // --delete-branch step fails (branch checked out in a worktree) so gh exits
+  // 1 — mergePr reconciles via `gh pr view --json state` instead of throwing.
   if (cmd === "pr" && sub === "merge") {
     const n = parseInt(argv[2], 10);
     // mergePr sends the strategy as a `--squash`/`--merge`/`--rebase` flag; pull
@@ -175,14 +188,25 @@ import {
     const strat =
       argv.find((a, idx) => idx > 2 && /^--(squash|merge|rebase)$/.test(a))?.slice(2) ||
       "squash";
+    let deleteBranchFails = false;
     await withStateLock(STATE, async () => {
       const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+      // Server-side merge lands first, regardless of the local delete-branch
+      // outcome — so `gh pr view --json state` reconciles to MERGED.
       state.merged = state.merged || [];
       if (!state.merged.includes(n)) state.merged.push(n);
       state.mergedStrategies = state.mergedStrategies || {};
       state.mergedStrategies[String(n)] = strat;
+      const num = (state.prTickets || {})[String(n)] || 0;
+      if (num && scen.mergeDeleteBranchFails && scen.mergeDeleteBranchFails.includes(num)) {
+        deleteBranchFails = true;
+      }
       await writeJson(STATE, state);
     });
+    if (deleteBranchFails) {
+      err("delete-branch failed: branch is checked out in a worktree\n");
+      exit(1);
+    }
     exit(0);
   }
 

@@ -86,6 +86,11 @@ export interface ScenarioOpts {
   /** Ticket numbers whose implement dispatch sets state.dependentLaunched = true
    *  (the release signal for a held `holdWatch` blocker). */
   dependentImpl?: number[];
+  /** Ticket numbers whose `gh pr merge --delete-branch` records the server-side
+   *  merge then exits 1 (the local branch is checked out in a worktree, so the
+   *  delete-branch step fails after the merge landed). Drives the #38 fix:
+   *  mergePr reconciles via `gh pr view --json state` → MERGED → success. */
+  mergeDeleteBranchFails?: number[];
 }
 
 export interface Env {
@@ -163,6 +168,7 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     pacerUntil: opts.pacerUntil ?? {},
     holdWatch: opts.holdWatch ?? [],
     dependentImpl: opts.dependentImpl ?? [],
+    mergeDeleteBranchFails: opts.mergeDeleteBranchFails ?? [],
   };
 }
 

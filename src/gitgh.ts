@@ -159,6 +159,20 @@ export class ShellBranch implements BranchPort {
  * Real {@link PullRequestPort} adapter: the gh PR→CI→merge→close path. Driven
  * by the lifecycle orchestrator; a fake stands in for tests.
  */
+
+/** GitHub's authoritative state for a PR. Narrowed to a union (mirroring
+ *  {@link MergeStrategy}) so the {@link ShellPullRequest.prState} contract is a
+ *  known enum, not a magic string compared at every call site. */
+type PrState = "OPEN" | "MERGED" | "CLOSED";
+
+/** Attempts {@link ShellPullRequest.prState} makes before conceding "unknown".
+ *  Guards a merge that already landed: a single transient `gh pr view` failure
+ *  would otherwise return null → mergePr throws → merge-race → the duplicate-PR
+ *  bug #38. Bounded so a real outage still fails fast-ish. */
+const PR_STATE_ATTEMPTS = 3;
+/** Backoff between {@link ShellPullRequest.prState} retries. */
+const PR_STATE_RETRY_MS = 500;
+
 export class ShellPullRequest implements PullRequestPort {
   constructor(
     private readonly cwd?: string,
@@ -227,10 +241,59 @@ export class ShellPullRequest implements PullRequestPort {
     return { state: "pass", failed: [] };
   }
 
-  /** Merge a PR and delete its branch. */
+  /** Merge a PR and delete its branch.
+   *
+   *  `gh pr merge --delete-branch` performs the server-side merge, then tries
+   *  to delete the branch — both remote and local. The local delete fails
+   *  (exit 1) when the branch is checked out in a worktree, which dag-tickets'
+   *  review worktree routinely is. The merge on GitHub has already landed by
+   *  then, so throwing here would be misclassified upstream as a retryable
+   *  `merge-race` and the already-merged ticket re-implemented → duplicate PRs
+   *  (#38). On a non-zero exit we reconcile against GitHub's authoritative PR
+   *  state: a `MERGED` PR means the merge succeeded and we return normally;
+   *  anything else (OPEN/CLOSED/unknown) is a genuine merge failure and we
+   *  throw, preserving the merge-race retry path. */
   async mergePr(prNumber: number, strategy: MergeStrategy): Promise<void> {
     const flag = strategy === "squash" ? "--squash" : strategy === "rebase" ? "--rebase" : "--merge";
-    await mustRun(["gh", "pr", "merge", String(prNumber), flag, "--delete-branch"], { cwd: this.cwd });
+    const r = await run(
+      ["gh", "pr", "merge", String(prNumber), flag, "--delete-branch"],
+      { cwd: this.cwd },
+    );
+    if (r.ok) return;
+    const state = await this.prState(prNumber);
+    if (state === "MERGED") return; // merge landed despite the non-zero exit
+    throw new Error(
+      `gh pr merge failed (pr state=${state ?? "?"}, exit ${r.code}): ${r.stderr.trim()}`,
+    );
+  }
+
+  /** GitHub's authoritative state for a PR ({@link PrState}). Used by
+   *  {@link mergePr} to decide whether a non-zero `gh pr merge` exit still
+   *  landed the merge. Retries on a transient gh failure (network/5xx) so a
+   *  flaky view right after a successful merge can't re-introduce the #38
+   *  misclassification; returns null only after all attempts fail (caller then
+   *  falls back to the merge-error). */
+  private async prState(prNumber: number): Promise<PrState | null> {
+    for (let attempt = 1; attempt <= PR_STATE_ATTEMPTS; attempt++) {
+      const r = await run(
+        ["gh", "pr", "view", String(prNumber), "--json", "state"],
+        { cwd: this.cwd },
+      );
+      if (!r.ok) {
+        if (attempt < PR_STATE_ATTEMPTS) {
+          await new Promise((res) => setTimeout(res, PR_STATE_RETRY_MS));
+        }
+        continue;
+      }
+      try {
+        const s = (JSON.parse(r.stdout) as { state?: string }).state;
+        if (s === "OPEN" || s === "MERGED" || s === "CLOSED") return s;
+        return null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   /** Close an issue with an explanatory comment. */
