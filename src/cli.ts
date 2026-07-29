@@ -464,6 +464,28 @@ export async function main(argv: string[]): Promise<number> {
   // dispatches nothing, so it stays lock-free (and never blocks a real run).
   let lockHandle: LockHandle | null = null;
   let onSignal: ((sig: NodeJS.Signals) => void) | null = null;
+  // #40: tickets currently in flight (launched, not yet settled) so a
+  // graceful / signal / thrown exit can stop the agents this run spawned
+  // instead of orphaning them on the worktree. `agentRef` is assigned inside
+  // the try below; the signal handler (registered before try) reads it by ref.
+  const inflightTickets = new Set<number>();
+  let agentRef: PaseoAgent | undefined;
+  // #40: best-effort stop of every agent this run still has in flight. Shared by
+  // the graceful-exit finally, the SIGINT/SIGTERM handler, and the crash handlers
+  // (uncaughtException / unhandledRejection) so the stop + its swallow live in
+  // ONE place (PaseoAgent.stopInFlight). Never throws; never blocks the next step.
+  const stopInFlightAgents = async (): Promise<void> => {
+    if (!agentRef) return;
+    try {
+      await agentRef.stopInFlight(inflightTickets);
+    } catch {
+      /* best-effort: the exit/cleanup that follows must proceed regardless */
+    }
+  };
+  // Crash handlers are registered in the non-dry-run block below and detached
+  // in the finally. Declared here so the finally can remove them on every exit.
+  let onUncaught: ((err: unknown) => void) | null = null;
+  let onRejection: ((err: unknown) => void) | null = null;
   if (!a.dryRun) {
     try {
       lockHandle = await acquireLock({ cwd: a.cwd, runId });
@@ -485,12 +507,35 @@ export async function main(argv: string[]): Promise<number> {
     // detached in the finally below so a later, unrelated signal keeps default
     // behaviour. handle.release() is idempotent, so a double call is harmless.
     const handle = lockHandle;
+    // #40: stop in-flight agents, then release the run lock, then exit. Shared
+    // by the SIGINT/SIGTERM handler and the crash handlers below — process.exit
+    // bypasses the try/finally, so the cleanup lives here. Best-effort throughout.
+    const cleanExit = async (code: number): Promise<void> => {
+      await stopInFlightAgents();
+      await handle.release();
+    };
     onSignal = (sig: NodeJS.Signals) => {
-      log("warn", `${sig} received; releasing run lock and exiting`);
+      log("warn", `${sig} received; stopping in-flight agents, releasing run lock and exiting`);
       // 128 + signal number: 130 for SIGINT, 143 for SIGTERM (the shell convention).
       const code = 128 + (sig === "SIGINT" ? 2 : 15);
-      handle.release().finally(() => process.exit(code));
+      cleanExit(code)
+        .catch(() => {})
+        .finally(() => process.exit(code));
     };
+    // #40: the "not graceful" half of "clean up agents on exit (graceful or not)".
+    // An uncaught exception / unhandled rejection bypasses the try/finally; these
+    // handlers stop the in-flight agents + release the lock before a non-zero
+    // exit. (The bin already logs the stack; these focus on cleanup + exit(1).)
+    const exitOnCrash = (kind: string) => (): void => {
+      log("warn", `${kind}: stopping in-flight agents, releasing run lock before exit`);
+      cleanExit(1)
+        .catch(() => {})
+        .finally(() => process.exit(1));
+    };
+    onUncaught = exitOnCrash("uncaught exception");
+    onRejection = exitOnCrash("unhandled rejection");
+    process.on("uncaughtException", onUncaught);
+    process.on("unhandledRejection", onRejection);
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
   }
@@ -520,6 +565,7 @@ export async function main(argv: string[]): Promise<number> {
       a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * MS_PER_MINUTE : undefined;
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
+    agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
     // main() — see OverlapCoordinator. Seeded from the resume sets so a
@@ -548,6 +594,11 @@ export async function main(argv: string[]): Promise<number> {
       events,
       canOverlap: overlap.canOverlap,
       process: async (n, info) => {
+        // #40: track this ticket as in flight so a graceful/signal exit can
+        // stop its agent. Removed once it settles normally; a throw leaves it
+        // in the set (the scheduler settles it failed externally) so exit
+        // cleanup still stops a possibly-running agent — harmless if not.
+        inflightTickets.add(n);
         const t = graph.byNumber.get(n)!;
         // #29: a launch via overlap composes on the blocker's pushed head +
         // captures its tip for the pre-createPr reconcile. A missing tip (lost
@@ -616,6 +667,7 @@ export async function main(argv: string[]): Promise<number> {
         );
         state.tickets[n] = stateFromOutcome(outcome.status, outcome);
         if (!a.dryRun) await saveState(state, a.cwd);
+        inflightTickets.delete(n); // settled normally → agent dispatch is done
         return outcome.status;
       },
       // #20: when a running dependent's blocker settles failed/skipped, kill the
@@ -658,11 +710,18 @@ export async function main(argv: string[]): Promise<number> {
     }
     log("dim", `state: ${`.scratch/dag-tickets/${runId}/state.json`}`);
   } finally {
+    // #40: stop any agent still in flight (thrown error / a crash whose handler
+    // didn't reach process.exit) so it doesn't keep editing the worktree after
+    // the orchestrator has exited. No-op on a clean run (in-flight is empty once
+    // runBatch returns) and on dry-run (nothing dispatched). Best-effort.
+    await stopInFlightAgents();
     await events.flush();
     if (onSignal) {
       process.removeListener("SIGINT", onSignal);
       process.removeListener("SIGTERM", onSignal);
     }
+    if (onUncaught) process.removeListener("uncaughtException", onUncaught);
+    if (onRejection) process.removeListener("unhandledRejection", onRejection);
     if (lockHandle) await lockHandle.release();
   }
   return exitCode;

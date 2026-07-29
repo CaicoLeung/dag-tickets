@@ -317,20 +317,34 @@ export async function stopRunningAgent(
   cwd: string | undefined,
   ticketNumber: number,
 ): Promise<void> {
-  const r = await run(["paseo", "ls", "--json"], { cwd });
-  if (!r.ok) return;
-  let agents: Array<{ id?: string; status?: string; cwd?: string }> = [];
+  // Best-effort and never throws (its documented contract — relied on by
+  // abort() and by the rate-limit fallback #40). `paseo` may be absent in
+  // unit-test envs, unreachable, or emit malformed output; `run()` itself
+  // throws on a missing executable (ENOENT), so the whole body is guarded.
+  // Any of those → nothing to stop; the caller still proceeds.
   try {
-    const j = JSON.parse(r.stdout) as unknown;
-    agents = Array.isArray(j) ? (j as typeof agents) : ((j as { agents?: typeof agents }).agents ?? []);
+    const r = await run(["paseo", "ls", "--json"], { cwd });
+    if (!r.ok) return;
+    let agents: Array<{ id?: string; status?: string; cwd?: string }> = [];
+    try {
+      const j = JSON.parse(r.stdout) as unknown;
+      agents = Array.isArray(j) ? (j as typeof agents) : ((j as { agents?: typeof agents }).agents ?? []);
+    } catch {
+      return; // malformed `paseo ls` output — nothing to stop
+    }
+    const running = agents.filter(
+      (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktreeSegment(a.cwd, ticketNumber),
+    );
+    for (const a of running) {
+      if (!a.id) continue;
+      try {
+        await run(["paseo", "stop", a.id], { cwd });
+      } catch {
+        /* one bad stop doesn't skip the rest — matches stopInFlight's contract */
+      }
+    }
   } catch {
-    return; // malformed `paseo ls` output — nothing to stop
-  }
-  const running = agents.filter(
-    (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktreeSegment(a.cwd, ticketNumber),
-  );
-  for (const a of running) {
-    if (a.id) await run(["paseo", "stop", a.id], { cwd });
+    /* paseo missing / spawn error → nothing to stop */
   }
 }
 
@@ -369,11 +383,29 @@ export class PaseoAgent implements AgentPort {
   ) {}
 
   /**
+   * #40: best-effort stop of the ticket's running agent. Swallowed so a stop
+   *  failure (paseo unreachable, lost race, a throwing injected fake) never
+   *  blocks the caller — the rate-limit fallback / exit cleanup still proceeds.
+   *  Mirrors the stop swallow in {@link abort}.
+   */
+  private async tryStop(t: Ticket): Promise<void> {
+    try {
+      await this.stopAgent(t.number);
+    } catch {
+      /* best-effort: a stop failure must not block the fallback or the exit */
+    }
+  }
+
+  /**
    * Rate-limit-retry hook shared by review() and fix(): log the provider switch
    * and free the branch so the checkout-branch retry isn't blocked by a stale
    * worktree. implement() builds its own callback (a branch-off retry also has
    * to delete the branch before re-creating it). Each switch is also emitted
    * as a structured `provider.switch` event (issue #19).
+   *
+   * #40: each switch STOPS the prior (rate-limited) agent before the fallback
+   * is dispatched on the same worktree — otherwise both agents run concurrently
+   * and clobber each other's edits (the orphan-agent accumulation from #40).
    */
   private onRateLimited(
     skill: string,
@@ -389,6 +421,10 @@ export class PaseoAgent implements AgentPort {
         to: next,
         reason: "rate-limited",
       });
+      // #40: stop the prior (rate-limited) agent BEFORE spawning the fallback
+      // on the same worktree, then free the branch. Stop-first ordering matters:
+      // cleaning a worktree a live agent is still editing races the agent.
+      await this.tryStop(t);
       await this.branch.cleanBranch(branch);
     };
   }
@@ -437,6 +473,9 @@ export class PaseoAgent implements AgentPort {
           to: next,
           reason: "rate-limited",
         });
+        // #40: stop the prior agent before the branch-off retry re-creates the
+        // branch (same reason as onRateLimited). Best-effort.
+        await this.tryStop(t);
         await this.branch.cleanBranch(branch);
         await this.branch.deleteBranch(branch);
       },
@@ -553,6 +592,28 @@ export class PaseoAgent implements AgentPort {
       /* a stale/missing worktree is fine — the agent stop is the load-bearing part */
     }
     this.log("warn", `cascade-abort: stopped agent + cleaned worktree ${branch}`, t.number);
+  }
+
+  /**
+   * #40: stop every agent this run still has in flight — called on graceful
+   *  exit (try/finally) and on signal/crash exit (SIGINT/SIGTERM,
+   *  uncaughtException, unhandledRejection) so a stopped or crashed run doesn't
+   *  orphan running agents on the worktree. Best-effort and never throws: a
+   *  per-ticket stop failure doesn't skip the rest, and a stop of an
+   *  already-stopped / never-started agent is a no-op. Worktrees are left
+   *  intact (cleaned at the next step's cleanBranch, or harmless on resume) —
+   *  this is the agent-only half of cleanup; {@link abort} does stop+clean for
+   *  the cascade-doomed path. Snapshots the iterable so a concurrent settle
+   *  mutating the caller's Set can't corrupt the iteration.
+   */
+  async stopInFlight(ticketNumbers: Iterable<number>): Promise<void> {
+    for (const n of [...ticketNumbers]) {
+      try {
+        await this.stopAgent(n);
+      } catch {
+        /* best-effort: keep going so one bad stop doesn't leak the rest */
+      }
+    }
   }
 
   /**
