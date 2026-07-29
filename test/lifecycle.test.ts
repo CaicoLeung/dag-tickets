@@ -65,6 +65,8 @@ class FakeAgent implements AgentPort {
 /** Recording PullRequestPort. createPr returns 1000+N; watchChecks returns scripted state. */
 class FakePullRequest implements PullRequestPort {
   prs: CreatePrOpts[] = [];
+  /** Heads force-pushed via pushHead (e.g. to update an open PR after a rebase). */
+  pushedHeads: string[] = [];
   merged: number[] = [];
   strategies: MergeStrategy[] = [];
   closed: number[] = [];
@@ -72,6 +74,9 @@ class FakePullRequest implements PullRequestPort {
   async createPr(opts: CreatePrOpts): Promise<number> {
     this.prs.push(opts);
     return 1000 + this.prs.length;
+  }
+  async pushHead(head: string): Promise<void> {
+    this.pushedHeads.push(head);
   }
   async watchChecks(): Promise<CheckResult> {
     return this.checks;
@@ -562,7 +567,7 @@ describe("implement lifecycle — failure reason classification (issue #21)", ()
 // ---------------------------------------------------------------------------
 
 describe("implement lifecycle — #29 overlap", () => {
-  test("overlap: branches off blockerHead, reconciles before PR, marks head pushed", async () => {
+  test("overlap: branches off blockerHead, opens PR then reconciles + force-pushes, marks head pushed", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
     const reconciled: Array<{ sha: string; base: string }> = [];
@@ -576,6 +581,7 @@ describe("implement lifecycle — #29 overlap", () => {
       blockerHead: "origin/loop/1-foo",
       blockerTipSha: "abc123",
     };
+    const branch = "loop/2-do-the-thing";
     const out = await processTicket(
       ticket(2),
       ctx(agent, repo, { markHeadPushed: (n) => pushed.push(n) }),
@@ -585,15 +591,20 @@ describe("implement lifecycle — #29 overlap", () => {
     // implement + review branched/diffed off the blocker head, not "main".
     expect(agent.implementBase).toBe("origin/loop/1-foo");
     expect(agent.reviewBase).toBe("origin/loop/1-foo");
-    // reconcile fired before the PR with the captured tip + integration base.
-    expect(reconciled).toEqual([{ sha: "abc123", base: "main" }]);
-    // PR opened against the integration base (post-rebase).
+    // PR opened against the integration base.
     expect(repo.prs[0]?.base).toBe("main");
+    // reconcile fired AFTER the PR (createPr is blocker-independent — see #42)
+    // with the captured tip + integration base.
+    expect(reconciled).toEqual([{ sha: "abc123", base: "main" }]);
+    // the rebased branch was force-pushed so the open PR reflects the reconcile.
+    expect(repo.pushedHeads).toEqual([branch]);
     // head-pushed signal fired so this ticket's own dependents can overlap on it.
     expect(pushed).toEqual([2]);
   });
 
-  test("overlap: a conflicting reconcile fails the dependent (overlap-rebase), no PR", async () => {
+  test("overlap: a conflicting reconcile fails the dependent (overlap-rebase), PR left open (#42)", async () => {
+    // createPr now fires BEFORE reconcile (#42), so a failing reconcile leaves
+    // the already-open PR for a human rather than never having opened one.
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
     agent.reconcile = async () => ({ ok: false, reason: "overlap-rebase" });
@@ -605,10 +616,11 @@ describe("implement lifecycle — #29 overlap", () => {
     const out = await processTicket(ticket(2), ctx(agent, repo), overlap);
     expect(out.status).toBe("failed");
     expect(out.reason).toBe("overlap-rebase");
-    expect(repo.prs).toHaveLength(0); // no PR after a failed reconcile
+    expect(repo.prs).toHaveLength(1); // PR was opened before reconcile failed.
+    expect(out.pr).toBe(1001);
   });
 
-  test("overlap: a stale-base reconcile fails the dependent (stale-base)", async () => {
+  test("overlap: a stale-base reconcile fails the dependent (stale-base), PR left open (#42)", async () => {
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
     agent.reconcile = async () => ({ ok: false, reason: "stale-base" });
@@ -620,6 +632,8 @@ describe("implement lifecycle — #29 overlap", () => {
     const out = await processTicket(ticket(2), ctx(agent, repo), overlap);
     expect(out.status).toBe("failed");
     expect(out.reason).toBe("stale-base");
+    expect(repo.prs).toHaveLength(1); // PR was opened before reconcile failed.
+    expect(out.pr).toBe(1001);
   });
 
   test("no overlap → no reconcile call, base is the integration branch", async () => {
@@ -649,7 +663,10 @@ describe("implement lifecycle — #29 overlap", () => {
     expect(rec?.data).toMatchObject({ ok: true, onto: "main", from: "abc123" });
   });
 
-  test("overlap: createPr is gated on waitForBlockers(blockers) before reconcile", async () => {
+  test("overlap: waitForBlockers gates reconcile (not createPr) and is called with the blockers (#42)", async () => {
+    // createPr fires BEFORE the blocker gate; the gate still runs (with the
+    // dependent's blockers) to gate the downstream reconcile + CI/merge, which
+    // genuinely need the blocker merged. Pre-#42 createPr parked here too.
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
     agent.reconcile = async () => ({ ok: true });
@@ -670,13 +687,46 @@ describe("implement lifecycle — #29 overlap", () => {
       } }),
       overlap,
     );
-    // createPr hasn't run yet (gate unresolved), but the gate was called with the blockers.
+    // createPr already fired (gate unresolved) — PR creation is blocker-independent.
     await new Promise((r) => setTimeout(r, 0));
-    expect(repo.prs).toHaveLength(0);
+    expect(repo.prs).toHaveLength(1);
+    // the gate was called with the dependent's blockers.
     expect(waitedFor).toEqual([[1, 2]]);
+    // reconcile + force-push have NOT run yet (gate unresolved).
+    expect(repo.pushedHeads).toHaveLength(0);
     resolveGate();
     const out = await running;
     expect(out.status).toBe("done");
+    // after the gate, the rebased branch was force-pushed onto the open PR.
+    expect(repo.pushedHeads).toHaveLength(1);
+  });
+
+  test("#42: createPr fires while a blocker's agent is still in flight — PR creation is not serialized behind it", async () => {
+    // The reported bug: an overlap-dependent logged "review clean; opening PR"
+    // then froze there for 10+ minutes because createPr was awaited behind
+    // waitForBlockers, which blocks on the blocker's in-flight agent. createPr
+    // is a local subprocess (gh pr create / git push) and must fire as soon as
+    // the dependent's own work is done, independent of the blocker's agent.
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const t = ticket(2);
+    t.blockedBy = [1];
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
+    // A blocker agent that never settles on its own (stuck) — the gate only
+    // resolves because the test releases it.
+    const gate = new Promise<void>(() => {});
+    const running = processTicket(
+      t,
+      ctx(agent, repo, { waitForBlockers: async () => gate }),
+      overlap,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    // createPr fired even though the blocker is still in flight.
     expect(repo.prs).toHaveLength(1);
+    expect(repo.pushedHeads).toHaveLength(0); // reconcile/push gated on the blocker
+    // Don't await `running`: the never-resolving gate would hang the test. The
+    // assertion above is the contract — createPr is independent of the gate.
   });
 });

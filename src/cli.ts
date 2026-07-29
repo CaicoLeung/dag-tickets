@@ -454,8 +454,11 @@ function stateFromOutcome(
  * field + closure per overlap reason. Three concerns, one home:
  *  - `pushedHeads`: admits a dependent once its blocker has pushed its head
  *    (createPr ran) — the canOverlap policy reads it.
- *  - `settled` + `waiters`: gate an overlap-dependent's createPr on its blocker
- *    merging (no premature PR); seeded from resume sets so a dependent
+ *  - `settled` + `waiters`: gate an overlap-dependent's post-createPr
+ *    reconcile on its blocker merging so the rebase lands on the merged base
+ *    (#42: createPr itself is no longer gated — it fires as soon as the
+ *    dependent's own work is done, so a stuck blocker agent can't freeze the
+ *    cursor at "opening PR"); seeded from resume sets so a dependent
  *    overlapping an already-done blocker resolves immediately.
  * Exposed as the slim RunContext hooks (markHeadPushed / waitForBlockers) plus
  * the scheduler's canOverlap policy; main() wires them, this class owns them.
@@ -481,9 +484,11 @@ class OverlapCoordinator {
     this.pushedHeads.add(n);
   };
 
-  /** RunContext hook: gate createPr on every blocker settling. Overlap can't
-   *  trigger at concurrency 1, so a blocker always holds its own slot while a
-   *  dependent waits here — no deadlock. */
+  /** RunContext hook: gate the overlap reconcile (NOT createPr — #42) on every
+   *  blocker settling. createPr fires before this; the wait gates only the
+   *  downstream rebase/CI/merge, which genuinely need the blocker merged.
+   *  Overlap can't trigger at concurrency 1, so a blocker always holds its own
+   *  slot while a dependent waits here — no deadlock. */
   readonly waitForBlockers = async (blockers: number[]): Promise<void> => {
     await Promise.all(blockers.map((b) => this.awaitOne(b)));
   };
@@ -816,7 +821,7 @@ export async function main(argv: string[]): Promise<number> {
       },
       onSettle: async (n, status, reason) => {
         // #29: this ticket settled — release any overlap-dependent waiting in
-        // its pre-createPr gate (waitForBlockers). Recorded before state persist
+        // its pre-reconcile gate (waitForBlockers). Recorded before state persist
         // so a dependent resumed after a kill sees the blocker as settled too.
         overlap.noteSettled(n);
         // A cascade-abort `reason` is persisted on its own field (not overloaded

@@ -706,8 +706,9 @@ export class PaseoAgent implements AgentPort {
    * {@link abort} — a missing worktree (lost race) is a clean success.
    *
    * Operational note: rebasing the branch checked out in a worktree while its
-   * agent is mid-dispatch is racy. The safe wiring is the pull model — call
-   * this at the dependent's create-Pr boundary (between dispatches), not mid-run.
+   * agent is mid-dispatch is racy. The safe wiring is between dispatches — the
+   * lifecycle calls this AFTER createPr (#42: createPr is blocker-independent)
+   * and before watchChecks/mergePr, never mid-run.
    */
   async reconcile(t: Ticket, blockerTipSha: string, base: string): Promise<ReconcileResult> {
     const branch = branchFor(t.number, t.title);

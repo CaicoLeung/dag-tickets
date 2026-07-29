@@ -30,9 +30,10 @@ export interface RunContext {
    *  overlap on it. Optional — absent in tests / when overlap is disabled. */
   markHeadPushed?: (n: number) => void;
   /** #29: resolve once every blocker in `blockers` has settled (done/failed/
-   *  skipped). Gates an overlapped dependent's createPr on its blocker merging
-   *  so reconcile lands on the merged base (no premature PR). Absent in tests /
-   *  when overlap is disabled. */
+   *  skipped). #42: this gates the overlap RECONCILE (the rebase onto the
+   *  merged base + the downstream CI/merge), NOT createPr — createPr fires
+   *  before this wait so a stuck blocker agent can't freeze PR creation.
+   *  Absent in tests / when overlap is disabled. */
   waitForBlockers?: (blockers: number[]) => Promise<void>;
 }
 
@@ -168,41 +169,13 @@ async function runImplementLifecycle(
   }
   ctx.log("ok", "review clean; opening PR", t.number);
 
-  // #29: gate createPr on all blockers settling — an overlapped dependent must
-  // not open its PR until its blocker has merged (so the reconcile below lands
-  // on the merged base). A strict launch's blockers are already done → no-op.
-  // Overlap can't trigger at concurrency 1, so this can't deadlock: the
-  // blocker always holds its own concurrency slot while the dependent waits.
-  if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
-
-  // #29 (pull-model reconcile): before opening a PR, land an overlapped
-  // dependent onto the merged integration base. Safe here — between dispatches,
-  // not mid-run. A conflicting/stale rebase fails the dependent (no PR opened).
-  if (overlap && ctx.agent.reconcile) {
-    const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
-    if (!rec.ok) {
-      // One reason, used in the event payload, the persisted FailureReason,
-      // and the human error message — formerly three separate
-      // `rec.reason ?? …` reads that drifted (the error said "unknown" while
-      // the reason said "overlap-rebase"). Default matches the failure type.
-      const reason = rec.reason ?? "overlap-rebase";
-      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, { ok: false, reason, onto: ctx.baseBranch });
-      return fail(
-        t,
-        ctx,
-        { reason, error: `overlap reconcile failed (${reason})` },
-        branch,
-      );
-    }
-    ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
-      ok: true,
-      onto: ctx.baseBranch,
-      from: overlap.blockerTipSha,
-    });
-    ctx.log("ok", `overlap reconcile landed ${branch} onto ${ctx.baseBranch}`, t.number);
-  }
-
-  // 3. PR.
+  // 3. PR — opened FIRST (#42). `gh pr create` / `git push` are local
+  // subprocesses; they must not serialize behind another ticket's in-flight
+  // agent. Pre-#42 an overlapped dependent parked here at `waitForBlockers`
+  // (below), so a stuck blocker agent froze the cursor at "opening PR" for the
+  // blocker's whole lifecycle even though the dependent's own work was done.
+  // Now the PR opens immediately; the overlap reconcile (which genuinely needs
+  // the blocker merged) runs AFTER, updating the open PR via a force-push.
   const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
@@ -214,6 +187,52 @@ async function runImplementLifecycle(
   // overlap on it (the cli's canOverlap policy reads this signal).
   ctx.markHeadPushed?.(t.number);
   ctx.log("ok", `PR #${pr} opened`, t.number);
+
+  // #29 + #42: an overlapped dependent composes on its blocker's UNMERGED head,
+  // so its branch carries the blocker's commits. Before CI/merge it must rebase
+  // onto the merged integration base. That rebase needs the blocker merged, so
+  // the wait lives HERE — after createPr (now blocker-independent) but before
+  // watchChecks/mergePr (which must run on the reconciled branch). A stuck
+  // blocker no longer blocks the PR OPENING; it blocks only the downstream
+  // CI/merge, which genuinely depend on the blocker's code. A strict launch's
+  // blockers are already done → the wait is a no-op. Overlap can't trigger at
+  // concurrency 1, so this can't deadlock: the blocker always holds its own
+  // concurrency slot while the dependent waits.
+  if (overlap) {
+    if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
+
+    // #29 (pull→push-model reconcile): land the dependent onto the merged base.
+    // Safe here — between dispatches, not mid-run. The rebase lands in the
+    // worktree; `pushHead` then force-pushes it so the PR opened above (from
+    // the pre-rebase branch) now points at the reconciled commits. A
+    // conflicting/stale rebase fails the dependent; the already-open PR is
+    // left for a human (createPr already fired — it is not un-run).
+    if (ctx.agent.reconcile) {
+      const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
+      if (!rec.ok) {
+        // One reason, used in the event payload, the persisted FailureReason,
+        // and the human error message — formerly three separate
+        // `rec.reason ?? …` reads that drifted (the error said "unknown" while
+        // the reason said "overlap-rebase"). Default matches the failure type.
+        const reason = rec.reason ?? "overlap-rebase";
+        ctx.events.emit(EVT.TICKET_RECONCILE, t.number, { ok: false, reason, onto: ctx.baseBranch });
+        return fail(
+          t,
+          ctx,
+          { reason, error: `overlap reconcile failed (${reason})` },
+          branch,
+          pr,
+        );
+      }
+      await ctx.pullRequest.pushHead(branch);
+      ctx.events.emit(EVT.TICKET_RECONCILE, t.number, {
+        ok: true,
+        onto: ctx.baseBranch,
+        from: overlap.blockerTipSha,
+      });
+      ctx.log("ok", `overlap reconcile landed ${branch} onto ${ctx.baseBranch}`, t.number);
+    }
+  }
 
   // 4. CI gate.
   const checks = await ctx.pullRequest.watchChecks(pr);

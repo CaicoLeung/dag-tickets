@@ -331,7 +331,7 @@ export async function runBatch(
       if (ready.length === 0) break;
       const n = ready[0]!;
       // #29: capture the single blocker n overlapped (if any) so the caller can
-      // branch off its head + capture its tip for the pull-model reconcile.
+      // branch off its head + capture its tip for the post-createPr reconcile.
       // overlapBlockerFor returns undefined for fan-in (>1 in-flight blocker),
       // so a multi-blocker dependent never overlap-launches on just one head —
       // matching frontier's ready decision exactly (shared helper).
@@ -354,9 +354,11 @@ export async function runBatch(
     } else if (settled.status === "done") {
       completed.add(settled.number);
       // Reconcile of an overlapped dependent onto its just-merged blocker is
-      // the lifecycle's job (pull model: between dispatches, before createPr —
-      // see lifecycle.ts). A push-model fire here would race a live agent
-      // worktree, so the scheduler does NOT touch overlap branches on settle.
+      // the lifecycle's job (between dispatches, after createPr — see
+      // lifecycle.ts). createPr itself is blocker-independent (#42), so the
+      // reconcile runs once the dependent has already opened its PR. A
+      // push-model fire here would race a live agent worktree, so the
+      // scheduler does NOT touch overlap branches on settle.
     } else {
       // failed — cascade to not-yet-started dependents only.
       failed.add(settled.number);

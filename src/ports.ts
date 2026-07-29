@@ -282,6 +282,17 @@ export function remoteRef(base: string): string {
 export interface PullRequestPort {
   /** Create a PR for the pushed head branch. Returns the PR number. */
   createPr(opts: CreatePrOpts): Promise<number>;
+  /**
+   * Force-push `head` to the remote (#42). Used to update an already-open PR
+   * after its branch was rebased post-create — e.g. an overlap-dependent
+   * opens its PR as soon as its own work is done (createPr is a local
+   * subprocess, not serialized behind the blocker's agent), THEN waits for
+   * its blocker to merge and rebases onto the merged base; this push lands
+   * the rebased commits on the PR so CI/merge run on the reconciled branch.
+   * Like {@link createPr}'s internal push, it force-pushes `head:head` so a
+   * rebased history overwrites the pre-rebase tip the PR was opened from.
+   */
+  pushHead(head: string): Promise<void>;
   /** Wait for PR checks to finish, then report pass/fail/none. */
   watchChecks(prNumber: number): Promise<CheckResult>;
   /** Merge a PR with the given strategy. */

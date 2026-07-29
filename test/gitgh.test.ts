@@ -229,3 +229,60 @@ describe("ShellPullRequest.mergePr (#38)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// ShellPullRequest.pushHead (#42): force-push a head branch so an open PR
+// reflects a rebase that landed AFTER createPr. The overlap-dependent opens
+// its PR as soon as its own work is done (createPr is blocker-independent),
+// then rebases onto the merged base; pushHead lands the rebased commits.
+// ---------------------------------------------------------------------------
+
+describe("ShellPullRequest.pushHead (#42)", () => {
+  test("force-pushes a rewritten branch tip onto the remote", async () => {
+    const tmp = await mkdtemp(join(tmpdir(), "dag-push-"));
+    const origin = join(tmp, "origin.git");
+    const work = join(tmp, "work");
+    const g = (args: string[], cwd?: string) =>
+      run(["git", ...args], {
+        cwd,
+        env: {
+          GIT_AUTHOR_NAME: "t",
+          GIT_AUTHOR_EMAIL: "t@t",
+          GIT_COMMITTER_NAME: "t",
+          GIT_COMMITTER_EMAIL: "t@t",
+        },
+      });
+
+    // Bare origin + a clone with the head branch pushed once (the state the
+    // PR was opened from — pre-rebase).
+    await g(["init", "--bare", origin]);
+    await g(["clone", "--quiet", origin, work]);
+    await writeFile(join(work, "a.txt"), "x");
+    await g(["add", "-A"], work);
+    await g(["commit", "--quiet", "-m", "init"], work);
+    await g(["branch", "loop/42-foo"], work);
+    await g(["checkout", "--quiet", "loop/42-foo"], work);
+    await g(["push", "--quiet", "-u", "origin", "loop/42-foo"], work);
+    const beforeTip = (await g(["rev-parse", "loop/42-foo"], work)).stdout.trim();
+
+    // Rewrite the branch tip locally (a rebase / amend diverges it from the
+    // remote — a normal push would be rejected; only a force-push lands).
+    await writeFile(join(work, "a.txt"), "rebased");
+    await g(["add", "-A"], work);
+    await g(["commit", "--quiet", "--amend", "-m", "rebased"], work);
+    const localTip = (await g(["rev-parse", "loop/42-foo"], work)).stdout.trim();
+    expect(localTip).not.toBe(beforeTip); // sanity: the rewrite diverged
+
+    // A plain push is rejected (non-fast-forward) — proves force is needed.
+    const rejected = await g(["push", "--quiet", "origin", "loop/42-foo"], work);
+    expect(rejected.ok).toBe(false);
+
+    // pushHead force-pushes the rewritten branch onto the remote.
+    const pr = new ShellPullRequest(work);
+    await expect(pr.pushHead("loop/42-foo")).resolves.toBeUndefined();
+
+    // The remote now holds the rewritten tip (force-updated).
+    const remoteTip = (await g(["--git-dir", origin, "rev-parse", "loop/42-foo"])).stdout.trim();
+    expect(remoteTip).toBe(localTip);
+  });
+});
