@@ -19,7 +19,7 @@ _Avoid_: status, triage label (ambiguous — see below)
 In `config.ts` this means specifically the `needs-triage` state — the trigger for `/triage`. In `triage-labels.md` it loosely means any triage role. Prefer the precise **state role** / **category role** terms and reserve "triage label" for the `needs-triage` trigger.
 
 **Orphan**:
-An open issue that carries a category role but no state role (e.g. `[bug]` with no state). Per the canonical model these are the same bucket as unlabeled issues and should be triaged. Until the routing fix lands they fall through to `unknown` and are skipped.
+An open issue that carries a category role but no state role (e.g. `[bug]` with no state). Per the canonical model these are the same bucket as unlabeled issues and should be triaged. The driver extends the "unlabeled → needs-triage" rule to them: an orphan routes to `/triage`, never to `unknown`. (Without this rescue they would fall through to `unknown` and be skipped — the original behaviour that left `[bug]`-only issues unrouted.)
 
 **Routing**:
 The CLI's label → skill dispatch: `ready-for-agent` → `/implement`, `needs-triage` (+ orphans) → `/triage`, research labels → `/research`. Batch and unattended — distinct from `/triage` the skill, which is interactive and maintainer-in-the-loop.

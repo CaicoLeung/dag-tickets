@@ -48,7 +48,10 @@ export function resolveKind(labels: string[], cfg: RoutingConfig = DEFAULT_ROUTI
   if (has(cfg.researchLabels)) return "research";
   if (has(cfg.skipLabels)) return "skip";
   // Orphan: a category role with no state role -> triage it (it needs a state).
-  if (has(cfg.categoryLabels) && !has([...cfg.implementLabels, ...cfg.triageLabels, ...cfg.skipLabels])) return "triage";
+  // Unreachable for any state role: implement/triage/research/skip all return
+  // above, so reaching here already proves no state role is present. We only
+  // need to ask whether a category role is present at all.
+  if (has(cfg.categoryLabels)) return "triage";
   return "unknown";
 }
 

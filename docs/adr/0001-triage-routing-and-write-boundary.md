@@ -1,6 +1,6 @@
 # Triage routing keys on state (and stateless category); unattended writes stop short of close/wontfix
 
-**Status**: proposed
+**Status**: accepted
 
 The CLI dispatches issues to skills by label. mattpocock/skills defines seven
 triage roles — two **category** (`bug`, `enhancement`) and five **state**

@@ -13,9 +13,10 @@ describe("resolveKind — seven-role routing (ADR-0001)", () => {
     expect(k(["research"])).toBe("research");
   });
 
-  test("orphan: a category role with no state role is triaged (Q1=C)", () => {
+  test("orphan: a category role with no state role is triaged", () => {
     expect(k(["bug"])).toBe("triage");
-    // bug and enhancement are symmetric (Q5) — both are category roles.
+    // bug and enhancement are both category roles, so both are orphans when
+    // they appear without a state role.
     expect(k(["enhancement"])).toBe("triage");
   });
 
@@ -30,7 +31,7 @@ describe("resolveKind — seven-role routing (ADR-0001)", () => {
     expect(k(["wontfix"])).toBe("skip");
   });
 
-  test("category + needs-info is NOT re-triaged (Q3=B: needs-info stays manual)", () => {
+  test("category + needs-info is NOT re-triaged (needs-info stays manual)", () => {
     expect(k(["bug", "needs-info"])).toBe("skip");
     expect(k(["bug", "wontfix"])).toBe("skip");
   });
