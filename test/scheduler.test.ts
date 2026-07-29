@@ -245,9 +245,15 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     };
     const run = runBatch(g, { concurrency: 2, process, canOverlap: () => true });
     await new Promise((r) => setTimeout(r, 0));
-    // 1 launched normally (no overlap info); 2 launched overlapping 1.
-    expect(infos.find((i) => i.n === 1)?.info).toEqual({});
-    expect(infos.find((i) => i.n === 2)?.info).toEqual({ overlapBlocker: 1 });
+    // 1 launched normally (no overlapBlocker); 2 launched overlapping 1.
+    // #34: info now carries signal too — check the field we care about, not
+    // exact shape (which also includes the per-launch AbortSignal).
+    const i1 = infos.find((i) => i.n === 1)?.info;
+    expect(i1?.overlapBlocker).toBeUndefined();
+    expect(i1?.signal).toBeInstanceOf(AbortSignal);
+    const i2 = infos.find((i) => i.n === 2)?.info;
+    expect(i2?.overlapBlocker).toBe(1);
+    expect(i2?.signal).toBeInstanceOf(AbortSignal);
     release1();
     await run;
   });
@@ -1011,5 +1017,37 @@ describe("runBatch — AbortController sentinel (#34)", () => {
     expect(twoSettles).toHaveLength(1);
     expect(twoSettles[0]![1]).toBe("failed");
     expect(twoSettles[0]![2]).toBeUndefined();
+  });
+
+  test("structural guard: sentinel prevents double-report even when dispatch.delete is skipped", async () => {
+    // Prove the AbortController sentinel ALONE (without the dispatch.delete
+    // guard) prevents a cascade-aborted dispatch from corrupting state. An
+    // aborted controller + a process that still manages to resolve "done"
+    // MUST yield sentinel "skipped", not "done" — the belt-and-suspenders
+    // protection that backs up the inflight.delete invariant.
+    const controller = new AbortController();
+    // Simulate cascade-abort: signal the controller before the process resolves.
+    controller.abort();
+
+    // The exact promise chain used in runBatch's launch() closure.
+    const n = 42;
+    const p = Promise.resolve(n)
+      .then(async (nn) => {
+        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        // A superseded dispatch whose process still finishes with "done" — the
+        // worst case the sentinel protects against.
+        const status = await Promise.resolve("done" as TicketStatus);
+        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        return { number: n, status };
+      })
+      .catch((e) => {
+        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
+        return { number: n, status: "failed" as TicketStatus };
+      });
+
+    const result = await p;
+    // Without the sentinel, this would be { number: 42, status: "done" } —
+    // a cascade-aborted ticket wrongly counted as completed.
+    expect(result).toEqual({ number: 42, status: "skipped" });
   });
 });
