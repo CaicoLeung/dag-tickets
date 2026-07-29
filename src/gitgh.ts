@@ -278,9 +278,13 @@ export class ShellPullRequest implements PullRequestPort {
   ) {}
 
   /** Push the head branch and open a PR for it. Returns the PR number.
-   *  Force-pushes so a stale remote branch from a prior batch is overwritten. */
+   *
+   *  Delegates the push to {@link guardedPushHead}, which keeps the
+   *  force-push for a fresh / fast-forwardable / tracked-re-attempt head but
+   *  refuses to clobber a divergent remote head that no open PR tracks — see
+   *  #32. */
   async createPr(opts: CreatePrOpts): Promise<number> {
-    await run(["git", "push", "-u", "--force", "origin", `${opts.head}:${opts.head}`], { cwd: this.cwd });
+    await this.guardedPushHead(opts.head);
     const args = [
       "gh",
       "pr",
@@ -300,6 +304,102 @@ export class ShellPullRequest implements PullRequestPort {
     const m = r.stdout.match(/\/pull\/(\d+)/) ?? r.stderr.match(/\/pull\/(\d+)/);
     if (!m) throw new Error(`could not parse PR number from gh output: ${r.stdout}\n${r.stderr}`);
     return parseInt(m[1]!, 10);
+  }
+
+  /** Push the head branch with a divergence guard (#32).
+   *
+   *  A plain force-push silently clobbered a remote `loop/<n>-<slug>` that had
+   *  diverged from an unexpected source (a human push to the same branch, or
+   *  unmerged work from a run before the repo-wide lock existed). The guard
+   *  refuses such a clobber — but only when the divergence is genuinely
+   *  unexpected, because the force-push is still the right call for the cases
+   *  the `--force` was added for:
+   *   - absent remote head, or a stale-behind head that is an ancestor of the
+   *     local head (fast-forwardable) → nothing unexpected, force-push;
+   *   - a divergent head that an OPEN PR still tracks → this is one of our own
+   *     re-attempts (a transient retry within the run, a resumed run, or a
+   *     prior batch's pushed-but-unmerged branch) → force-push, exactly as the
+   *     `--force` was intended ("overwriting a stale remote branch from a prior
+   *     batch").
+   *
+   *  That open-PR signal is what makes fail-fast feasible at all: a retry
+   *  re-implements off the integration base, so its second attempt's history
+   *  DIVERGES from the first attempt's push in exactly the same shape as a
+   *  foreign push. Topology alone can't tell them apart, but a tracked
+   *  re-attempt always leaves an open PR on the head (createPr opens one every
+   *  attempt), whereas a human push / orphaned branch does not. So:
+   *   - divergent + NO open PR (gh confirmed) → fail fast with a clear message;
+   *   - divergent + open PR → force-push our own stale branch;
+   *   - divergent + `gh pr list` itself failed (network/flake) → best-effort
+   *     force-push but make it NON-silent (stderr warning naming the overwritten
+   *     tip) so a real foreign push is never swallowed — the fetch and the PR
+   *     lookup are both best-effort, so the guard only adds safety and never
+   *     blocks a genuinely fresh push. */
+  private async guardedPushHead(head: string): Promise<void> {
+    const bare = normalizeBase(head);
+    // Force-update the remote-tracking ref so a force-pushed / rebased remote
+    // head still lands instead of being read as stale.
+    await run(["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`], { cwd: this.cwd });
+    const tip = await run(
+      ["git", "rev-parse", "--verify", "--quiet", `origin/${bare}`],
+      { cwd: this.cwd },
+    );
+    const remoteSha = tip.ok ? tip.stdout.trim() : "";
+    if (remoteSha) {
+      // Fast-forwardable iff origin/<head> is an ancestor of the local head.
+      // merge-base --is-ancestor exits 0 (ancestor), 1 (not), other on error.
+      const anc = await run(
+        ["git", "merge-base", "--is-ancestor", `origin/${bare}`, head],
+        { cwd: this.cwd },
+      );
+      if (!anc.ok) {
+        // Diverged. Decide whether it is our own tracked re-attempt or an
+        // unexpected source before force-pushing.
+        const open = await this.headHasOpenPr(head);
+        if (open === "no") {
+          throw new Error(
+            `refusing to force-push ${head}: origin/${bare} has diverged from ` +
+              `local ${head} and no open PR tracks it, so a force-push would ` +
+              `silently clobber unexpected remote history (remote tip ${remoteSha}). ` +
+              `Inspect with \`git log --oneline origin/${bare}..${head}\` and ` +
+              `resolve manually (rebase, or delete the remote branch if it is ` +
+              `stale) before retrying.`,
+          );
+        }
+        if (open === "unknown") {
+          // gh pr list failed (network/flake): can't confirm the divergence is
+          // our own. Best-effort allow (don't block legitimate retries on a gh
+          // outage) but surface it so a real foreign push isn't swallowed.
+          process.stderr.write(
+            `[dag-tickets] WARNING: force-pushing ${head} over a divergent ` +
+              `origin/${bare} (tip ${remoteSha}); could not confirm an open PR ` +
+              `(gh pr list failed) — verify this overwrite is expected.\n`,
+          );
+        }
+        // open === "yes" → a tracked re-attempt: overwrite our own stale branch
+        //   silently, as the force-push was designed for.
+      }
+    }
+    await run(["git", "push", "-u", "--force", "origin", `${head}:${head}`], { cwd: this.cwd });
+  }
+
+  /** Whether an OPEN PR tracks `head`, for {@link guardedPushHead}'s divergence
+   *  decision (#32). Returns "yes" | "no" when `gh pr list` answers
+   *  definitively, or "unknown" on any failure (non-zero exit / malformed JSON)
+   *  so the caller can fall back safely — the lookup is best-effort, mirroring
+   *  the divergence fetch. */
+  private async headHasOpenPr(head: string): Promise<"yes" | "no" | "unknown"> {
+    const r = await run(
+      ["gh", "pr", "list", "--head", head, "--state", "open", "--json", "number", "--limit", "1"],
+      { cwd: this.cwd },
+    );
+    if (!r.ok) return "unknown";
+    try {
+      const arr = JSON.parse(r.stdout) as unknown;
+      return Array.isArray(arr) && arr.length > 0 ? "yes" : "no";
+    } catch {
+      return "unknown";
+    }
   }
 
   /**
