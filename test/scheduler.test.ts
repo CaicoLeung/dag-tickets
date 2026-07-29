@@ -921,3 +921,95 @@ describe("runBatch — transient retry integration (issue #21)", () => {
     expect(one.some((e) => e.type === EVT.TICKET_CASCADE)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #34 — AbortController sentinel prevents double-report on cascade-abort.
+//
+// Each dispatch is paired with an AbortController. On cascade-abort the
+// controller is signalled BEFORE the plan is applied, so the dispatch promise
+// resolves to a harmless "skipped" sentinel instead of staying pending forever.
+// Even without the inflight.delete() guard, the sentinel can't corrupt state
+// (Set.add of an already-present number is a no-op, and the settle-path guard
+// skips removed entries). Together they form belt-and-suspenders protection
+// against double-reporting — a future edit that forgets the delete won't
+// silently move a cascade-skipped ticket into completed.
+// ---------------------------------------------------------------------------
+
+describe("runBatch — AbortController sentinel (#34)", () => {
+  test("cascade-aborted dispatch resolves to sentinel, not double-reported when process finishes after abort", async () => {
+    // 1 → 2 with overlap. Hold both in flight via gates. Fail 1 → cascade-
+    // abort 2. The abort hook releases 2's gate, causing its process to finish
+    // with "done". The AbortController wrapper converts this to sentinel
+    // "skipped". Verify onSettle fires exactly once for 2 (from the cascade,
+    // not a second time from the sentinel winning a race).
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const gates = new Map<number, () => void>();
+    let fail1 = false;
+    const process = async (n: number): Promise<TicketStatus> => {
+      if (n === 1) {
+        await new Promise<void>((r) => { gates.set(1, r); });
+        return fail1 ? "failed" : "done";
+      }
+      // 2 overlaps 1; gate holds it in flight so it's still running when 1 fails.
+      await new Promise<void>((r) => { gates.set(2, r); });
+      // Returns "done" — would corrupt state if sentinel didn't catch it.
+      return "done";
+    };
+    const settled: Array<[number, TicketStatus, string?]> = [];
+    const aborted: number[] = [];
+    const run = runBatch(g, {
+      concurrency: 2,
+      process,
+      canOverlap: () => true,
+      abort: async (n) => {
+        aborted.push(n);
+        gates.get(n)?.(); // release the gate so process can finish
+      },
+      onSettle: (n, s, r) => settled.push([n, s, r]),
+    });
+    // Flush microtasks: both 1 and 2 (overlap) are in flight.
+    await new Promise((r) => setTimeout(r, 0));
+    // Fail 1 → cascade-abort 2.
+    fail1 = true;
+    gates.get(1)!();
+    const out = await run;
+
+    // Abort hook was called for 2.
+    expect(aborted).toEqual([2]);
+    // 2 was cascade-aborted once; its later process finish must not double-settle.
+    const twoSettles = settled.filter((e) => e[0] === 2);
+    expect(twoSettles).toHaveLength(1);
+    expect(twoSettles[0]![1]).toBe("skipped");
+    expect(twoSettles[0]![2]).toBe("cascade-abort");
+    // Final state: 1 failed, 2 skipped (NOT completed/double-reported).
+    expect(out.failed).toEqual([1]);
+    expect(out.skipped).toEqual([2]);
+    expect(out.completed).toEqual([]);
+  });
+
+  test("without abort hook, mark path still cascades and controller is cleaned up via settle path", async () => {
+    // 1 fails synchronously; 2 depends on 1. Without overlap, 2 never enters
+    // inflight before 1 settles → mark path (not abort). The controller for
+    // 1 is cleaned up in the normal settle path.
+    const g = buildGraph([ticket(1), ticket(2, [1])]);
+    const settled: Array<[number, TicketStatus, string?]> = [];
+    const out = await runBatch(g, {
+      concurrency: 2,
+      process: makeFake({ 1: "failed" }).process,
+      onSettle: (n, s, r) => settled.push([n, s, r]),
+    });
+    // 1 failed, 2 cascaded via mark path.
+    expect(out.failed).toEqual([1, 2]);
+    expect(out.skipped).toEqual([]);
+    expect(out.completed).toEqual([]);
+    // onSettle: 1 failed (no reason), 2 failed (no reason, mark path).
+    const oneSettles = settled.filter((e) => e[0] === 1);
+    expect(oneSettles).toHaveLength(1);
+    expect(oneSettles[0]![1]).toBe("failed");
+    expect(oneSettles[0]![2]).toBeUndefined();
+    const twoSettles = settled.filter((e) => e[0] === 2);
+    expect(twoSettles).toHaveLength(1);
+    expect(twoSettles[0]![1]).toBe("failed");
+    expect(twoSettles[0]![2]).toBeUndefined();
+  });
+});
