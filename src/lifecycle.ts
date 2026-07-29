@@ -342,6 +342,7 @@ const IMPL_FAIL: Record<ImplFailReason, Failure> = {
   "rate-limited": { reason: "rate-limited", error: "rate-limited, no fallback succeeded" },
   "stale-base": { reason: "stale-base", error: "base ref could not be refreshed (offline?); refusing a stale branch-off" },
   timeout: { reason: "agent-timeout", error: "agent timed out" },
+  "connection-error": { reason: "connection-error", error: "relay connection/stream error (transient)" },
   empty: { reason: "implement-empty", error: "produced no commits (agent may have failed silently)" },
   failed: { reason: "implement-failed", error: "agent failed" },
 };

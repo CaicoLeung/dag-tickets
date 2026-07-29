@@ -18,6 +18,7 @@ describe("isTransient", () => {
       "stale-base",
       "merge-race",
       "agent-timeout",
+      "connection-error",
     ];
     for (const r of transient) expect(isTransient(r)).toBe(true);
   });
@@ -46,7 +47,7 @@ describe("isTransient", () => {
     // deliberate transient/terminal decision — the set is the retry policy's
     // source of truth, so it must be exhaustive over the transient labels.
     expect([...TRANSIENT_REASONS].sort()).toEqual(
-      ["agent-timeout", "ci-failed", "merge-race", "rate-limited", "stale-base"],
+      ["agent-timeout", "ci-failed", "connection-error", "merge-race", "rate-limited", "stale-base"],
     );
   });
 });
@@ -122,6 +123,40 @@ describe("runWithRetry", () => {
       type: EVT.TICKET_RETRY,
       ticket: 7,
       data: { attempt: 2, delayMs: 100, reason: "ci-failed" },
+    });
+  });
+
+  test("connection-error (issue #39) is retried like ci-failed: backoff then success", async () => {
+    // A relay ECONNRESET is transient — paseo auto-recovers in the daemon, so
+    // the ticket backs off and retries instead of cascading immediately as a
+    // hard implement-failed. This is the exact regression the issue fixes.
+    const slept: number[] = [];
+    const sink = new RecordingSink();
+    const scripted = [
+      outcome("failed", "connection-error"), // attempt 1: relay transport blip
+      outcome("done"), // attempt 2: succeeds after daemon recovery
+    ];
+    let i = 0;
+    const out = await runWithRetry(
+      async () => scripted[i++]!,
+      {
+        maxRetries: 3,
+        baseDelayMs: 100,
+        maxDelayMs: 1000,
+        sleep: async (ms) => { slept.push(ms); },
+        random: () => 1,
+        events: sink,
+        ticketNumber: 39,
+      },
+    );
+    expect(out.status).toBe("done");
+    expect(out.attempts).toBe(2);
+    expect(slept).toEqual([100]);
+    expect(sink.events).toHaveLength(1);
+    expect(sink.events[0]).toMatchObject({
+      type: EVT.TICKET_RETRY,
+      ticket: 39,
+      data: { attempt: 2, delayMs: 100, reason: "connection-error" },
     });
   });
 

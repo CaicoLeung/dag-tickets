@@ -147,6 +147,33 @@ import {
       });
     }
 
+    // Connection-error simulation (issue #39): the FIRST implement dispatch
+    // for a ticket in `connectionErrors` writes a relay ECONNRESET to stderr
+    // and exits non-zero — exactly what a real transport blip looks like to
+    // dispatch() (r.ok=false, r.stderr carries the errno). The latch ensures
+    // the backoff-and-retry dispatch proceeds normally: it falls through to
+    // branch materialisation below and exits 0, so the ticket recovers.
+    let connErr = false;
+    if (
+      wtMode === "branch-off" &&
+      skill === "implement" &&
+      num &&
+      Array.isArray(scen.connectionErrors) &&
+      scen.connectionErrors.includes(num)
+    ) {
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.connectionErrorHit = s.connectionErrorHit || {};
+        connErr = !s.connectionErrorHit[String(num)];
+        if (connErr) s.connectionErrorHit[String(num)] = true;
+        await writeJson(STATE, s);
+      });
+      if (connErr) {
+        err("paseo run failed: fetch failed: Error: connect ECONNRESET 203.0.113.10:443\n");
+        exit(1);
+      }
+    }
+
     if (wtMode === "branch-off" && branch && !emptyImpl && !failRun) {
       const baseSha = git(["rev-parse", base]).stdout.trim();
       const tree = baseSha ? git(["rev-parse", `${base}^{tree}`]).stdout.trim() : "";

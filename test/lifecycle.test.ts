@@ -467,6 +467,19 @@ describe("implement lifecycle — failure reason classification (issue #21)", ()
     expect(out.reason).toBe("agent-timeout");
   });
 
+  test("connection-error implement → reason connection-error (transient, issue #39)", async () => {
+    // A relay transport blip (ECONNRESET / stream closed) surfaces from the
+    // adapter as ImplFailReason 'connection-error'; the lifecycle maps it to a
+    // transient FailureReason so the retry wrapper backs off instead of
+    // killing the batch. Mirrors how 'rate-limited' / 'timeout' map.
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "connection-error" };
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("connection-error");
+  });
+
   test("stale-base implement → reason stale-base (transient)", async () => {
     const agent = new FakeAgent();
     agent.impl = { ok: false, commits: 0, reason: "stale-base" };

@@ -79,6 +79,29 @@ export function isRateLimited(output: string): boolean {
 }
 
 /**
+ * Relay/stream transport failure signatures. A transport blip (TCP reset,
+ * dropped SSE stream, undici `fetch failed`, …) makes `paseo run` exit
+ * non-zero even though the paseo daemon auto-recovers the agent. Such a
+ * failure is transient — a backoff-and-retry clears it — so it's classified
+ * distinctly from a hard agent failure (`implement-failed`). Mirrors the
+ * shape of {@link RATE_LIMIT_RE}: a case-insensitive alternation over the
+ * real errno codes / human phrases the relay prints.
+ *
+ * `ETIMEDOUT` (the socket errno) is deliberately NOT matched: it would
+ * conflate with the wall-clock {@link DispatchResult.timedOut} path, which is
+ * already its own transient reason (`agent-timeout`). A genuine connect/read
+ * timeout almost always surfaces as `fetch failed` / `socket hang up` too, so
+ * those aliases still catch it.
+ */
+const CONNECTION_ERROR_RE =
+  /\bECONNRESET\b|\bECONNREFUSED\b|\bEPIPE\b|fetch failed|socket hang up|stream (?:closed|ended|aborted)|connection (?:reset|refused|closed|aborted)/i;
+
+/** Detect a relay/stream transport failure in agent output. */
+export function isConnectionError(output: string): boolean {
+  return CONNECTION_ERROR_RE.test(output);
+}
+
+/**
  * Run one Paseo agent in a fresh worktree. `paseo run --json --new-workspace
  * worktree` creates the worktree + agent and blocks until the agent finishes.
  *
@@ -153,11 +176,20 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
     }
   }
   const rateLimited = isRateLimited(output);
+  // Transport failures (ECONNRESET / fetch failed / stream closed) classically
+  // land on STDERR as an uncaught stack trace, not in the status envelope on
+  // stdout — and on the !r.ok path `output` is stdout only (the JSON/log
+  // polling above is skipped). Scan both streams so a relay blip reported to
+  // stderr is still classified transient instead of falling through to a
+  // terminal `implement-failed` (issue #39). rateLimited stays stdout-only to
+  // avoid widening its (working) detection surface here.
+  const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
   return {
     ok: r.ok && (status === "completed" || status === "idle"),
     output,
     timedOut: r.timedOut,
     rateLimited,
+    connectionError,
   };
 }
 
@@ -445,7 +477,20 @@ export class PaseoAgent implements AgentPort {
       return {
         ok: false,
         commits: 0,
-        reason: r.rateLimited ? "rate-limited" : r.timedOut ? "timeout" : "failed",
+        // Precedence: rate-limit (the fallback loop above owns it) →
+        // connection-error (relay transport blip, transient) → timeout (wall
+        // budget) → failed (terminal catch-all). Rate-limit is checked first
+        // because dispatchWithFallback already retried across providers; a
+        // connection error is checked before timeout so a transport reset that
+        // also burned the clock is labelled by its root cause (both labels are
+        // transient, so the retry decision is unchanged either way).
+        reason: r.rateLimited
+          ? "rate-limited"
+          : r.connectionError
+            ? "connection-error"
+            : r.timedOut
+              ? "timeout"
+              : "failed",
       };
     }
     // A rate-limited or empty agent still "completes" with no diff — count
