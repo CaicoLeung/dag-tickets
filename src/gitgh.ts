@@ -330,11 +330,11 @@ export class ShellPullRequest implements PullRequestPort {
    *  attempt), whereas a human push / orphaned branch does not. So:
    *   - divergent + NO open PR (gh confirmed) → fail fast with a clear message;
    *   - divergent + open PR → force-push our own stale branch;
-   *   - divergent + `gh pr list` itself failed (network/flake) → best-effort
-   *     force-push but make it NON-silent (stderr warning naming the overwritten
-   *     tip) so a real foreign push is never swallowed — the fetch and the PR
-   *     lookup are both best-effort, so the guard only adds safety and never
-   *     blocks a genuinely fresh push. */
+   *   - divergent + `gh pr list` itself failed (network/flake) → fail fast. The
+   *     open-PR signal is the only thing that tells our own re-attempt from a
+   *     foreign push, so when it is unavailable the guard must refuse rather
+   *     than guess — #32's contract is that the run stops instead of rewriting
+   *     history, and a gh outage must not turn a clobber silent. */
   private async guardedPushHead(head: string): Promise<void> {
     const bare = normalizeBase(head);
     // Force-update the remote-tracking ref so a force-pushed / rebased remote
@@ -367,13 +367,21 @@ export class ShellPullRequest implements PullRequestPort {
           );
         }
         if (open === "unknown") {
-          // gh pr list failed (network/flake): can't confirm the divergence is
-          // our own. Best-effort allow (don't block legitimate retries on a gh
-          // outage) but surface it so a real foreign push isn't swallowed.
-          process.stderr.write(
-            `[dag-tickets] WARNING: force-pushing ${head} over a divergent ` +
-              `origin/${bare} (tip ${remoteSha}); could not confirm an open PR ` +
-              `(gh pr list failed) — verify this overwrite is expected.\n`,
+          // gh pr list failed (network/flake): the open-PR signal is the only
+          // thing that tells our own re-attempt from a foreign push, so when it
+          // is unavailable the guard must refuse rather than guess. #32's
+          // contract is that divergence stops the run instead of rewriting
+          // history; a gh outage must not downgrade that to a clobber.
+          throw new Error(
+            `refusing to force-push ${head}: origin/${bare} has diverged from ` +
+              `local ${head} (remote tip ${remoteSha}) and the open-PR check ` +
+              `needed to tell our own re-attempt from a foreign push failed ` +
+              `(\`gh pr list\` exited non-zero or returned malformed output). ` +
+              `Per #32 the run must stop instead of rewriting history. Re-run ` +
+              `once \`gh\` is healthy; if the divergence is genuinely ` +
+              `unexpected, inspect with \`git log --oneline origin/${bare}..${head}\` ` +
+              `and resolve manually (rebase, or delete the remote branch if it ` +
+              `is stale) before retrying.`,
           );
         }
         // open === "yes" → a tracked re-attempt: overwrite our own stale branch
@@ -386,8 +394,8 @@ export class ShellPullRequest implements PullRequestPort {
   /** Whether an OPEN PR tracks `head`, for {@link guardedPushHead}'s divergence
    *  decision (#32). Returns "yes" | "no" when `gh pr list` answers
    *  definitively, or "unknown" on any failure (non-zero exit / malformed JSON)
-   *  so the caller can fall back safely — the lookup is best-effort, mirroring
-   *  the divergence fetch. */
+   *  so the caller can fail fast rather than guess — the open-PR signal is the
+   *  only thing distinguishing our own re-attempt from a foreign push. */
   private async headHasOpenPr(head: string): Promise<"yes" | "no" | "unknown"> {
     const r = await run(
       ["gh", "pr", "list", "--head", head, "--state", "open", "--json", "number", "--limit", "1"],

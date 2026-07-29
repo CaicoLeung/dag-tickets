@@ -333,7 +333,10 @@ describe("mergedReference (B2) — already-merged-on-base heuristic", () => {
 // for a fresh/ancestor head or a divergent head that an OPEN PR still tracks
 // (a retry / resumed run / prior batch — exactly what the `--force` was added
 // for), but fails fast when a divergent head has NO open PR (an unexpected
-// source). A retry re-implements off the base, so its second attempt diverges
+// source) OR when the open-PR check itself failed (a flaky/down gh) — the
+// open-PR signal is the only thing distinguishing our own re-attempt from a
+// foreign push, so when it is unavailable the guard refuses rather than guess.
+// A retry re-implements off the base, so its second attempt diverges
 // from the first in the same shape as a foreign push — topology can't tell
 // them apart, but a tracked re-attempt always leaves an open PR on the head.
 // ---------------------------------------------------------------------------
@@ -517,36 +520,34 @@ describe("ShellPullRequest.createPr (#32 divergence guard)", () => {
     }
   });
 
-  test("diverged remote head + flaky gh pr list → best-effort force-push (non-silent)", async () => {
-    // gh pr list itself failed (network/flake): the guard can't confirm the
-    // divergence is our own. It must not block a legitimate retry on a gh
-    // outage, so it best-effort force-pushes — but surfaces a warning so a real
-    // foreign push is never swallowed. The warning goes to stderr.
+  test("diverged remote head + flaky gh pr list → refuses to force-push (fail-fast)", async () => {
+    // gh pr list itself failed (network/flake): the open-PR signal is the only
+    // thing that tells our own re-attempt from a foreign push, so when it is
+    // unavailable the guard must refuse rather than guess. #32's contract is
+    // that divergence stops the run instead of rewriting history — a gh outage
+    // must not downgrade that to a clobber. (Contrast the tracked-re-attempt
+    // case above, where the open PR IS confirmed and the push proceeds.)
     const { work, g } = await harness();
     const { restore } = await installCreateGhShim({ prNumber: 781, prListFails: true });
-    const stderrWrite = process.stderr.write.bind(process.stderr);
-    const captured: string[] = [];
-    process.stderr.write = ((chunk: string) => {
-      captured.push(String(chunk));
-      return true;
-    }) as typeof process.stderr.write;
     try {
       await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
       await writeFile(join(work, "a.txt"), "1");
       await g(["add", "-A"], work);
       await g(["commit", "--quiet", "-m", "c1"], work);
       await g(["push", "--quiet", "origin", "loop/32-foo"], work);
+      const remoteBefore = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
       await g(["commit", "--quiet", "--amend", "-m", "rewritten"], work);
 
       const pr = new ShellPullRequest(work);
       await expect(
         pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
-      ).resolves.toBe(781);
+        // Names the branch + divergence + the failed open-PR check.
+      ).rejects.toThrow(/diverged/);
 
-      // Non-silent: the divergence warning landed on stderr.
-      expect(captured.join("")).toMatch(/WARNING.*loop\/32-foo.*divergent/);
+      // No clobber: the remote tip is byte-identical.
+      const remoteAfter = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
+      expect(remoteAfter).toBe(remoteBefore);
     } finally {
-      process.stderr.write = stderrWrite;
       restore();
     }
   });
