@@ -14,24 +14,23 @@
  *    scheduler, and agent adapter emit through it. This module holds only the
  *    file-backed adapter ({@link JsonlEventLog}); tests pass {@link NULL_SINK}
  *    (also from ports.ts) or the {@link RecordingSink} fake exported below.
- *  - Each emit appends its line SYNCHRONOUSLY (issue #41), so a reader tailing
- *    the file mid-run — a dashboard, scheduler, or resume check — sees every
- *    step/ticket event the instant it happens, not only at run end. Sync
- *    appends are inherently ordered, so burst-ordering and resume-seq hold
- *    without a promise chain. `flush()` is retained as a no-op shim for the
- *    cli's try/finally + signal-exit wiring. `appendFileSync` hands the line
- *    to the OS kernel before returning, so process death (SIGKILL / exit /
- *    throw) can no longer drop a staged line — at most a single in-flight
- *    append is truncated, and the surviving prefix stays ordered (small JSON
- *    lines are appended atomically). This is kernel-level durability, NOT an
- *    fsync: a power loss / OS crash could still lose dirty pages — a
- *    deliberate trade for an infrequent post-mortem channel.
+ *  - Each emit writes its line through an append-mode write stream that
+ *    auto-flushes (issue #41): `stream.write()` hands the line to libuv and
+ *    returns at once — it does NOT block the JS event loop — so a reader
+ *    tailing the file mid-run (a dashboard, scheduler, or resume check) sees
+ *    every step/ticket event as it happens, not only at run end. A single
+ *    writer serializes lines in emit order, so burst-ordering and resume-seq
+ *    hold without a promise chain. `flush()` drains pending writes so a
+ *    graceful exit (the cli's try/finally + signal-exit wiring) leaves a
+ *    complete trace; it is not an fsync — a hard kill or power loss could
+ *    still lose buffered / unwritten data, an acceptable trade for an
+ *    infrequent post-mortem channel.
  *  - runId / ts / seq are auto-stamped; callers supply only the discriminating
  *    `type`, an optional ticket number, and optional structured `data`.
  *
  * See docs/agents (issue #19) for the canonical event vocabulary.
  */
-import { appendFileSync, mkdirSync } from "node:fs";
+import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { EventSink, Logger } from "./ports.ts";
@@ -92,6 +91,10 @@ export class JsonlEventLog implements EventSink {
   private readonly full: string;
   private ensured = false;
   private writeFailed = false;
+  /** Lazy append-mode stream; opened on first emit. */
+  private stream: WriteStream | null = null;
+  /** Resolves once every write issued so far has flushed to the OS. */
+  private drained: Promise<void> = Promise.resolve();
 
   /**
    * @param log Optional human logger. A persistently failing event log would
@@ -157,42 +160,68 @@ export class JsonlEventLog implements EventSink {
       ...(data ? { data } : {}),
     };
     const line = JSON.stringify(e) + "\n";
-    // #41: durable per-emit. appendFileSync hands the line to the OS kernel
-    // before this returns, so a reader tailing the file mid-run (a dashboard,
-    // scheduler, or resume check) sees every step/ticket event the instant it
-    // happens, not only at run end, and the line survives a hard kill
-    // (SIGKILL). Sync appends are inherently ordered, so burst-ordering and
-    // resume-seq hold without a promise chain. This is NOT an fsync — a power
-    // loss could still drop dirty pages — which is the deliberate trade for an
-    // infrequent post-mortem channel. mkdir on first write keeps emit
-    // self-sufficient even if ensure() was skipped or raced.
+    // #41: per-step visibility WITHOUT blocking the event loop. write() hands
+    // the line to libuv and returns at once; the stream auto-flushes each line
+    // to disk, so a reader tailing mid-run (a dashboard, scheduler, or resume
+    // check) sees it without a run-end flush. The write callback resolves
+    // when the line reaches the OS, so flush() can await it. mkdir on first
+    // write keeps emit self-sufficient even if ensure() was skipped or raced.
     try {
       if (!this.ensured) {
         mkdirSync(dirname(this.full), { recursive: true });
         this.ensured = true;
       }
-      appendFileSync(this.full, line, "utf8");
+      const s = this.openIfNeeded();
+      const written = new Promise<void>((resolve, reject) => {
+        s.write(line, "utf8", (err) => (err ? reject(err) : resolve()));
+      });
+      // Chain so flush() awaits all writes in emit order; a rejected write
+      // must not break the chain for later writes (each surfaces its own
+      // failure once via surface()).
+      this.drained = this.drained.then(() => written, () => written);
+      this.drained.catch(() => {
+        /* rejection surfaced per-write via the stream 'error' handler */
+      });
     } catch (err) {
-      // A failed write must never break the run — the stderr log still
-      // carries it. Surface the first failure once via the human logger so
-      // an operator notices the post-mortem channel is broken.
-      if (!this.writeFailed) {
-        this.writeFailed = true;
-        this.log?.(
-          "warn",
-          `event log write failed (${this.full}): ${(err as Error).message}; events.jsonl may be incomplete`,
-        );
-      }
+      this.surface(err as Error);
     }
   }
 
   /**
-   * No-op since #41: writes are durable per-emit, so there is no staged chain
-   * to drain. Retained (and still awaited by the cli's try/finally and the
-   * signal-exit wiring) for backward compatibility — it resolves immediately.
+   * Lazy-open the append stream. Open / async write errors arrive on the
+   * 'error' event (not via throw); surface the first once via the logger.
+   */
+  private openIfNeeded(): WriteStream {
+    if (this.stream) return this.stream;
+    const s = createWriteStream(this.full, { flags: "a", encoding: "utf8" });
+    s.on("error", (err) => this.surface(err));
+    this.stream = s;
+    return s;
+  }
+
+  /**
+   * Surface the first persistent write failure once via the human logger (not
+   * per emit) — a failed write must never break the run; the stderr log still
+   * carries the line, and the operator gets one `warn` that the post-mortem
+   * channel is broken.
+   */
+  private surface(err: Error): void {
+    if (this.writeFailed) return;
+    this.writeFailed = true;
+    this.log?.(
+      "warn",
+      `event log write failed (${this.full}): ${err.message}; events.jsonl may be incomplete`,
+    );
+  }
+
+  /**
+   * Drain every write issued so far to the OS. The stream auto-flushes each
+   * line as it is written, so flush() is only needed to observe a coherent
+   * file (tests) or to leave a complete trace on graceful exit — the cli's
+   * try/finally and the signal-exit wiring both await it.
    */
   async flush(): Promise<void> {
-    /* durable per-emit since #41 — nothing staged to drain */
+    await this.drained;
   }
 }
 
