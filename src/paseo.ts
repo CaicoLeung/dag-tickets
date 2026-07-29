@@ -62,6 +62,10 @@ export async function loadPrefs(): Promise<ProviderPrefs> {
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
 
+/** #43: per-step progress watchdog default — 10 minutes of no new log output
+ *  before the agent is killed and the step is restarted. */
+const DEFAULT_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
+
 /** Grace margin so `paseo run`'s own `--wait-timeout` fires before run()'s
  *  hard kill: proportional to `waitMs`, floored at 1s and capped at 60s. Capped
  *  at 60s so a real long run (default 60min) keeps the unchanged prod margin;
@@ -137,19 +141,128 @@ export function implFailReason(r: {
         : "failed";
 }
 
-/**
- * Run one Paseo agent in a fresh worktree. `paseo run --json --new-workspace
- * worktree` creates the worktree + agent and blocks until the agent finishes.
- *
- * `paseo run`'s stdout is NOT the agent's answer — it's a status envelope
- * (`{agentId, status, provider, cwd, title}`). The agent's actual answer text
- * lives in `paseo logs <agentId>`. We fetch it with `--filter text` and strip
- * `[User]` lines so the prompt (which echoes the literal `REVIEW_VERDICT:`
- * instruction tokens) cannot false-match the verdict parser; the parser also
- * takes the LAST verdict match as a second line of defence.
- */
-export async function dispatch(prompt: string, opts: DispatchOpts): Promise<DispatchResult> {
-  const waitMs = opts.timeoutMs ?? DEFAULT_RUN_MS;
+/** Find a running Paseo agent whose worktree segment matches `slug`. Returns
+ *  the agent ID or null if none found / paseo is absent / output is malformed.
+ *  Best-effort and never throws — the watchdog consumes this on a polling loop
+ *  and must not crash the dispatch. Exported for testing (same contract as
+ *  {@link stopRunningAgent}). */
+export async function findRunningAgent(slug: string, cwd?: string): Promise<string | null> {
+  try {
+    const r = await run(["paseo", "ls", "--json"], { cwd, timeoutMs: 10_000 });
+    if (!r.ok) return null;
+    let agents: Array<{ status?: string; cwd?: string; id?: string }> = [];
+    try {
+      const j = JSON.parse(r.stdout) as unknown;
+      agents = Array.isArray(j) ? (j as typeof agents) : ((j as { agents?: typeof agents }).agents ?? []);
+    } catch {
+      return null;
+    }
+    return (
+      agents.find(
+        (a) =>
+          a.status === "running" &&
+          typeof a.cwd === "string" &&
+          a.cwd.split("/").pop() === slug,
+      )?.id ?? null
+    );
+  } catch {
+    return null; // paseo absent / spawn error
+  }
+}
+
+/** #43: poll `paseo logs` for `agentId` and return the current text length.
+ *  Best-effort: a failing poll returns 0 (treated as no progress), which is
+ *  conservative — the worst case is a premature watchdog fire, bounded by the
+ *  restart budget. */
+async function agentLogLength(agentId: string, cwd?: string): Promise<number> {
+  try {
+    const lr = await run(["paseo", "logs", agentId, "--filter", "text"], {
+      cwd,
+      timeoutMs: 15_000,
+    });
+    return lr.ok ? lr.stdout.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Minimal handle so the dispatch loop can stop the background watchdog and
+ *  read whether it fired. */
+interface WatchdogHandle {
+  /** True iff the watchdog detected an agent stuck with no progress. */
+  fired: boolean;
+  /** Stop the polling loop (no-op if already stopped or already fired). */
+  stop(): void;
+}
+
+/** #43: start a background watchdog that polls `paseo logs` for an agent
+ *  identified by `slug`. If log output stops growing for `progressTimeoutMs`,
+ *  it calls `onStuck`. The watchdog first waits up to 20s for the agent to
+ *  appear in `paseo ls`; if it never appears the watchdog exits silently (the
+ *  agent may have finished before paseo registered it). */
+function startWatchdog(
+  slug: string,
+  cwd: string | undefined,
+  progressTimeoutMs: number,
+  onStuck: () => void,
+): WatchdogHandle {
+  let fired = false;
+  let stopped = false;
+
+  const poll = async (): Promise<void> => {
+    // Wait for the agent to appear (up to 20s, polling every 2s).
+    let agentId: string | null = null;
+    for (let i = 0; i < 10 && !stopped; i++) {
+      agentId = await findRunningAgent(slug, cwd);
+      if (agentId) break;
+      if (!stopped) await new Promise((r) => setTimeout(r, 2000));
+    }
+    if (!agentId || stopped) return;
+
+    // Agent found — poll its log output every 30s for staleness.
+    let lastLen = await agentLogLength(agentId, cwd);
+    let stuckSince: number | null = null;
+    while (!stopped) {
+      await new Promise((r) => setTimeout(r, 30_000));
+      if (stopped) return;
+      const curLen = await agentLogLength(agentId!, cwd);
+      if (curLen > lastLen) {
+        lastLen = curLen;
+        stuckSince = null;
+      } else if (stuckSince === null) {
+        stuckSince = Date.now();
+      } else if (Date.now() - stuckSince >= progressTimeoutMs) {
+        // Before firing, verify the agent is still running so we don't
+        // false-positive on an agent that completed between polls.
+        const stillRunning = await findRunningAgent(slug, cwd);
+        if (!stillRunning) return; // agent completed naturally — ignore
+        fired = true;
+        onStuck();
+        return;
+      }
+    }
+  };
+
+  void poll();
+
+  return {
+    get fired(): boolean {
+      return fired;
+    },
+    stop(): void {
+      stopped = true;
+    },
+  };
+}
+
+/** #43: max restarts when the progress watchdog fires. A step restarting
+ *  more than 3 times (original + 2 restarts) is a hard failure — the agent
+ *  is genuinely stuck in an unrecoverable loop. */
+const MAX_WATCHDOG_RESTARTS = 2;
+
+/** #43: build the `paseo run` argument list so the watchdog restart loop
+ *  doesn't duplicate it. */
+function paseoRunArgs(prompt: string, opts: DispatchOpts, waitMs: number): string[] {
   const args = [
     "paseo",
     "run",
@@ -175,8 +288,16 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
     if (opts.branch) args.push("--branch", opts.branch);
   }
   args.push(prompt);
+  return args;
+}
 
-  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs) });
+/** Parse the `paseo run` stdout envelope into output + status, mirroring the
+ *  post-run parsing that lived inline in dispatch(). Extracted so the
+ *  watchdog restart loop and the normal path share one parser. */
+async function parsePaseoRun(
+  r: Awaited<ReturnType<typeof run>>,
+  opts: DispatchOpts,
+): Promise<{ status: string; output: string }> {
   let status = r.ok ? "completed" : "failed";
   let output = r.stdout;
   if (r.ok) {
@@ -185,11 +306,6 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
       if (typeof j.status === "string") status = j.status;
       const agentId = j.agentId;
       if (agentId) {
-        // The paseo log store can lag behind agent completion: reading once
-        // right after `paseo run` returns sometimes captures a partial
-        // transcript (missing the agent's final lines — e.g. REVIEW_VERDICT).
-        // Poll until the filtered output stops changing so we capture the full
-        // text instead of truncating mid-generation.
         let prev = "";
         for (let attempt = 0; attempt < 4; attempt++) {
           const lr = await run(["paseo", "logs", agentId, "--filter", "text"], {
@@ -211,21 +327,128 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
       /* non-JSON stdout (older paseo) → keep the status envelope as output */
     }
   }
-  const rateLimited = isRateLimited(output);
-  // Transport failures (ECONNRESET / fetch failed / stream closed) classically
-  // land on STDERR as an uncaught stack trace, not in the status envelope on
-  // stdout — and on the !r.ok path `output` is stdout only (the JSON/log
-  // polling above is skipped). Scan both streams so a relay blip reported to
-  // stderr is still classified transient instead of falling through to a
-  // terminal `implement-failed` (issue #39). rateLimited stays stdout-only to
-  // avoid widening its (working) detection surface here.
-  const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
+  return { status, output };
+}
+
+/**
+ * Run one Paseo agent in a fresh worktree. `paseo run --json --new-workspace
+ * worktree` creates the worktree + agent and blocks until the agent finishes.
+ *
+ * `paseo run`'s stdout is NOT the agent's answer — it's a status envelope
+ * (`{agentId, status, provider, cwd, title}`). The agent's actual answer text
+ * lives in `paseo logs <agentId>`. We fetch it with `--filter text` and strip
+ * `[User]` lines so the prompt (which echoes the literal `REVIEW_VERDICT:`
+ * instruction tokens) cannot false-match the verdict parser; the parser also
+ * takes the LAST verdict match as a second line of defence.
+ *
+ * #43: a progress watchdog runs in parallel. If the agent produces no new log
+ * output for `progressTimeoutMs` (default 10 min), the watchdog fires: it
+ * kills the stuck agent and `dispatch` restarts from scratch — up to
+ * {@link MAX_WATCHDOG_RESTARTS} additional attempts — before returning failure.
+ */
+export async function dispatch(prompt: string, opts: DispatchOpts): Promise<DispatchResult> {
+  const waitMs = opts.timeoutMs ?? DEFAULT_RUN_MS;
+  const progressTimeoutMs = opts.progressTimeoutMs ?? DEFAULT_PROGRESS_TIMEOUT_MS;
+  const args = paseoRunArgs(prompt, opts, waitMs);
+
+  // #43: progressTimeoutMs === 0 disables the watchdog entirely — run the
+  // original single-shot path (pre-#43 behaviour). This is the escape hatch
+  // for a host that wants the total wait-timeout but no progress monitoring.
+  if (progressTimeoutMs === 0) {
+    const r = await run(args, {
+      cwd: opts.cwd,
+      timeoutMs: waitMs + dispatchGraceMs(waitMs),
+    });
+    const { status, output } = await parsePaseoRun(r, opts);
+    const rateLimited = isRateLimited(output);
+    const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
+    return {
+      ok: r.ok && (status === "completed" || status === "idle"),
+      output,
+      timedOut: r.timedOut,
+      rateLimited,
+      connectionError,
+    };
+  }
+
+  for (let restart = 0; restart <= MAX_WATCHDOG_RESTARTS; restart++) {
+    const controller = new AbortController();
+    const watchdog = startWatchdog(opts.slug, opts.cwd, progressTimeoutMs, () => {
+      controller.abort();
+    });
+
+    const r = await run(args, {
+      cwd: opts.cwd,
+      timeoutMs: waitMs + dispatchGraceMs(waitMs),
+      signal: controller.signal,
+    });
+    watchdog.stop();
+
+    // Not a watchdog abort → normal path (success, hard timeout, or agent error).
+    if (!watchdog.fired) {
+      const { status, output } = await parsePaseoRun(r, opts);
+      const rateLimited = isRateLimited(output);
+      const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
+      return {
+        ok: r.ok && (status === "completed" || status === "idle"),
+        output,
+        timedOut: r.timedOut,
+        rateLimited,
+        connectionError,
+      };
+    }
+
+    // Watchdog fired. If the run also completed naturally around the same time
+    // (race between watchdog check and agent exit), treat it as a normal
+    // result — don't restart a completed agent.
+    if (!r.aborted) {
+      const { status, output } = await parsePaseoRun(r, opts);
+      const rateLimited = isRateLimited(output);
+      const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
+      return {
+        ok: r.ok && (status === "completed" || status === "idle"),
+        output,
+        timedOut: r.timedOut,
+        rateLimited,
+        connectionError,
+      };
+    }
+
+    // Agent was genuinely stuck — kill it via paseo stop (best-effort) and
+    // restart if budget remains.
+    try {
+      await findRunningAgent(opts.slug, opts.cwd).then((id) => {
+        if (id) return run(["paseo", "stop", id], { cwd: opts.cwd, timeoutMs: 10_000 });
+      });
+    } catch {
+      /* best-effort */
+    }
+
+    if (restart < MAX_WATCHDOG_RESTARTS) {
+      // The `paseo run` process was killed mid-stream; wait a moment for the
+      // worktree to settle before restarting.
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+
+    // Restart budget exhausted — return as a timeout so the caller sees
+    // `agent-timeout` and retries at the ticket level if transient.
+    return {
+      ok: false,
+      output: r.stdout,
+      timedOut: true,
+      rateLimited: false,
+      connectionError: false,
+    };
+  }
+
+  // Unreachable (the loop always returns). Keep TS happy.
   return {
-    ok: r.ok && (status === "completed" || status === "idle"),
-    output,
-    timedOut: r.timedOut,
-    rateLimited,
-    connectionError,
+    ok: false,
+    output: "",
+    timedOut: true,
+    rateLimited: false,
+    connectionError: false,
   };
 }
 
@@ -459,6 +682,9 @@ export class PaseoAgent implements AgentPort {
      *  module-level {@link stopRunningAgent} bound to this agent's cwd. */
     private readonly stopAgent: (ticketNumber: number) => Promise<void> = (n) =>
       stopRunningAgent(this.cwd, n),
+    /** #43: per-step progress watchdog timeout (ms). Passed to every dispatch
+     *  as {@link DispatchOpts.progressTimeoutMs}. Default 10 min; 0 disables. */
+    private readonly progressTimeoutMs: number | undefined = DEFAULT_PROGRESS_TIMEOUT_MS,
   ) {}
 
   /**
@@ -546,6 +772,7 @@ export class PaseoAgent implements AgentPort {
         slug: SLUG(t.number),
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        progressTimeoutMs: this.progressTimeoutMs,
         branchMode: "branch-off",
         newBranch: branch,
         base: baseRef,
@@ -585,6 +812,7 @@ export class PaseoAgent implements AgentPort {
         slug: `${SLUG(t.number)}-review`,
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        progressTimeoutMs: this.progressTimeoutMs,
         branchMode: "checkout-branch",
         branch,
       },
@@ -608,6 +836,7 @@ export class PaseoAgent implements AgentPort {
         slug: SLUG(t.number),
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
+        progressTimeoutMs: this.progressTimeoutMs,
         branchMode: "checkout-branch",
         branch,
       },
@@ -630,6 +859,7 @@ export class PaseoAgent implements AgentPort {
       slug: SLUG(t.number),
       cwd: this.cwd,
       timeoutMs: this.timeoutMs,
+      progressTimeoutMs: this.progressTimeoutMs,
       branchMode: "branch-off",
       newBranch: branch,
       base: baseRef,

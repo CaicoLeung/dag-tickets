@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import {
+  findRunningAgent,
   implFailReason,
   isConnectionError,
   isRateLimited,
@@ -1014,5 +1015,17 @@ describe("PaseoAgent.stopInFlight (#40)", () => {
 describe("stopRunningAgent — never throws (no paseo in unit-test env)", () => {
   test("returns without throwing when paseo is absent from PATH", async () => {
     await expect(stopRunningAgent(undefined, 11)).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #43 — findRunningAgent: the progress watchdog's agent-discovery seam.
+// Same contract as stopRunningAgent: best-effort and never throws.
+// ---------------------------------------------------------------------------
+
+describe("findRunningAgent — never throws (no paseo in unit-test env)", () => {
+  test("returns null when paseo is absent from PATH", async () => {
+    const id = await findRunningAgent("dag-11", undefined);
+    expect(id).toBeNull();
   });
 });

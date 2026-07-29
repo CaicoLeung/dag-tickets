@@ -165,6 +165,10 @@ export interface DispatchOpts {
   cwd?: string;
   /** Max wall time for the agent run (paseo --wait-timeout). */
   timeoutMs?: number;
+  /** #43: per-step progress watchdog. If the agent produces no new log output
+   *  for this duration it is killed and the step is retried. Default 10 min
+   *  (DEFAULT_PROGRESS_TIMEOUT_MS in paseo.ts). */
+  progressTimeoutMs?: number;
   mode?: string;
   branchMode: "branch-off" | "checkout-branch";
   /** branch-off: new branch to create. */

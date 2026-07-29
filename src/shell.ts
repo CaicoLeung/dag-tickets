@@ -8,6 +8,10 @@ export interface RunOptions {
   timeoutMs?: number;
   /** Extra env merged into the child environment. */
   env?: Record<string, string>;
+  /** #43: external kill signal. When aborted the process is killed and the
+   *  result carries `aborted: true`. The caller uses this to inject a
+   *  per-step progress watchdog without changing the blocking call shape. */
+  signal?: AbortSignal;
 }
 
 export interface RunResult {
@@ -17,6 +21,8 @@ export interface RunResult {
   code: number;
   /** True if the process was killed by the timeout. */
   timedOut: boolean;
+  /** #43: True if the process was killed by an external AbortSignal. */
+  aborted: boolean;
 }
 
 export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResult> {
@@ -38,6 +44,7 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
   });
 
   let timedOut = false;
+  let aborted = false;
   let timer: Timer | undefined;
   if (opts.timeoutMs && opts.timeoutMs > 0) {
     timer = setTimeout(() => {
@@ -48,6 +55,24 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
         /* already dead */
       }
     }, opts.timeoutMs);
+  }
+  // #43: external kill signal — the watchdog fires this when it detects no
+  // progress for progressTimeoutMs. Distinct from the total --wait-timeout so
+  // a stuck agent is killed at 10min instead of burning the full 60min slot.
+  if (opts.signal) {
+    const onAbort = () => {
+      aborted = true;
+      try {
+        proc.kill();
+      } catch {
+        /* already dead */
+      }
+    };
+    if (opts.signal.aborted) {
+      onAbort();
+    } else {
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
   }
 
   if (opts.input !== undefined && proc.stdin) {
@@ -62,7 +87,7 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
   ]);
   clearTimeout(timer);
 
-  return { ok: !timedOut && code === 0, stdout, stderr, code, timedOut };
+  return { ok: !timedOut && !aborted && code === 0, stdout, stderr, code, timedOut, aborted };
 }
 
 /** Run and throw a formatted error on non-zero exit. */

@@ -64,6 +64,15 @@ const agentTimeoutMs = (): number | undefined => {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 };
 
+/** #43: per-step progress watchdog timeout override (ms). Unset → undefined →
+ *  PaseoAgent's DEFAULT_PROGRESS_TIMEOUT_MS (10 min). 0 disables the watchdog.
+ *  Read at call time so a caller can adjust between dispatches; the e2e suite
+ *  collapses it to prove the watchdog fires without burning 10min. */
+const progressTimeoutMs = (): number | undefined => {
+  const n = Number(process.env.DAG_PROGRESS_TIMEOUT_MS);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+};
+
 /** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
  *  completing check otherwise polls indefinitely and starves a concurrency slot
  *  for the rest of the batch — the one load-bearing availability risk in an
@@ -697,7 +706,7 @@ export async function main(argv: string[]): Promise<number> {
     // collapses the backoff. Prod leaves it unset → the flag/default stands.
     const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
-    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events, undefined, progressTimeoutMs());
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
