@@ -491,14 +491,15 @@ class OverlapCoordinator {
     await Promise.all(blockers.map((b) => this.awaitOne(b)));
   };
 
-  /** Scheduler onSettle hook: record `n` settled. Releases waiters only when
-   *  `status === "done"`: a failed/skipped blocker must NOT release an overlap-
-   *  dependent's gate — the cascade-abort owns that dependent instead (#31).
-   *  Called before state persist so a resumed run sees the blocker as settled
-   *  too. */
+  /** Scheduler onSettle hook: record `n` as settled-done and release any
+   *  overlap-dependent's waiters. Only `status === "done"` is recorded: a
+   *  failed/skipped blocker must NOT release a dependent's gate — the
+   *  cascade-abort owns that dependent instead (#31). Keeping non-done out of
+   *  `settled` also stops a dependent that registers its waiter after the
+   *  settle from bypassing the gate via the `awaitOne` short-circuit (#31). */
   noteSettled(n: number, status: TicketStatus): void {
-    this.settled.add(n);
     if (status !== "done") return;
+    this.settled.add(n);
     const w = this.waiters.get(n);
     if (w) {
       this.waiters.delete(n);
