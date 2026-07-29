@@ -126,8 +126,17 @@ import {
     // commit ahead of base, unless the scenario scripts an empty implement.
     const emptyImpl =
       Array.isArray(scen.implementFails) && scen.implementFails.includes(num);
+    // failRun covers three failure modes, each scoped to the skill that produces
+    // its reason: runFails→implement-failed (branch-off), fixFails→fix-failed
+    // (checkout-branch), singleShotFails→single-shot-failed (triage/research).
+    // All three resolve to a `failed` status envelope here; the lifecycle maps
+    // the skill to its FailureReason.
     const failRun =
-      Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "";
+      (Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "") ||
+      (skill === "fix" && Array.isArray(scen.fixFails) && scen.fixFails.includes(num)) ||
+      ((skill === "triage" || skill === "research") &&
+        Array.isArray(scen.singleShotFails) &&
+        scen.singleShotFails.includes(num));
 
     // Overlap choreography: a dependent's implement flipping dependentLaunched
     // is the release signal for a held `holdWatch` blocker. Set it before the

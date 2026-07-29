@@ -671,6 +671,54 @@ describe("e2e: agent failure modes", () => {
       await teardown(env);
     }
   });
+
+  test("fix round dispatch fails → terminal fix-failed", async () => {
+    // A review that found ISSUES enters the fix-loop; if the fix dispatch
+    // itself fails (agent crashed / produced nothing) the ticket settles
+    // terminal `fix-failed` — distinct from implement-failed (the fix step,
+    // not the implement step, broke). Pre-this-test `fix-failed` was a
+    // FailureReason never hit at E2E (the shim's fix always succeeded).
+    const env = await setup({
+      issues: [issue(16, "Fixable work")],
+      verdicts: { "16": ["issues:2"] },
+      fixFails: [16],
+    });
+    try {
+      expect(await runMain(env, ["16", "--max-fix-rounds", "1"])).toBe(1);
+
+      const t = ticketOf((await readState(env))!, 16);
+      expect(t.status).toBe("failed");
+      expect(t.reason).toBe("fix-failed");
+      // (rounds is not persisted on the fix-failed path — lifecycle's fail()
+      // helper omits it, unlike the ci-failed return — so don't assert it.)
+
+      // No PR was ever opened — the ticket died in the fix-loop, pre-createPr.
+      expect((await readShimState(env)).prCounter).toBe(1000);
+    } finally {
+      await teardown(env);
+    }
+  });
+
+  test("triage single-shot dispatch fails → terminal single-shot-failed (no PR)", async () => {
+    // A triage/research single-shot that fails settles terminal
+    // `single-shot-failed`. Pre-this-test `single-shot-failed` was a
+    // FailureReason never hit at E2E (the shim's single-shot always completed).
+    const env = await setup({
+      issues: [{ number: 17, title: "Broken triage", labels: ["needs-triage"] }],
+      singleShotFails: [17],
+    });
+    try {
+      expect(await runMain(env, ["--label", "needs-triage"])).toBe(1);
+
+      const t = ticketOf((await readState(env))!, 17);
+      expect(t.status).toBe("failed");
+      expect(t.reason).toBe("single-shot-failed");
+      expect(t.pr).toBeUndefined();
+      expect((await readShimState(env)).prCounter).toBe(1000);
+    } finally {
+      await teardown(env);
+    }
+  });
 });
 
 describe("e2e: lock stale-pid recovery", () => {

@@ -66,6 +66,15 @@ export interface ScenarioOpts {
   implementFails?: number[];
   /** Ticket numbers whose `paseo run` returns status "failed" (→ implement-failed). */
   runFails?: number[];
+  /** Ticket numbers whose FIX dispatch returns status "failed" → a review that
+   *  found ISSUES enters the fix-loop, the fix round fails → terminal
+   *  `fix-failed`. Drives the fix-failed E2E gap (a FailureReason never hit at
+   *  E2E before). */
+  fixFails?: number[];
+  /** Ticket numbers whose triage/research single-shot dispatch returns status
+   *  "failed" → terminal `single-shot-failed`. Drives the single-shot-failed
+   *  E2E gap (a FailureReason never hit at E2E before). */
+  singleShotFails?: number[];
   /** Per-ticket CI outcome sequence served one per `gh pr checks --watch` call
    *  (e.g. `["fail","pass"]` → attempt 1 CI fails, attempt 2 passes). Drives
    *  the transient-retry loop with a real transient-then-success outcome. */
@@ -183,6 +192,8 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     verdicts: opts.verdicts ?? {},
     implementFails: opts.implementFails ?? [],
     runFails: opts.runFails ?? [],
+    fixFails: opts.fixFails ?? [],
+    singleShotFails: opts.singleShotFails ?? [],
     checksSeq: opts.checksSeq ?? {},
     rateLimited: opts.rateLimited ?? [],
     connectionErrors: opts.connectionErrors ?? [],
