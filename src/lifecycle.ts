@@ -72,6 +72,10 @@ export async function processTicket(
   overlap?: OverlapContext,
 ): Promise<TicketOutcome> {
   const rule = routingRuleFor(t.kind);
+  if (t.kind === "skip") {
+    ctx.log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
+    return { status: "skipped", error: "intentional-skip" };
+  }
   if (t.kind === "unknown" || !rule.skill) {
     ctx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
     return { status: "skipped", error: "unknown-kind" };

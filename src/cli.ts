@@ -78,6 +78,8 @@ interface ParsedArgs {
   implLabel?: string;
   triageLabel?: string;
   researchLabel?: string;
+  categoryLabels: string[];
+  skipLabels: string[];
   help: boolean;
   version: boolean;
 }
@@ -118,6 +120,12 @@ OPTIONS
   --impl-label <l>        Override the implement-routing label.
   --triage-label <l>      Override the triage-routing label.
   --research-label <l>    Override the research-routing label.
+  --category-label <l>    Add a category role to the orphan-detection set
+                         (default bug, enhancement; repeat / comma-sep). An
+                         issue with a category role but no state role is triaged.
+  --skip-label <l>        Add a state role the driver intentionally skips
+                         (default needs-info, ready-for-human, wontfix;
+                         repeat / comma-sep).
   --cwd <path>            Operate on a different checkout.
   --run-id <id>           Name this run (for the state file).
   --resume <id>           Resume a previous run; skip its merged/failed tickets.
@@ -143,6 +151,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
     requireChecks: false,
     dryRun: false,
     fallbackProviders: [],
+    categoryLabels: [],
+    skipLabels: [],
     help: false,
     version: false,
   };
@@ -210,6 +220,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.triageLabel = next(); break;
       case "--research-label":
         a.researchLabel = next(); break;
+      case "--category-label":
+        a.categoryLabels.push(...(next()?.split(",").map((s) => s.trim()).filter(Boolean) ?? [])); break;
+      case "--skip-label":
+        a.skipLabels.push(...(next()?.split(",").map((s) => s.trim()).filter(Boolean) ?? [])); break;
       case "--cwd":
         a.cwd = next(); break;
       case "--run-id":
@@ -352,10 +366,14 @@ function buildRouting(a: ParsedArgs): RoutingConfig {
     implementLabels: [...DEFAULT_ROUTING.implementLabels],
     triageLabels: [...DEFAULT_ROUTING.triageLabels],
     researchLabels: [...DEFAULT_ROUTING.researchLabels],
+    categoryLabels: [...DEFAULT_ROUTING.categoryLabels],
+    skipLabels: [...DEFAULT_ROUTING.skipLabels],
   };
   if (a.implLabel) cfg.implementLabels = [a.implLabel];
   if (a.triageLabel) cfg.triageLabels = [a.triageLabel];
   if (a.researchLabel) cfg.researchLabels = [a.researchLabel];
+  cfg.categoryLabels.push(...a.categoryLabels);
+  cfg.skipLabels.push(...a.skipLabels);
   return cfg;
 }
 
@@ -517,10 +535,14 @@ export async function main(argv: string[]): Promise<number> {
   const closedSkipped = tickets.length - open.length;
   if (closedSkipped > 0) log("warn", `skipping ${closedSkipped} already-closed ticket(s)`);
 
-  const actionable = open.filter((t) => t.kind !== "unknown");
+  const actionable = open.filter((t) => t.kind !== "unknown" && t.kind !== "skip");
   const unrouted = open.filter((t) => t.kind === "unknown");
+  const intentionalSkips = open.filter((t) => t.kind === "skip");
   for (const t of unrouted) {
-    log("warn", `no routing label (need one of ${[...cfg.implementLabels, ...cfg.triageLabels, ...cfg.researchLabels].join("/")}); skipping`, t.number);
+    log("warn", `no routing label (need one of ${[...cfg.implementLabels, ...cfg.triageLabels, ...cfg.researchLabels].join("/")} or a category role like ${cfg.categoryLabels.join("/")}); skipping`, t.number);
+  }
+  for (const t of intentionalSkips) {
+    log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
   }
   if (actionable.length === 0) {
     log("info", "no actionable tickets found.");

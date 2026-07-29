@@ -267,6 +267,17 @@ describe("routing & dry-run", () => {
     expect(out.status).toBe("skipped");
     expect(repo.prs).toHaveLength(0);
   });
+  test("skip kind (ready-for-human) is skipped as intentional, nothing dispatched", async () => {
+    const agent = new FakeAgent();
+    const repo = new FakePullRequest();
+    const t = ticket();
+    t.kind = "skip";
+    t.labels = ["bug", "ready-for-human"];
+    const out = await processTicket(t, ctx(agent, repo));
+    expect(out.status).toBe("skipped");
+    expect(out.error).toBe("intentional-skip");
+    expect(repo.prs).toHaveLength(0);
+  });
 
   test("dry-run prints the plan and dispatches nothing", async () => {
     const agent = new FakeAgent();
