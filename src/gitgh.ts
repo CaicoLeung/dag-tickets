@@ -195,9 +195,16 @@ export class ShellPullRequest implements PullRequestPort {
    * Wait for PR checks to finish, then report pass/fail.
    *
    * `gh pr checks --watch --fail-fast` blocks until complete and exits non-zero
-   * on the first failing check. A PR with no checks prints "no checks" and
-   * exits 0 → we report `none` (the caller decides whether that satisfies the
-   * merge gate via --require-checks).
+   * on the first failing check. A PR that triggers zero check workflows (e.g.
+   * every workflow path-filters the changed files out) prints
+   * "no checks reported on the <branch> branch" to stderr and exits non-zero
+   * (often 1). That message is unambiguous, so we treat it as `state:"none"`
+   * regardless of exit code — otherwise path-filtered PRs cascade to
+   * `ci-failed` (#37). We scope the match to stderr (where gh writes its own
+   * diagnostics) and anchor on the literal "no checks reported" (not bare
+   * "no checks") so a real failing check whose stdout table echoes those words
+   * can't be misread as no-CI. The caller decides whether `none` satisfies the
+   * merge gate via --require-checks.
    */
   async watchChecks(prNumber: number): Promise<CheckResult> {
     const watch = await run(
@@ -205,9 +212,11 @@ export class ShellPullRequest implements PullRequestPort {
       { cwd: this.cwd, timeoutMs: this.timeoutMs },
     );
     if (watch.timedOut) return { state: "fail", failed: ["checks-watch-timeout"] };
-    // "no checks" is an exit-0 case with that text on stderr/stdout.
-    const blob = (watch.stdout + watch.stderr).toLowerCase();
-    if (watch.ok && /no checks|nothing to check/.test(blob)) {
+    // gh writes its no-checks diagnostic to stderr; a failing check's output is
+    // a table on stdout. Match stderr only (exit code is unreliable, #37) so a
+    // failing check whose log echoes "no checks reported" can't be misread as
+    // no-CI.
+    if (/no checks reported|nothing to check/.test(watch.stderr.toLowerCase())) {
       return { state: "none", failed: [] };
     }
     if (!watch.ok) {
