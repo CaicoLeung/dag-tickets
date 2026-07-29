@@ -822,8 +822,8 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
     const stopped: number[] = [];
     const d = tracingDispatcher(
       [
-        { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true },
-        { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+        { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true, connectionError: false },
+        { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
       ],
       order,
     );
@@ -856,8 +856,8 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
     const stopped: number[] = [];
     const d = tracingDispatcher(
       [
-        { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true },
-        { ok: true, output: "", timedOut: false, rateLimited: false }, // fallback ok, commits land
+        { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true, connectionError: false },
+        { ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }, // fallback ok, commits land
       ],
       order,
     );
@@ -891,8 +891,8 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
     const stopped: number[] = [];
     const d = tracingDispatcher(
       [
-        { ok: false, output: "429", timedOut: false, rateLimited: true },
-        { ok: true, output: "", timedOut: false, rateLimited: false },
+        { ok: false, output: "429", timedOut: false, rateLimited: true, connectionError: false },
+        { ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false },
       ],
       order,
     );
@@ -922,8 +922,8 @@ describe("PaseoAgent — stop prior agent before rate-limit fallback (#40)", () 
     // A stop failure (paseo unreachable / lost race) must NOT block the retry.
     const d = new ScriptedDispatcher();
     d.queue = [
-      { ok: false, output: "429", timedOut: false, rateLimited: true },
-      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+      { ok: false, output: "429", timedOut: false, rateLimited: true, connectionError: false },
+      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const branch = new FakeBranch();
     const a = new PaseoAgent(
