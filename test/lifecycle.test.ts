@@ -10,9 +10,14 @@ import type {
   ReconcileResult,
   StepResult,
 } from "../src/ports.ts";
-import type { ReviewVerdict, Ticket, TicketStatus } from "../src/types.ts";
+import type { ReviewVerdict, Ticket } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
+import { OverlapCoordinator } from "../src/cli.ts";
+
+/** Flush the microtask queue so an async lifecycle reaches its next await
+ *  (e.g. waitForBlockers registering a waiter) before an assertion reads it. */
+const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
 function ticket(n = 1, title = "Do the thing"): Ticket {
   return {
@@ -681,9 +686,9 @@ describe("implement lifecycle — #29 overlap", () => {
   });
 
   test("overlap: a failed/skipped blocker does NOT release the createPr gate — stuck until cascade-abort (#31)", async () => {
-    // Models the fixed OverlapCoordinator gate: waiters registered before
-    // noteSettled, and only released on "done". A failed/skipped blocker
-    // must NOT release the gate — the cascade-abort owns the dependent.
+    // Exercises the REAL OverlapCoordinator (the class the fix lives in) wired
+    // into the lifecycle — not a hand-rolled gate model — so this validates the
+    // `settled`-Set exclusion + noteSettled status guard that ARE the #31 fix.
     const agent = new FakeAgent();
     agent.reviews = [CLEAN];
     agent.reconcile = async () => ({ ok: true });
@@ -692,49 +697,41 @@ describe("implement lifecycle — #29 overlap", () => {
     t.blockedBy = [1];
     const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
 
-    // Gate modeled after the fixed OverlapCoordinator: no settled Set needed
-    // (in the active path, waiters are registered before noteSettled fires).
-    const waiters = new Map<number, Array<() => void>>();
-    const note = (n: number, status: TicketStatus) => {
-      if (status !== "done") return; // #31: gate stays locked on non-done
-      const w = waiters.get(n);
-      if (w) { waiters.delete(n); for (const fn of w) fn(); }
-    };
+    const coord = new OverlapCoordinator([]); // empty seed — blocker 1 not settled
 
     const running = processTicket(
       t,
-      ctx(agent, repo, {
-        waitForBlockers: async (bs) => Promise.all(bs.map((b) =>
-          new Promise<void>((r) => {
-            const arr = waiters.get(b) ?? [];
-            arr.push(r);
-            waiters.set(b, arr);
-          }),
-        )),
-      }),
+      ctx(agent, repo, { waitForBlockers: coord.waitForBlockers }),
       overlap,
     );
 
-    // Flush microtasks so the lifecycle reaches waitForBlockers and registers waiters.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick(); // lifecycle reaches waitForBlockers → registers a waiter on 1
     expect(repo.prs).toHaveLength(0);
 
-    // Blocker settles failed — gate stays LOCKED (#31 fix).
-    note(1, "failed");
-    await new Promise((r) => setTimeout(r, 0));
+    // Blocker settles failed/skipped — gate stays LOCKED (#31): noteSettled's
+    // status guard skips both the `settled` add AND the waiter release.
+    coord.noteSettled(1, "failed");
+    await tick();
     expect(repo.prs).toHaveLength(0); // still no PR — gate didn't release
-
-    // Blocker settles skipped — also stays locked.
-    note(1, "skipped");
-    await new Promise((r) => setTimeout(r, 0));
+    coord.noteSettled(1, "skipped");
+    await tick();
     expect(repo.prs).toHaveLength(0); // still no PR
 
-    // The dependent is stuck at the gate forever. In production,
-    // the cascade-abort kills it. From the lifecycle's perspective,
-    // createPr is never reached.
+    // #31 race guard: a non-done settle must NOT land in `settled`, so a
+    // dependent that registers its waiter AFTER the settle can't bypass the
+    // gate via the awaitOne short-circuit. Blocker 1 settled failed above — a
+    // fresh waiter registered now must still hang, not resolve immediately.
+    let lateResolved = false;
+    await Promise.race([
+      coord.waitForBlockers([1]).then(() => {
+        lateResolved = true;
+      }),
+      tick(),
+    ]);
+    expect(lateResolved).toBe(false); // 1 ∉ settled → no short-circuit
 
     // Sanity: "done" releases (proves the gate is status-aware).
-    note(1, "done");
+    coord.noteSettled(1, "done");
     await running;
     expect(repo.prs).toHaveLength(1);
   });

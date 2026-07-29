@@ -459,8 +459,10 @@ function stateFromOutcome(
  *    overlapping an already-done blocker resolves immediately.
  * Exposed as the slim RunContext hooks (markHeadPushed / waitForBlockers) plus
  * the scheduler's canOverlap policy; main() wires them, this class owns them.
+ * Exported so the #31 race (a non-done settle must not release the gate) can
+ * be tested against the real class instead of a hand-rolled model.
  */
-class OverlapCoordinator {
+export class OverlapCoordinator {
   private readonly pushedHeads = new Set<number>();
   private readonly settled: Set<number>;
   private readonly waiters = new Map<number, Array<() => void>>();
