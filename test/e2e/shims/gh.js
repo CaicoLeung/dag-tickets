@@ -110,6 +110,10 @@ import {
 
   // gh pr checks <n> --watch --fail-fast --interval 30
   // Outcome, per PR's ticket (looked up via prTickets):
+  //   - stuckChecksFirst[<n>] (first call only) → sleep past the parent's
+  //     ci-watch ceiling so run() kills it (timedOut) → checks-watch-timeout.
+  //     The latch is persisted BEFORE sleeping (the kill can't write it), so
+  //     the retry's --watch falls through to the scripted outcome below.
   //   - checksSeq[<n>] = ["fail","pass",...] → serve one per watch call (transient CI)
   //   - holdWatch[<n>]   → block until state.releaseWatch flips true (overlap choreography)
   //   - else            → scen.checks ("pass"|"fail"|"none")
@@ -120,6 +124,28 @@ import {
     // Resolve the ticket this PR belongs to, then apply per-ticket scripting.
     const state0 = withDefaults(await readJson(STATE, DEFAULT_STATE));
     const num = state0.prTickets[String(pr)] || 0;
+
+    // stuckChecksFirst: the FIRST --watch for this ticket sleeps past the
+    // parent's ci-watch timeout so run() kills it (timedOut) →
+    // {state:"fail", failed:["checks-watch-timeout"]} → transient ci-failed.
+    // Latch persisted BEFORE the sleep (the kill can't), so the retry falls
+    // through to the scripted outcome below. Bounded sleep so a missing-
+    // timeout bug fails loudly instead of hanging the suite.
+    if (num && Array.isArray(scen.stuckChecksFirst) && scen.stuckChecksFirst.includes(num)) {
+      let first = false;
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.stuckHit = s.stuckHit || {};
+        first = !s.stuckHit[String(num)];
+        if (first) s.stuckHit[String(num)] = true;
+        await writeJson(STATE, s);
+      });
+      if (first) {
+        await sleep(5000);
+        exit(1); // fail — reached only if the timeout never fired (bug guard)
+      }
+      // not first → fall through to the scripted outcome below
+    }
 
     if (num && scen.checksSeq && Array.isArray(scen.checksSeq[String(num)])) {
       // Advance the per-ticket pointer under the lock so concurrent watchers
@@ -139,15 +165,19 @@ import {
       // a pacer's merge — removes the race where the blocker would settle
       // before the dependent overlap-launched. Bounded (~30s) so a broken
       // choreography fails loudly instead of hanging the test.
+      // holdWatchFail: once released, serve `fail` (not `pass`) so the blocker
+      // settles terminally failed — cascading an in-flight overlap-dependent
+      // via the #20 abort branch.
+      const fail = Array.isArray(scen.holdWatchFail) && scen.holdWatchFail.includes(num);
       for (let i = 0; i < 6000; i++) {
         const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
         if (s.dependentLaunched) {
-          outcome = "pass";
+          outcome = fail ? "fail" : "pass";
           break;
         }
         await sleep(5);
       }
-      outcome = "pass";
+      outcome = fail ? "fail" : "pass";
     }
 
     if (outcome === "none") {

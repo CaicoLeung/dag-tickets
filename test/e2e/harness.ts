@@ -39,6 +39,7 @@ import { DEFAULT_STATE, type ShimState } from "./shims/util.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SHIM_GH = join(__dirname, "shims", "gh.js");
 const SHIM_PASEO = join(__dirname, "shims", "paseo.js");
+const SHIM_GIT = join(__dirname, "shims", "git.js");
 const SHIM_UTIL = join(__dirname, "shims", "util.ts");
 /** Fixed run-id so state.json / events.jsonl land at a known path per repo. */
 export const RUN_ID = "e2e";
@@ -66,10 +67,45 @@ export interface ScenarioOpts {
   implementFails?: number[];
   /** Ticket numbers whose `paseo run` returns status "failed" (→ implement-failed). */
   runFails?: number[];
+  /** Ticket numbers whose FIX dispatch returns status "failed" → a review that
+   *  found ISSUES enters the fix-loop, the fix round fails → terminal
+   *  `fix-failed`. Drives the fix-failed E2E gap (a FailureReason never hit at
+   *  E2E before). */
+  fixFails?: number[];
+  /** Ticket numbers whose triage/research single-shot dispatch returns status
+   *  "failed" → terminal `single-shot-failed`. Drives the single-shot-failed
+   *  E2E gap (a FailureReason never hit at E2E before). */
+  singleShotFails?: number[];
   /** Per-ticket CI outcome sequence served one per `gh pr checks --watch` call
    *  (e.g. `["fail","pass"]` → attempt 1 CI fails, attempt 2 passes). Drives
    *  the transient-retry loop with a real transient-then-success outcome. */
   checksSeq?: Record<string, string[]>;
+  /** Ticket numbers whose FIRST implement dispatch hangs past the agent
+   *  wall budget so `run()` kills it (timedOut) → `agent-timeout` (transient)
+   *  → backoff-and-retry. The latch is persisted BEFORE the hang (the kill
+   *  can't write), so the retry's dispatch materialises a commit and succeeds.
+   *  When set, the harness ALSO collapses `DAG_AGENT_TIMEOUT_MS` to ~ms (see
+   *  setup/teardown) so the kill lands fast — no test touches the env var
+   *  itself. Closes the last transient-reason E2E gap (every FailureReason now
+   *  E2E-covered). */
+  timeouts?: number[];
+  /** How many `git fetch` base-refreshes to FAIL before passing through, so
+   *  `ensureBaseRefFresh` returns false → implement settles transient
+   *  `stale-base` (#15). Self-limiting via the git shim's `baseFetchFails`
+   *  counter, so the retry's fetch succeeds and the ticket converges. When set,
+    *  the harness installs a `git` shim on PATH (passthrough for every other git
+   *  subcommand) + resolves DAG_E2E_REAL_GIT. Drives the stale-base E2E gap. */
+  fetchFailBase?: number;
+  /** Ticket numbers whose FIRST `gh pr checks --watch` sleeps past the
+   *  parent's `--ci-watch-timeout-minutes` ceiling so `run()` kills it
+   *  (timedOut) → `{state:"fail", failed:["checks-watch-timeout"]}` → transient
+   *  ci-failed → backoff-and-retry. The latch is persisted BEFORE the sleep
+   *  (the kill can't write), so the retry's watch falls through to the normal
+   *  scripted `checks` outcome. When set, the harness ALSO collapses
+   *  `DAG_CI_WATCH_TIMEOUT_MS` to ~ms (see setup/teardown) so the kill lands
+   *  fast — no test touches the env var itself. Drives the #1 E2E gap (README's
+   *  load-bearing availability path). */
+  stuckChecksFirst?: number[];
   /** Ticket numbers whose first primary-provider dispatch emits a 429 body
    *  (→ rate-limited) so runWithFallback retries on the fallback provider. */
   rateLimited?: number[];
@@ -88,6 +124,13 @@ export interface ScenarioOpts {
    *  Holding on the dependent's implement (not the pacer's merge) removes the
    *  race where the blocker would settle before the dependent launched. */
   holdWatch?: number[];
+  /** Subset of `holdWatch` whose held --watch returns `fail` (not `pass`) once
+   *  released — so a blocker stays in flight at CI (head already pushed →
+   *  dependents can overlap) and then settles terminally failed. With
+   *  `--max-ticket-retries 0` that ci-failed is terminal, which cascades a
+   *  still-in-flight overlap-dependent via the #20 abort branch (cascade-abort)
+   *  instead of the not-yet-started `mark` branch. Drives the #2 E2E gap. */
+  holdWatchFail?: number[];
   /** Ticket numbers whose implement dispatch sets state.dependentLaunched = true
    *  (the release signal for a held `holdWatch` blocker). */
   dependentImpl?: number[];
@@ -109,6 +152,9 @@ export interface Env {
   prevHome: string | undefined;
   prevRetryBase: string | undefined;
   prevRetryMax: string | undefined;
+  prevRealGit: string | undefined;
+  prevAgentTimeout: string | undefined;
+  prevCiWatchTimeout: string | undefined;
 }
 
 /** Run a command synchronously, throwing a formatted error on non-zero exit. */
@@ -168,13 +214,19 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     verdicts: opts.verdicts ?? {},
     implementFails: opts.implementFails ?? [],
     runFails: opts.runFails ?? [],
+    fixFails: opts.fixFails ?? [],
+    singleShotFails: opts.singleShotFails ?? [],
     checksSeq: opts.checksSeq ?? {},
     rateLimited: opts.rateLimited ?? [],
     connectionErrors: opts.connectionErrors ?? [],
     pacerUntil: opts.pacerUntil ?? {},
     holdWatch: opts.holdWatch ?? [],
+    holdWatchFail: opts.holdWatchFail ?? [],
     dependentImpl: opts.dependentImpl ?? [],
     mergeDeleteBranchFails: opts.mergeDeleteBranchFails ?? [],
+    stuckChecksFirst: opts.stuckChecksFirst ?? [],
+    timeouts: opts.timeouts ?? [],
+    fetchFailBase: opts.fetchFailBase ?? 0,
   };
 }
 
@@ -191,6 +243,13 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   await installShim(SHIM_GH, join(shimBin, "gh"));
   await installShim(SHIM_PASEO, join(shimBin, "paseo"));
   await installShimUtil(shimBin);
+  // The `git` shim is installed ONLY for stale-base scenarios: it intercepts
+  // `git fetch` to force a transient fetch failure, passing every other git
+  // subcommand through to the real binary. Installing it unconditionally would
+  // route EVERY git call in EVERY test through bun→git (a real perf hit across
+  // the suite), so it's opt-in via fetchFailBase.
+  const wantGitShim = (opts.fetchFailBase ?? 0) > 0;
+  if (wantGitShim) await installShim(SHIM_GIT, join(shimBin, "git"));
 
   // Bare origin with HEAD → main (push target; no network).
   sh("git", ["init", "--bare", origin]);
@@ -224,6 +283,26 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   const prevHome = process.env.HOME;
   const prevRetryBase = process.env.DAG_RETRY_BASE_MS;
   const prevRetryMax = process.env.DAG_RETRY_MAX_MS;
+  const prevRealGit = process.env.DAG_E2E_REAL_GIT;
+  // The agent-timeout / ci-watch collapses are bound 1:1 to their scenario
+  // opts, so the harness owns them: setting them here (not in each test)
+  // means a test can never forget to set OR forget to clear one. teardown()
+  // restores both. Values mirror what the two tests set by hand before this
+  // centralisation (~ms, paired with the shims' bounded hangs/sleeps).
+  const prevAgentTimeout = process.env.DAG_AGENT_TIMEOUT_MS;
+  const prevCiWatchTimeout = process.env.DAG_CI_WATCH_TIMEOUT_MS;
+  // Resolve the REAL git against the pre-shim PATH (prevPath has no shimBin),
+  // so the git shim's passthrough never resolves back to itself. Only needed
+  // when the git shim is installed; resolved here (before PATH mutation) so the
+  // lookup is unconditional and stable.
+  if (wantGitShim) {
+    const which = spawnSync("which", ["git"], { env: { ...process.env, PATH: prevPath }, encoding: "utf8" });
+    const realGit = (which.stdout ?? "").trim();
+    if (which.status !== 0 || !realGit) {
+      throw new Error(`e2e harness: could not resolve real git on PATH=${prevPath} for the git shim`);
+    }
+    process.env.DAG_E2E_REAL_GIT = realGit;
+  }
   process.env.PATH = `${shimBin}:${prevPath}`;
   process.env.HOME = root;
   process.env.DAG_E2E_SCENARIO = scenarioPath;
@@ -238,8 +317,14 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   // default caps stay unchanged there.
   process.env.DAG_RETRY_BASE_MS = "1";
   process.env.DAG_RETRY_MAX_MS = "1";
+  // Collapse the agent / ci-watch wall budgets ONLY when the corresponding
+  // scenario opt is present, so a ticket that hangs / sticks is killed in ~ms
+  // instead of burning the prod 60s/30m caps. Prod-identical when the opt is
+  // absent (the env var stays unset → PaseoAgent / flag default stands).
+  if ((opts.timeouts ?? []).length) process.env.DAG_AGENT_TIMEOUT_MS = "300";
+  if ((opts.stuckChecksFirst ?? []).length) process.env.DAG_CI_WATCH_TIMEOUT_MS = "300";
 
-  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax };
+  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax, prevRealGit, prevAgentTimeout, prevCiWatchTimeout };
 }
 
 /** Restore env + remove the temp root. Safe to call in afterEach. */
@@ -253,6 +338,12 @@ export async function teardown(env: Env): Promise<void> {
   else process.env.DAG_RETRY_BASE_MS = env.prevRetryBase;
   if (env.prevRetryMax === undefined) delete process.env.DAG_RETRY_MAX_MS;
   else process.env.DAG_RETRY_MAX_MS = env.prevRetryMax;
+  if (env.prevRealGit === undefined) delete process.env.DAG_E2E_REAL_GIT;
+  else process.env.DAG_E2E_REAL_GIT = env.prevRealGit;
+  if (env.prevAgentTimeout === undefined) delete process.env.DAG_AGENT_TIMEOUT_MS;
+  else process.env.DAG_AGENT_TIMEOUT_MS = env.prevAgentTimeout;
+  if (env.prevCiWatchTimeout === undefined) delete process.env.DAG_CI_WATCH_TIMEOUT_MS;
+  else process.env.DAG_CI_WATCH_TIMEOUT_MS = env.prevCiWatchTimeout;
   await rm(env.root, { recursive: true, force: true });
 }
 

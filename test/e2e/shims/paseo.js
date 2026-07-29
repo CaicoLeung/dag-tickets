@@ -126,8 +126,17 @@ import {
     // commit ahead of base, unless the scenario scripts an empty implement.
     const emptyImpl =
       Array.isArray(scen.implementFails) && scen.implementFails.includes(num);
+    // failRun covers three failure modes, each scoped to the skill that produces
+    // its reason: runFails→implement-failed (branch-off), fixFails→fix-failed
+    // (checkout-branch), singleShotFails→single-shot-failed (triage/research).
+    // All three resolve to a `failed` status envelope here; the lifecycle maps
+    // the skill to its FailureReason.
     const failRun =
-      Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "";
+      (Array.isArray(scen.runFails) && scen.runFails.includes(num) && skill !== "") ||
+      (skill === "fix" && Array.isArray(scen.fixFails) && scen.fixFails.includes(num)) ||
+      ((skill === "triage" || skill === "research") &&
+        Array.isArray(scen.singleShotFails) &&
+        scen.singleShotFails.includes(num));
 
     // Overlap choreography: a dependent's implement flipping dependentLaunched
     // is the release signal for a held `holdWatch` blocker. Set it before the
@@ -170,6 +179,33 @@ import {
       });
       if (connErr) {
         err("paseo run failed: fetch failed: Error: connect ECONNRESET 203.0.113.10:443\n");
+        exit(1);
+      }
+    }
+
+    // Agent-timeout simulation: the FIRST implement dispatch for a ticket in
+    // `timeouts` hangs past the agent wall budget so `run()` kills it
+    // (timedOut) → implFailReason "timeout" → transient agent-timeout. The
+    // latch is persisted BEFORE the hang (the kill can't write it), so the
+    // retry's dispatch falls through to branch materialisation and succeeds.
+    // Bounded sleep so a missing-timeout bug fails loudly instead of hanging.
+    if (
+      wtMode === "branch-off" &&
+      skill === "implement" &&
+      num &&
+      Array.isArray(scen.timeouts) &&
+      scen.timeouts.includes(num)
+    ) {
+      let willHang = false;
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.timeoutHit = s.timeoutHit || {};
+        willHang = !s.timeoutHit[String(num)];
+        if (willHang) s.timeoutHit[String(num)] = true;
+        await writeJson(STATE, s);
+      });
+      if (willHang) {
+        await sleep(10000); // killed by run() at waitMs+grace; reached only if no timeout (bug)
         exit(1);
       }
     }

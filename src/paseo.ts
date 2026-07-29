@@ -62,6 +62,13 @@ export async function loadPrefs(): Promise<ProviderPrefs> {
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
 
+/** Grace margin so `paseo run`'s own `--wait-timeout` fires before run()'s
+ *  hard kill: proportional to `waitMs`, floored at 1s and capped at 60s. Capped
+ *  at 60s so a real long run (default 60min) keeps the unchanged prod margin;
+ *  a tiny `waitMs` (e.g. the e2e suite via DAG_AGENT_TIMEOUT_MS) gets a tiny
+ *  grace so the kill lands in ~ms instead of waiting a flat 60s. */
+const dispatchGraceMs = (waitMs: number): number => Math.min(60_000, Math.max(1_000, waitMs));
+
 /** Interval between `paseo logs` reads while waiting for the agent's transcript
  *  to stop changing. Read at call time (not module load) so a caller can adjust
  *  it via env between dispatches — prod leaves it unset → 2000ms (unchanged). */
@@ -169,7 +176,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   }
   args.push(prompt);
 
-  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + 60_000 });
+  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs) });
   let status = r.ok ? "completed" : "failed";
   let output = r.stdout;
   if (r.ok) {

@@ -31,6 +31,8 @@ import {
 import { EVT } from "../../src/events.ts";
 import { statePath, type RunState, type TicketState } from "../../src/state.ts";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { mkdir, writeFile } from "node:fs/promises";
 
 describe("e2e: arg-only exits (no dispatch)", () => {
@@ -469,6 +471,86 @@ describe("e2e: transient retry + backoff (#21)", () => {
       await teardown(env);
     }
   }, 30_000);
+
+  test("implement dispatch exceeds the wall budget → transient agent-timeout retry converges", async () => {
+    // An agent run that blows its wall budget is killed by run() (timedOut) →
+    // implFailReason "timeout" → transient `agent-timeout` → backoff-and-retry.
+    // Pre-this-test `agent-timeout` was never hit at E2E. Of the six transient
+    // FailureReasons this now puts five behind an E2E assertion (ci-failed /
+    // rate-limited / connection-error / agent-timeout here, plus the #38 merge
+    // path); the remaining two — `stale-base` (needs a broken origin fetch the
+    // harness can't yet script) and `merge-race` (the #38 reconcile exists
+    // specifically to PREVENT it settling) — stay unit-only for now.
+    //
+    // The harness collapses DAG_AGENT_TIMEOUT_MS to ~ms automatically when
+    // `timeouts` is set; the shim's `timeouts` knob hangs the first implement
+    // dispatch past it (latched before the kill, so the retry materialises a
+    // commit and succeeds).
+    const env = await setup({
+      issues: [issue(18, "Slow agent")],
+      verdicts: { "18": ["clean"] },
+      timeouts: [18],
+    });
+    try {
+      expect(await runMain(env, ["18", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 18);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 wall-budget-exceeded + 1 succeeded
+
+      const retries = (await readEvents(env))!.filter(
+        (e) => e.type === EVT.TICKET_RETRY && e.ticket === 18,
+      );
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("agent-timeout");
+
+      // The timeout fired at IMPLEMENT (pre-createPr), so attempt 1 opened no
+      // PR; the retry opened exactly one and merged it. (Contrast ci-failed,
+      // which fires post-createPr and so leaves a PR open per attempt.)
+      expect((await readShimState(env)).prCounter).toBe(1001);
+      expect((await readShimState(env)).merged).toContain(1001);
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
+
+  test("origin fetch fails → transient stale-base retry converges (#15)", async () => {
+    // ensureBaseRefFresh's `git fetch` failing (offline / no remote / refused)
+    // must fail the implement as transient `stale-base` rather than silently
+    // branching off a stale tip — a dependent composing on pre-merge code is
+    // exactly the CI/merge-conflict failure #15 prevents. Pre-this-test
+    // stale-base was unit-only: the harness's bare origin always fetches, and
+    // stale-base returns BEFORE dispatch so no shim could "repair" the origin
+    // between attempts. A dedicated `git` shim (installed ONLY for this scenario
+    // via fetchFailBase) makes the fetch failure SELF-LIMITING — it advances
+    // its own counter before failing, so the retry's fetch passes through and
+    // the ticket converges.
+    const env = await setup({
+      issues: [issue(19, "Needs a fresh base")],
+      verdicts: { "19": ["clean"] },
+      fetchFailBase: 1,
+    });
+    try {
+      expect(await runMain(env, ["19", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 19);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 fetch-failed + 1 succeeded
+
+      const retries = (await readEvents(env))!.filter(
+        (e) => e.type === EVT.TICKET_RETRY && e.ticket === 19,
+      );
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("stale-base");
+
+      // stale-base fires pre-createPr, so attempt 1 opened no PR; the retry
+      // opened exactly one and merged it.
+      expect((await readShimState(env)).prCounter).toBe(1001);
+      expect((await readShimState(env)).merged).toContain(1001);
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
 });
 
 describe("e2e: rate-limit fallback (#7)", () => {
@@ -669,6 +751,54 @@ describe("e2e: agent failure modes", () => {
       await teardown(env);
     }
   });
+
+  test("fix round dispatch fails → terminal fix-failed", async () => {
+    // A review that found ISSUES enters the fix-loop; if the fix dispatch
+    // itself fails (agent crashed / produced nothing) the ticket settles
+    // terminal `fix-failed` — distinct from implement-failed (the fix step,
+    // not the implement step, broke). Pre-this-test `fix-failed` was a
+    // FailureReason never hit at E2E (the shim's fix always succeeded).
+    const env = await setup({
+      issues: [issue(16, "Fixable work")],
+      verdicts: { "16": ["issues:2"] },
+      fixFails: [16],
+    });
+    try {
+      expect(await runMain(env, ["16", "--max-fix-rounds", "1"])).toBe(1);
+
+      const t = ticketOf((await readState(env))!, 16);
+      expect(t.status).toBe("failed");
+      expect(t.reason).toBe("fix-failed");
+      // (rounds is not persisted on the fix-failed path — lifecycle's fail()
+      // helper omits it, unlike the ci-failed return — so don't assert it.)
+
+      // No PR was ever opened — the ticket died in the fix-loop, pre-createPr.
+      expect((await readShimState(env)).prCounter).toBe(1000);
+    } finally {
+      await teardown(env);
+    }
+  });
+
+  test("triage single-shot dispatch fails → terminal single-shot-failed (no PR)", async () => {
+    // A triage/research single-shot that fails settles terminal
+    // `single-shot-failed`. Pre-this-test `single-shot-failed` was a
+    // FailureReason never hit at E2E (the shim's single-shot always completed).
+    const env = await setup({
+      issues: [{ number: 17, title: "Broken triage", labels: ["needs-triage"] }],
+      singleShotFails: [17],
+    });
+    try {
+      expect(await runMain(env, ["--label", "needs-triage"])).toBe(1);
+
+      const t = ticketOf((await readState(env))!, 17);
+      expect(t.status).toBe("failed");
+      expect(t.reason).toBe("single-shot-failed");
+      expect(t.pr).toBeUndefined();
+      expect((await readShimState(env)).prCounter).toBe(1000);
+    } finally {
+      await teardown(env);
+    }
+  });
 });
 
 describe("e2e: lock stale-pid recovery", () => {
@@ -691,6 +821,185 @@ describe("e2e: lock stale-pid recovery", () => {
   });
 });
 
+// --- new coverage: ci-watch-timeout / cascade-abort / SIGINT ----------------
+
+describe("e2e: ci-watch-timeout (the load-bearing availability path)", () => {
+  test("a stuck `gh pr checks --watch` hits the ceiling → transient ci-failed → retry converges", async () => {
+    // README names this "the one load-bearing availability risk": a stuck /
+    // never-completing check would otherwise poll forever and starve a
+    // concurrency slot. The --ci-watch-timeout-minutes ceiling turns that into
+    // a transient ci-failed the retry loop backs off and clears. Pre-this-test
+    // the whole chain (run() kills the stuck gh → timedOut → watchChecks maps
+    // to {state:fail, failed:["checks-watch-timeout"]} → transient → backoff →
+    // retry) was only reasoned about, never run end-to-end.
+    //
+    // The harness collapses DAG_CI_WATCH_TIMEOUT_MS to ~ms automatically when
+    // `stuckChecksFirst` is set (the flag is whole minutes — too coarse for a
+    // fast test), exactly like DAG_RETRY_* collapses the backoff. The shim's
+    // stuckChecksFirst sleeps past that ceiling on the FIRST watch (latched
+    // before the kill, so the retry's watch falls through to the scripted
+    // `none` outcome → CI ok → merge).
+    const env = await setup({
+      issues: [issue(4, "Stuck CI")],
+      verdicts: { "4": ["clean"] },
+      stuckChecksFirst: [4],
+    });
+    try {
+      expect(await runMain(env, ["4", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 4);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 stuck-timeout + 1 succeeded
+
+      const events = (await readEvents(env))!;
+      // The timeout-fired CI result carries the canonical checks-watch-timeout
+      // marker — the one an operator greps for.
+      const stuckCi = events.find((e) => {
+        if (e.type !== EVT.CI_RESULT || e.ticket !== 4) return false;
+        const failed = e.data?.failed;
+        return Array.isArray(failed) && failed.includes("checks-watch-timeout");
+      });
+      expect(stuckCi).toBeDefined();
+      expect(stuckCi!.data?.state).toBe("fail");
+      // It was classified transient and retried (not terminal at retries=0).
+      const retries = events.filter((e) => e.type === EVT.TICKET_RETRY && e.ticket === 4);
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("ci-failed");
+
+      // The retry's second attempt opened a fresh PR and merged it.
+      expect((await readShimState(env)).prCounter).toBe(1002);
+      expect((await readShimState(env)).merged).toContain(1002);
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
+});
+
+describe("e2e: cascade-abort of an in-flight dependent (#20)", () => {
+  test("blocker fails terminally while an overlap-dependent is in flight → dependent cascade-aborted", async () => {
+    // The #20 abort branch (applyCascadePlan kind:"abort") fires when a
+    // dependent is GENUINELY in flight when its blocker settles failed. Under
+    // the strict frontier that can't happen; it needs overlap (#29). The unit
+    // tests prove applyCascadePlan with an injected fake; this proves the real
+    // scheduler + cli wiring reaches the abort branch (not the mark branch)
+    // under a real overlap launch.
+    //
+    // Choreography (mirror of the #29 overlap test, but the blocker FAILS):
+    //   #1 (blocker)  — holdWatchFail: its `pr checks --watch` blocks until
+    //                   state.dependentLaunched, then returns FAIL. With
+    //                   --max-ticket-retries 0 that ci-failed is terminal.
+    //   #2 (dependent)— dependentImpl: its implement flips dependentLaunched
+    //                   (the release signal for #1's held watch). It then parks
+    //                   at waitForBlockers([1]) — genuinely in flight — when #1
+    //                   settles.
+    //   #3 (pacer)    — pacerUntil {3:1}: its implement blocks until #1 pushed
+    //                   its head; when #3 settles (freeing a slot) #2 overlap-
+    //                   launches on #1's pushed head.
+    // When #1 settles failed, #2 is in flight → applyCascade ABORTS it: records
+    // it cascade-skipped, emits TICKET_CASCADE{reason:cascade-abort}, and fires
+    // agent.abort (best-effort stop + clean).
+    //
+    // SCOPE NOTE: the scheduler deletes an aborted dependent from its in-flight
+    // map but does NOT cancel its pending processTicket promise (the T05
+    // cancel-semantics work). That orphaned promise may resume after #1 settles
+    // and append its own step/pr events — so this test asserts the deterministic
+    // abort contract (the cascade event + the single skipped TICKET_END, both
+    // emitted synchronously at abort time, before any resume) and does NOT
+    // assert #2's final state.json status or merged-set membership.
+    const env = await setup({
+      issues: [
+        issue(1, "Base work"),
+        issue(2, "Dependent work", [1]),
+        issue(3, "Pacer"),
+      ],
+      verdicts: { "1": ["clean"], "2": ["clean"], "3": ["clean"] },
+      pacerUntil: { "3": 1 },
+      holdWatch: [1],
+      holdWatchFail: [1],
+      dependentImpl: [2],
+    });
+    try {
+      // #1's ci-failed is terminal at retries 0 → it settles failed (not retried).
+      expect(await runMain(env, ["1", "2", "3", "--concurrency", "2", "--max-ticket-retries", "0"])).toBe(1);
+
+      const state = (await readState(env))!;
+      // The blocker settled terminal ci-failed (deterministic — #1 is never
+      // resumed, only its dependents can be).
+      expect(ticketOf(state, 1).status).toBe("failed");
+      expect(ticketOf(state, 1).reason).toBe("ci-failed");
+
+      const events = (await readEvents(env))!;
+      // The abort branch fired for the dependent — this event ONLY emits from
+      // applyCascadePlan's abort path, proving the scheduler reached ABORT (not
+      // the not-yet-started MARK path the existing cascade test covers).
+      const cascade = events.filter(
+        (e) => e.type === EVT.TICKET_CASCADE && e.ticket === 2,
+      );
+      expect(cascade.length).toBe(1);
+      expect(cascade[0]?.data?.reason).toBe("cascade-abort");
+      expect(cascade[0]?.data?.status).toBe("skipped");
+      expect(Array.isArray(cascade[0]?.data?.from)).toBe(true);
+      expect(cascade[0]?.data?.from).toContain(1);
+
+      // Exactly ONE TICKET_END for #2, and it is the aborted (skipped /
+      // cascade-abort) one. The orphaned resume never emits a TICKET_END (that's
+      // scheduler-only, and #2 was removed from the in-flight map), so this
+      // count is stable regardless of the resume race.
+      const ends = events.filter((e) => e.type === EVT.TICKET_END && e.ticket === 2);
+      expect(ends.length).toBe(1);
+      expect(ends[0]?.data?.status).toBe("skipped");
+      expect(ends[0]?.data?.reason).toBe("cascade-abort");
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
+});
+
+describe("e2e: SIGINT releases the lock + flushes the event trace (#40)", () => {
+  test("Ctrl-C mid-run exits 130, releases run.lock, leaves a complete ordered event prefix", async () => {
+    // #40's RunExit coordinates stop→flush→release across signal exits. The
+    // unit tests prove the ordering with an injected `exit` fake; this proves
+    // the REAL signal→cleanup→lock-release chain against a spawned binary: a
+    // run interrupted mid-flight must not orphan the repo-wide run.lock (the
+    // next run would then fail with EX_TEMPFAIL) nor lose its event trace.
+    //
+    // holdWatch (no dependent) parks the run at `gh pr checks --watch` —
+    // ticket in flight, lock HELD — so the signal lands while the lock is
+    // genuinely owned (proving release matters). We signal right after the
+    // "PR #N opened" marker (the line that precedes watchChecks).
+    const env = await setup({
+      issues: [issue(1, "Interrupt me")],
+      verdicts: { "1": ["clean"] },
+      holdWatch: [1],
+    });
+    try {
+      const res = await spawnBinAndWaitFor(env, ["1"], "PR #1001 opened", "SIGINT");
+
+      // Shell convention: 128 + SIGINT(2) = 130.
+      expect(res.code).toBe(130);
+
+      // The lock was released by the signal cleanup (not left held → the next
+      // run would otherwise fail EX_TEMPFAIL forever).
+      expect(lockExists(env)).toBe(false);
+
+      // The event trace flushed before exit: every line parses (runEvents
+      // throws on a truncated/malformed tail) and carries the run prefix up to
+      // the interruption. RUN_END is emitted only at clean completion, so its
+      // absence proves the run was genuinely interrupted mid-flight.
+      const events = await readEvents(env);
+      expect(events).not.toBeNull();
+      const types = events!.map((e) => e.type);
+      expect(types).toContain(EVT.RUN_START);
+      expect(types).not.toContain(EVT.RUN_END);
+      // seq is monotonic in emit order — the flush preserved ordering.
+      const seqs = events!.map((e) => e.seq);
+      expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+    } finally {
+      await teardown(env);
+    }
+  }, 20_000);
+});
+
 // --- helpers ---------------------------------------------------------------
 
 function issue(n: number, title: string, blockedBy: number[] = []): IssueSpec {
@@ -711,4 +1020,46 @@ async function seedRunState(env: Env, state: object): Promise<void> {
   const full = join(env.repo, statePath("e2e"));
   await mkdir(join(full, ".."), { recursive: true });
   await writeFile(full, JSON.stringify(state, null, 2) + "\n", "utf8");
+}
+
+/** Spawn the real `bin/dag-tickets.ts` as a child (inheriting the harness's
+ *  shim PATH / scenario env), wait for `marker` to appear on its stderr, then
+ *  deliver `sig`. Resolves with the child's exit code + captured stderr. Used
+ *  by the SIGINT test, which can't use the in-process runMain() because
+ *  signals target processes, not async functions. */
+function spawnBinAndWaitFor(
+  env: Env,
+  args: string[],
+  marker: string,
+  sig: NodeJS.Signals = "SIGINT",
+  timeoutMs = 15_000,
+): Promise<{ code: number; stderr: string }> {
+  const bin = fileURLToPath(new URL("../../bin/dag-tickets.ts", import.meta.url));
+  const child = spawn(process.execPath, [bin, ...args, "--cwd", env.repo, "--run-id", "e2e"], {
+    cwd: env.repo,
+    env: { ...process.env },
+  });
+  let stderr = "";
+  let signaled = false;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      reject(new Error(`spawnBinAndWaitFor: timed out after ${timeoutMs}ms waiting for exit (marker=${JSON.stringify(marker)})\nstderr:\n${stderr}`));
+    }, timeoutMs);
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr += d.toString();
+      if (!signaled && stderr.includes(marker)) {
+        signaled = true;
+        try { child.kill(sig); } catch { /* race with natural exit */ }
+      }
+    });
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? -1, stderr });
+    });
+  });
 }
