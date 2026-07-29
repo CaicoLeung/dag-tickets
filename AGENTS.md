@@ -35,8 +35,9 @@ Issues for this repo live as GitHub issues (via the `gh` CLI). See `docs/agents/
 
 ### Triage labels
 
-Five canonical labels, each named after its role: `needs-triage`, `needs-info`,
-`ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+Seven canonical triage roles — two **category** (`bug`, `enhancement`) and five
+**state** (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`,
+`wontfix`). See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

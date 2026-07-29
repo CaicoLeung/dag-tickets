@@ -7,7 +7,7 @@
  * skills describe.
  */
 
-export type TicketKind = "implement" | "triage" | "research" | "unknown";
+export type TicketKind = "implement" | "triage" | "research" | "skip" | "unknown";
 
 /** Lifecycle of one ticket within a run. Persisted for resume. */
 export type TicketStatus =
@@ -16,7 +16,7 @@ export type TicketStatus =
   | "running" // an agent pipeline is in flight for this ticket
   | "done" // merged (implement) or completed (triage/research)
   | "failed" // exhausted retries / fix-loop; needs human attention
-  | "skipped"; // unknown kind, closed, or filtered out
+  | "skipped"; // unknown kind, intentional skip (ready-for-human/wontfix/needs-info), closed, or filtered out
 
 /**
  * Non-natural settle marker — why a ticket settled other than by running to

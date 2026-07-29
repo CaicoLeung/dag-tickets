@@ -92,7 +92,7 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 
 ## How a ticket flows
 
-1. **Route by label.** `ready-for-agent` → implement lifecycle (PR + merge). `needs-triage` → `/triage` single-shot. Research labels → `/research` single-shot. Unlabelled issues are skipped with a warning (override the routing labels if yours differ).
+1. **Route by label** (on the **state** role). `ready-for-agent` → implement lifecycle (PR + merge). `needs-triage` → `/triage` single-shot. Research labels → `/research` single-shot. An issue with a **category** role (`bug`/`enhancement`) but *no* state role is an "orphan" → `/triage`. `needs-info` / `ready-for-human` / `wontfix` are intentionally skipped (not for a batch agent). Override any list with `--impl-label` / `--triage-label` / `--category-label` / `--skip-label`.
 2. **Build the DAG.** `Blocked by` edges are read from each issue body — both `#NN` references and **title references** (e.g. `Blocked by: T2 — Ticket-type labels + routing dispatch`), which are matched to batch tickets by normalised title. A cycle aborts the run.
 3. **Walk the frontier.** Tickets with all blockers done launch up to `--concurrency` at a time. Each runs in its own fresh Paseo worktree. When one finishes, its dependents become eligible.
 4. **Per implement ticket:** `paseo run` `/implement` (branch-off from the default branch) → fresh `paseo run` `/code-review` against `origin/<default>` → if the verdict is `ISSUES`, a bounded fix-loop (fix agent → re-review) up to `--max-fix-rounds` → `gh pr create` → `gh pr checks --watch` → `gh pr merge` + close the issue.

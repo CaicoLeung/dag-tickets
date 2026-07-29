@@ -338,6 +338,16 @@ Report what you changed and the final test result.`;
 }
 
 export function singleShotPrompt(skill: string, t: Ticket): string {
+  // Unattended /triage runs without a maintainer to confirm destructive
+  // actions, so it is fenced at the write boundary (ADR-0001): non-destructive
+  // transitions + comments are fine; closing the issue or applying `wontfix`
+  // is not — those need a human. Research writes a markdown asset, not the
+  // tracker, so the fence only applies to triage.
+  const triageBoundary = skill === "triage" ? `
+## Write boundary (unattended)
+There is no maintainer to confirm destructive actions.
+- You MAY apply non-destructive state transitions (label \`needs-info\` or \`ready-for-agent\`) and post comments / agent briefs via \`gh\`.
+- You MUST NOT close the issue or apply the \`wontfix\` label — irreversible. If you recommend \`wontfix\`, post the rationale as a comment and leave the issue open for a human.` : "";
   return `You are working one GitHub issue in isolation. The /${skill} skill is available — run it.
 
 ## Task
@@ -346,6 +356,7 @@ Issue URL: ${t.url}
 
 ## Issue body
 ${t.body || "(no body)"}
+${triageBoundary}
 
 Run /${skill} for this issue. When finished, post any required comment/output on the issue via \`gh\` per the skill's contract, then report a one-paragraph summary.`;
 }
