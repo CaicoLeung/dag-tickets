@@ -542,7 +542,7 @@ export async function main(argv: string[]): Promise<number> {
     log("warn", `no routing label (need one of ${[...cfg.implementLabels, ...cfg.triageLabels, ...cfg.researchLabels].join("/")} or a category role like ${cfg.categoryLabels.join("/")}); skipping`, t.number);
   }
   for (const t of intentionalSkips) {
-    log("info", `intentional skip — [${t.labels.join(", ")}] not for a batch agent; leaving for a human`, t.number);
+    log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
   }
   if (actionable.length === 0) {
     log("info", "no actionable tickets found.");
