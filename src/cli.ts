@@ -52,6 +52,16 @@ function ciWatchMsFromOpts(minutes: number): number | undefined {
   return minutes > 0 ? minutes * MS_PER_MINUTE : undefined;
 }
 
+/** Per-agent-run wall budget override (ms). Unset → undefined → PaseoAgent's
+ *  DEFAULT_RUN_MS (60min). Read at call time so a caller can adjust between
+ *  dispatches; the e2e suite collapses it to ~ms (paired with the paseo shim's
+ *  `timeouts` knob) to exercise the agent-timeout → transient retry path
+ *  without burning 60min. */
+const agentTimeoutMs = (): number | undefined => {
+  const n = Number(process.env.DAG_AGENT_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+};
+
 /** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
  *  completing check otherwise polls indefinitely and starves a concurrency slot
  *  for the rest of the batch — the one load-bearing availability risk in an
@@ -685,7 +695,7 @@ export async function main(argv: string[]): Promise<number> {
     // collapses the backoff. Prod leaves it unset → the flag/default stands.
     const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
-    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events);
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in

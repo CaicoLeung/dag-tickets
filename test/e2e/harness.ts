@@ -79,6 +79,13 @@ export interface ScenarioOpts {
    *  (e.g. `["fail","pass"]` → attempt 1 CI fails, attempt 2 passes). Drives
    *  the transient-retry loop with a real transient-then-success outcome. */
   checksSeq?: Record<string, string[]>;
+  /** Ticket numbers whose FIRST implement dispatch hangs past the agent
+   *  wall budget so `run()` kills it (timedOut) → `agent-timeout` (transient)
+   *  → backoff-and-retry. The latch is persisted BEFORE the hang (the kill
+   *  can't write), so the retry's dispatch materialises a commit and succeeds.
+   *  Pair with DAG_AGENT_TIMEOUT_MS to collapse the wait. Closes the last
+   *  transient-reason E2E gap (every FailureReason now E2E-covered). */
+  timeouts?: number[];
   /** Ticket numbers whose FIRST `gh pr checks --watch` sleeps past the
    *  parent's `--ci-watch-timeout-minutes` ceiling so `run()` kills it
    *  (timedOut) → `{state:"fail", failed:["checks-watch-timeout"]}` → transient
@@ -203,6 +210,7 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     dependentImpl: opts.dependentImpl ?? [],
     mergeDeleteBranchFails: opts.mergeDeleteBranchFails ?? [],
     stuckChecksFirst: opts.stuckChecksFirst ?? [],
+    timeouts: opts.timeouts ?? [],
   };
 }
 

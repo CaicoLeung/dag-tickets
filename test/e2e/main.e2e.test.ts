@@ -471,6 +471,51 @@ describe("e2e: transient retry + backoff (#21)", () => {
       await teardown(env);
     }
   }, 30_000);
+
+  test("implement dispatch exceeds the wall budget → transient agent-timeout retry converges", async () => {
+    // An agent run that blows its wall budget is killed by run() (timedOut) →
+    // implFailReason "timeout" → transient `agent-timeout` → backoff-and-retry.
+    // Pre-this-test `agent-timeout` was never hit at E2E. Of the six transient
+    // FailureReasons this now puts five behind an E2E assertion (ci-failed /
+    // rate-limited / connection-error / agent-timeout here, plus the #38 merge
+    // path); the remaining two — `stale-base` (needs a broken origin fetch the
+    // harness can't yet script) and `merge-race` (the #38 reconcile exists
+    // specifically to PREVENT it settling) — stay unit-only for now.
+    //
+    // DAG_AGENT_TIMEOUT_MS collapses the wall budget to ~ms; the shim's
+    // `timeouts` knob hangs the first implement dispatch past it (latched
+    // before the kill, so the retry materialises a commit and succeeds).
+    const env = await setup({
+      issues: [issue(18, "Slow agent")],
+      verdicts: { "18": ["clean"] },
+      timeouts: [18],
+    });
+    const prevTimeout = process.env.DAG_AGENT_TIMEOUT_MS;
+    process.env.DAG_AGENT_TIMEOUT_MS = "300";
+    try {
+      expect(await runMain(env, ["18", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 18);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 wall-budget-exceeded + 1 succeeded
+
+      const retries = (await readEvents(env))!.filter(
+        (e) => e.type === EVT.TICKET_RETRY && e.ticket === 18,
+      );
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("agent-timeout");
+
+      // The timeout fired at IMPLEMENT (pre-createPr), so attempt 1 opened no
+      // PR; the retry opened exactly one and merged it. (Contrast ci-failed,
+      // which fires post-createPr and so leaves a PR open per attempt.)
+      expect((await readShimState(env)).prCounter).toBe(1001);
+      expect((await readShimState(env)).merged).toContain(1001);
+    } finally {
+      if (prevTimeout === undefined) delete process.env.DAG_AGENT_TIMEOUT_MS;
+      else process.env.DAG_AGENT_TIMEOUT_MS = prevTimeout;
+      await teardown(env);
+    }
+  }, 30_000);
 });
 
 describe("e2e: rate-limit fallback (#7)", () => {

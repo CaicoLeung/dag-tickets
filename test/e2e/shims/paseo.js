@@ -183,6 +183,33 @@ import {
       }
     }
 
+    // Agent-timeout simulation: the FIRST implement dispatch for a ticket in
+    // `timeouts` hangs past the agent wall budget so `run()` kills it
+    // (timedOut) → implFailReason "timeout" → transient agent-timeout. The
+    // latch is persisted BEFORE the hang (the kill can't write it), so the
+    // retry's dispatch falls through to branch materialisation and succeeds.
+    // Bounded sleep so a missing-timeout bug fails loudly instead of hanging.
+    if (
+      wtMode === "branch-off" &&
+      skill === "implement" &&
+      num &&
+      Array.isArray(scen.timeouts) &&
+      scen.timeouts.includes(num)
+    ) {
+      let willHang = false;
+      await withStateLock(STATE, async () => {
+        const s = withDefaults(await readJson(STATE, DEFAULT_STATE));
+        s.timeoutHit = s.timeoutHit || {};
+        willHang = !s.timeoutHit[String(num)];
+        if (willHang) s.timeoutHit[String(num)] = true;
+        await writeJson(STATE, s);
+      });
+      if (willHang) {
+        await sleep(10000); // killed by run() at waitMs+grace; reached only if no timeout (bug)
+        exit(1);
+      }
+    }
+
     if (wtMode === "branch-off" && branch && !emptyImpl && !failRun) {
       const baseSha = git(["rev-parse", base]).stdout.trim();
       const tree = baseSha ? git(["rev-parse", `${base}^{tree}`]).stdout.trim() : "";

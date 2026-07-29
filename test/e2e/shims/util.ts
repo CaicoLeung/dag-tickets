@@ -43,6 +43,11 @@ export interface ShimState {
    *  the normal scripted outcome. Latched BEFORE the stuck sleep because the
    *  timeout kill can't write it. */
   stuckHit: Record<string, boolean>;
+  /** ticket -> bool: a `timeouts` ticket has already burned its one hung
+   *  implement dispatch (killed by run()'s agent-timeout), so the retry's
+   *  dispatch materialises a commit and succeeds. Latched BEFORE the hang
+   *  because the kill can't write it. */
+  timeoutHit: Record<string, boolean>;
   /** ticket -> provider string the paseo shim last received (proves
    *  --provider / --review-provider override wiring through real argv). */
   providers: Record<string, Record<string, string>>;
@@ -68,6 +73,7 @@ export const DEFAULT_STATE: ShimState = Object.freeze({
   rateLimitedHit: {},
   checksIdx: {},
   stuckHit: {},
+  timeoutHit: {},
   providers: {},
   dependentLaunched: false,
 });
