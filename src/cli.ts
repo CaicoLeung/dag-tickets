@@ -42,10 +42,12 @@ const MS_PER_MINUTE = 60_000;
 const retryBaseMs = (): number => Number(process.env.DAG_RETRY_BASE_MS ?? 30_000) || 30_000;
 const retryMaxMs = (): number => Number(process.env.DAG_RETRY_MAX_MS ?? 5 * MS_PER_MINUTE) || 5 * MS_PER_MINUTE;
 
-/** Resolve the `gh pr checks --watch` ceiling in ms. Honours the
- *  `--ci-watch-timeout-minutes` flag (whole minutes), then the raw-ms
- *  `DAG_CI_WATCH_TIMEOUT_MS` escape hatch (e2e / per-host override), then the
- *  default. 0 / unset → undefined → unbounded watch (the pre-flag behaviour). */
+/** Resolve the `gh pr checks --watch` ceiling in ms. The raw-ms
+ *  `DAG_CI_WATCH_TIMEOUT_MS` escape hatch (e2e / per-host override) wins when
+ *  set + valid — a hard override, exactly like `DAG_RETRY_*`; otherwise the
+ *  `--ci-watch-timeout-minutes` flag (whole minutes) applies. `0` flag /
+ *  flag-unset + env-unset → undefined → unbounded watch (the pre-flag
+ *  behaviour). */
 function ciWatchMsFromOpts(minutes: number): number | undefined {
   const envMs = Number(process.env.DAG_CI_WATCH_TIMEOUT_MS);
   if (Number.isFinite(envMs) && envMs > 0) return envMs;

@@ -84,8 +84,10 @@ export interface ScenarioOpts {
    *  wall budget so `run()` kills it (timedOut) → `agent-timeout` (transient)
    *  → backoff-and-retry. The latch is persisted BEFORE the hang (the kill
    *  can't write), so the retry's dispatch materialises a commit and succeeds.
-   *  Pair with DAG_AGENT_TIMEOUT_MS to collapse the wait. Closes the last
-   *  transient-reason E2E gap (every FailureReason now E2E-covered). */
+   *  When set, the harness ALSO collapses `DAG_AGENT_TIMEOUT_MS` to ~ms (see
+   *  setup/teardown) so the kill lands fast — no test touches the env var
+   *  itself. Closes the last transient-reason E2E gap (every FailureReason now
+   *  E2E-covered). */
   timeouts?: number[];
   /** How many `git fetch` base-refreshes to FAIL before passing through, so
    *  `ensureBaseRefFresh` returns false → implement settles transient
@@ -99,8 +101,10 @@ export interface ScenarioOpts {
    *  (timedOut) → `{state:"fail", failed:["checks-watch-timeout"]}` → transient
    *  ci-failed → backoff-and-retry. The latch is persisted BEFORE the sleep
    *  (the kill can't write), so the retry's watch falls through to the normal
-   *  scripted `checks` outcome. Pair with DAG_CI_WATCH_TIMEOUT_MS to collapse
-   *  the wait. Drives the #1 E2E gap (README's load-bearing availability path). */
+   *  scripted `checks` outcome. When set, the harness ALSO collapses
+   *  `DAG_CI_WATCH_TIMEOUT_MS` to ~ms (see setup/teardown) so the kill lands
+   *  fast — no test touches the env var itself. Drives the #1 E2E gap (README's
+   *  load-bearing availability path). */
   stuckChecksFirst?: number[];
   /** Ticket numbers whose first primary-provider dispatch emits a 429 body
    *  (→ rate-limited) so runWithFallback retries on the fallback provider. */
@@ -149,6 +153,8 @@ export interface Env {
   prevRetryBase: string | undefined;
   prevRetryMax: string | undefined;
   prevRealGit: string | undefined;
+  prevAgentTimeout: string | undefined;
+  prevCiWatchTimeout: string | undefined;
 }
 
 /** Run a command synchronously, throwing a formatted error on non-zero exit. */
@@ -278,6 +284,13 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   const prevRetryBase = process.env.DAG_RETRY_BASE_MS;
   const prevRetryMax = process.env.DAG_RETRY_MAX_MS;
   const prevRealGit = process.env.DAG_E2E_REAL_GIT;
+  // The agent-timeout / ci-watch collapses are bound 1:1 to their scenario
+  // opts, so the harness owns them: setting them here (not in each test)
+  // means a test can never forget to set OR forget to clear one. teardown()
+  // restores both. Values mirror what the two tests set by hand before this
+  // centralisation (~ms, paired with the shims' bounded hangs/sleeps).
+  const prevAgentTimeout = process.env.DAG_AGENT_TIMEOUT_MS;
+  const prevCiWatchTimeout = process.env.DAG_CI_WATCH_TIMEOUT_MS;
   // Resolve the REAL git against the pre-shim PATH (prevPath has no shimBin),
   // so the git shim's passthrough never resolves back to itself. Only needed
   // when the git shim is installed; resolved here (before PATH mutation) so the
@@ -304,8 +317,14 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   // default caps stay unchanged there.
   process.env.DAG_RETRY_BASE_MS = "1";
   process.env.DAG_RETRY_MAX_MS = "1";
+  // Collapse the agent / ci-watch wall budgets ONLY when the corresponding
+  // scenario opt is present, so a ticket that hangs / sticks is killed in ~ms
+  // instead of burning the prod 60s/30m caps. Prod-identical when the opt is
+  // absent (the env var stays unset → PaseoAgent / flag default stands).
+  if ((opts.timeouts ?? []).length) process.env.DAG_AGENT_TIMEOUT_MS = "300";
+  if ((opts.stuckChecksFirst ?? []).length) process.env.DAG_CI_WATCH_TIMEOUT_MS = "300";
 
-  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax, prevRealGit };
+  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax, prevRealGit, prevAgentTimeout, prevCiWatchTimeout };
 }
 
 /** Restore env + remove the temp root. Safe to call in afterEach. */
@@ -321,6 +340,10 @@ export async function teardown(env: Env): Promise<void> {
   else process.env.DAG_RETRY_MAX_MS = env.prevRetryMax;
   if (env.prevRealGit === undefined) delete process.env.DAG_E2E_REAL_GIT;
   else process.env.DAG_E2E_REAL_GIT = env.prevRealGit;
+  if (env.prevAgentTimeout === undefined) delete process.env.DAG_AGENT_TIMEOUT_MS;
+  else process.env.DAG_AGENT_TIMEOUT_MS = env.prevAgentTimeout;
+  if (env.prevCiWatchTimeout === undefined) delete process.env.DAG_CI_WATCH_TIMEOUT_MS;
+  else process.env.DAG_CI_WATCH_TIMEOUT_MS = env.prevCiWatchTimeout;
   await rm(env.root, { recursive: true, force: true });
 }
 

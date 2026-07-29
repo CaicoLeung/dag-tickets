@@ -482,16 +482,15 @@ describe("e2e: transient retry + backoff (#21)", () => {
     // harness can't yet script) and `merge-race` (the #38 reconcile exists
     // specifically to PREVENT it settling) — stay unit-only for now.
     //
-    // DAG_AGENT_TIMEOUT_MS collapses the wall budget to ~ms; the shim's
-    // `timeouts` knob hangs the first implement dispatch past it (latched
-    // before the kill, so the retry materialises a commit and succeeds).
+    // The harness collapses DAG_AGENT_TIMEOUT_MS to ~ms automatically when
+    // `timeouts` is set; the shim's `timeouts` knob hangs the first implement
+    // dispatch past it (latched before the kill, so the retry materialises a
+    // commit and succeeds).
     const env = await setup({
       issues: [issue(18, "Slow agent")],
       verdicts: { "18": ["clean"] },
       timeouts: [18],
     });
-    const prevTimeout = process.env.DAG_AGENT_TIMEOUT_MS;
-    process.env.DAG_AGENT_TIMEOUT_MS = "300";
     try {
       expect(await runMain(env, ["18", "--max-ticket-retries", "1"])).toBe(0);
 
@@ -511,8 +510,6 @@ describe("e2e: transient retry + backoff (#21)", () => {
       expect((await readShimState(env)).prCounter).toBe(1001);
       expect((await readShimState(env)).merged).toContain(1001);
     } finally {
-      if (prevTimeout === undefined) delete process.env.DAG_AGENT_TIMEOUT_MS;
-      else process.env.DAG_AGENT_TIMEOUT_MS = prevTimeout;
       await teardown(env);
     }
   }, 30_000);
@@ -836,18 +833,17 @@ describe("e2e: ci-watch-timeout (the load-bearing availability path)", () => {
     // to {state:fail, failed:["checks-watch-timeout"]} → transient → backoff →
     // retry) was only reasoned about, never run end-to-end.
     //
-    // DAG_CI_WATCH_TIMEOUT_MS collapses the ceiling to ~ms (the flag is whole
-    // minutes — too coarse for a fast test), exactly like DAG_RETRY_* collapses
-    // the backoff. The shim's stuckChecksFirst sleeps past that ceiling on the
-    // FIRST watch (latched before the kill, so the retry's watch falls through
-    // to the scripted `none` outcome → CI ok → merge).
+    // The harness collapses DAG_CI_WATCH_TIMEOUT_MS to ~ms automatically when
+    // `stuckChecksFirst` is set (the flag is whole minutes — too coarse for a
+    // fast test), exactly like DAG_RETRY_* collapses the backoff. The shim's
+    // stuckChecksFirst sleeps past that ceiling on the FIRST watch (latched
+    // before the kill, so the retry's watch falls through to the scripted
+    // `none` outcome → CI ok → merge).
     const env = await setup({
       issues: [issue(4, "Stuck CI")],
       verdicts: { "4": ["clean"] },
       stuckChecksFirst: [4],
     });
-    const prevCeiling = process.env.DAG_CI_WATCH_TIMEOUT_MS;
-    process.env.DAG_CI_WATCH_TIMEOUT_MS = "300";
     try {
       expect(await runMain(env, ["4", "--max-ticket-retries", "1"])).toBe(0);
 
@@ -874,8 +870,6 @@ describe("e2e: ci-watch-timeout (the load-bearing availability path)", () => {
       expect((await readShimState(env)).prCounter).toBe(1002);
       expect((await readShimState(env)).merged).toContain(1002);
     } finally {
-      if (prevCeiling === undefined) delete process.env.DAG_CI_WATCH_TIMEOUT_MS;
-      else process.env.DAG_CI_WATCH_TIMEOUT_MS = prevCeiling;
       await teardown(env);
     }
   }, 30_000);

@@ -118,6 +118,8 @@ caps below when unset.
 | `DAG_PASEO_LOG_POLL_MS` | `2000` | Interval between `paseo logs` reads while waiting for the review transcript to stop changing. Lower it on hosts whose paseo log store updates quickly. |
 | `DAG_RETRY_BASE_MS` | `30000` | Base for the whole-ticket transient-retry backoff (full-jitter is applied on top). |
 | `DAG_RETRY_MAX_MS` | `300000` | Cap for the same backoff curve. |
+| `DAG_CI_WATCH_TIMEOUT_MS` | unset → flag default | Raw-ms override for the `--ci-watch-timeout-minutes` ceiling (the flag is whole minutes, too coarse where a tight bound is wanted). When set + valid it wins over the flag, exactly like the `DAG_RETRY_*` hard overrides; unset leaves the flag/default standing. |
+| `DAG_AGENT_TIMEOUT_MS` | unset → `3600000` (60min) | Per-agent-run wall budget. Unset leaves `PaseoAgent`'s 60min default; set to shrink it for quick local batches. |
 
 ## Verify before trusting it
 
