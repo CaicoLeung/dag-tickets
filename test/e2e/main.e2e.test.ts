@@ -516,6 +516,44 @@ describe("e2e: transient retry + backoff (#21)", () => {
       await teardown(env);
     }
   }, 30_000);
+
+  test("origin fetch fails → transient stale-base retry converges (#15)", async () => {
+    // ensureBaseRefFresh's `git fetch` failing (offline / no remote / refused)
+    // must fail the implement as transient `stale-base` rather than silently
+    // branching off a stale tip — a dependent composing on pre-merge code is
+    // exactly the CI/merge-conflict failure #15 prevents. Pre-this-test
+    // stale-base was unit-only: the harness's bare origin always fetches, and
+    // stale-base returns BEFORE dispatch so no shim could "repair" the origin
+    // between attempts. A dedicated `git` shim (installed ONLY for this scenario
+    // via fetchFailBase) makes the fetch failure SELF-LIMITING — it advances
+    // its own counter before failing, so the retry's fetch passes through and
+    // the ticket converges.
+    const env = await setup({
+      issues: [issue(19, "Needs a fresh base")],
+      verdicts: { "19": ["clean"] },
+      fetchFailBase: 1,
+    });
+    try {
+      expect(await runMain(env, ["19", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 19);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 fetch-failed + 1 succeeded
+
+      const retries = (await readEvents(env))!.filter(
+        (e) => e.type === EVT.TICKET_RETRY && e.ticket === 19,
+      );
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("stale-base");
+
+      // stale-base fires pre-createPr, so attempt 1 opened no PR; the retry
+      // opened exactly one and merged it.
+      expect((await readShimState(env)).prCounter).toBe(1001);
+      expect((await readShimState(env)).merged).toContain(1001);
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
 });
 
 describe("e2e: rate-limit fallback (#7)", () => {

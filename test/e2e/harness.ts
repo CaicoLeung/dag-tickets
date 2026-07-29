@@ -39,6 +39,7 @@ import { DEFAULT_STATE, type ShimState } from "./shims/util.ts";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SHIM_GH = join(__dirname, "shims", "gh.js");
 const SHIM_PASEO = join(__dirname, "shims", "paseo.js");
+const SHIM_GIT = join(__dirname, "shims", "git.js");
 const SHIM_UTIL = join(__dirname, "shims", "util.ts");
 /** Fixed run-id so state.json / events.jsonl land at a known path per repo. */
 export const RUN_ID = "e2e";
@@ -86,6 +87,13 @@ export interface ScenarioOpts {
    *  Pair with DAG_AGENT_TIMEOUT_MS to collapse the wait. Closes the last
    *  transient-reason E2E gap (every FailureReason now E2E-covered). */
   timeouts?: number[];
+  /** How many `git fetch` base-refreshes to FAIL before passing through, so
+   *  `ensureBaseRefFresh` returns false → implement settles transient
+   *  `stale-base` (#15). Self-limiting via the git shim's `baseFetchFails`
+   *  counter, so the retry's fetch succeeds and the ticket converges. When set,
+    *  the harness installs a `git` shim on PATH (passthrough for every other git
+   *  subcommand) + resolves DAG_E2E_REAL_GIT. Drives the stale-base E2E gap. */
+  fetchFailBase?: number;
   /** Ticket numbers whose FIRST `gh pr checks --watch` sleeps past the
    *  parent's `--ci-watch-timeout-minutes` ceiling so `run()` kills it
    *  (timedOut) → `{state:"fail", failed:["checks-watch-timeout"]}` → transient
@@ -140,6 +148,7 @@ export interface Env {
   prevHome: string | undefined;
   prevRetryBase: string | undefined;
   prevRetryMax: string | undefined;
+  prevRealGit: string | undefined;
 }
 
 /** Run a command synchronously, throwing a formatted error on non-zero exit. */
@@ -211,6 +220,7 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     mergeDeleteBranchFails: opts.mergeDeleteBranchFails ?? [],
     stuckChecksFirst: opts.stuckChecksFirst ?? [],
     timeouts: opts.timeouts ?? [],
+    fetchFailBase: opts.fetchFailBase ?? 0,
   };
 }
 
@@ -227,6 +237,13 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   await installShim(SHIM_GH, join(shimBin, "gh"));
   await installShim(SHIM_PASEO, join(shimBin, "paseo"));
   await installShimUtil(shimBin);
+  // The `git` shim is installed ONLY for stale-base scenarios: it intercepts
+  // `git fetch` to force a transient fetch failure, passing every other git
+  // subcommand through to the real binary. Installing it unconditionally would
+  // route EVERY git call in EVERY test through bun→git (a real perf hit across
+  // the suite), so it's opt-in via fetchFailBase.
+  const wantGitShim = (opts.fetchFailBase ?? 0) > 0;
+  if (wantGitShim) await installShim(SHIM_GIT, join(shimBin, "git"));
 
   // Bare origin with HEAD → main (push target; no network).
   sh("git", ["init", "--bare", origin]);
@@ -260,6 +277,19 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   const prevHome = process.env.HOME;
   const prevRetryBase = process.env.DAG_RETRY_BASE_MS;
   const prevRetryMax = process.env.DAG_RETRY_MAX_MS;
+  const prevRealGit = process.env.DAG_E2E_REAL_GIT;
+  // Resolve the REAL git against the pre-shim PATH (prevPath has no shimBin),
+  // so the git shim's passthrough never resolves back to itself. Only needed
+  // when the git shim is installed; resolved here (before PATH mutation) so the
+  // lookup is unconditional and stable.
+  if (wantGitShim) {
+    const which = spawnSync("which", ["git"], { env: { ...process.env, PATH: prevPath }, encoding: "utf8" });
+    const realGit = (which.stdout ?? "").trim();
+    if (which.status !== 0 || !realGit) {
+      throw new Error(`e2e harness: could not resolve real git on PATH=${prevPath} for the git shim`);
+    }
+    process.env.DAG_E2E_REAL_GIT = realGit;
+  }
   process.env.PATH = `${shimBin}:${prevPath}`;
   process.env.HOME = root;
   process.env.DAG_E2E_SCENARIO = scenarioPath;
@@ -275,7 +305,7 @@ export async function setup(opts: ScenarioOpts): Promise<Env> {
   process.env.DAG_RETRY_BASE_MS = "1";
   process.env.DAG_RETRY_MAX_MS = "1";
 
-  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax };
+  return { root, repo, origin, shimBin, scenarioPath, statePath, prevPath, prevHome, prevRetryBase, prevRetryMax, prevRealGit };
 }
 
 /** Restore env + remove the temp root. Safe to call in afterEach. */
@@ -289,6 +319,8 @@ export async function teardown(env: Env): Promise<void> {
   else process.env.DAG_RETRY_BASE_MS = env.prevRetryBase;
   if (env.prevRetryMax === undefined) delete process.env.DAG_RETRY_MAX_MS;
   else process.env.DAG_RETRY_MAX_MS = env.prevRetryMax;
+  if (env.prevRealGit === undefined) delete process.env.DAG_E2E_REAL_GIT;
+  else process.env.DAG_E2E_REAL_GIT = env.prevRealGit;
   await rm(env.root, { recursive: true, force: true });
 }
 

@@ -48,6 +48,11 @@ export interface ShimState {
    *  dispatch materialises a commit and succeeds. Latched BEFORE the hang
    *  because the kill can't write it. */
   timeoutHit: Record<string, boolean>;
+  /** How many `git fetch` base-refreshes the git shim has already failed for a
+   *  `fetchFailBase` scenario. Advanced by the git shim itself (before the
+   *  failing fetch) so the failure is self-limiting — the retry's fetch sees
+   *  the bumped counter and passes through. Drives the stale-base E2E path. */
+  baseFetchFails: number;
   /** ticket -> provider string the paseo shim last received (proves
    *  --provider / --review-provider override wiring through real argv). */
   providers: Record<string, Record<string, string>>;
@@ -74,6 +79,7 @@ export const DEFAULT_STATE: ShimState = Object.freeze({
   checksIdx: {},
   stuckHit: {},
   timeoutHit: {},
+  baseFetchFails: 0,
   providers: {},
   dependentLaunched: false,
 });
