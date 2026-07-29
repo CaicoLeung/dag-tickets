@@ -76,6 +76,10 @@ export async function processTicket(
   t: Ticket,
   ctx: RunContext,
   overlap?: OverlapContext,
+  /** #34: per-launch AbortSignal so the lifecycle can observe cancellation
+   *  at every side-effect boundary (post-blocker-wait, reconcile, createPr,
+   *  mergePr, closeIssue). */
+  signal?: AbortSignal,
 ): Promise<TicketOutcome> {
   const rule = routingRuleFor(t.kind);
   if (t.kind === "skip") {
@@ -88,8 +92,8 @@ export async function processTicket(
   }
 
   if (ctx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, ctx);
-  if (rule.expectPr) return runImplementLifecycle(t, ctx, overlap);
-  return runSingleShot(t, rule.skill, ctx);
+  if (rule.expectPr) return runImplementLifecycle(t, ctx, overlap, signal);
+  return runSingleShot(t, rule.skill, ctx, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +108,7 @@ async function runImplementLifecycle(
   t: Ticket,
   ctx: RunContext,
   overlap?: OverlapContext,
+  signal?: AbortSignal,
 ): Promise<TicketOutcome> {
   const branch = branchFor(t.number, t.title);
   // #29: an overlapped dependent composes on its blocker's head (not the
@@ -216,6 +221,9 @@ async function runImplementLifecycle(
   // Overlap can't trigger at concurrency 1, so this can't deadlock: the
   // blocker always holds its own concurrency slot while the dependent waits.
   if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
+  // #34: after the potentially long blocker wait the dispatch may have been
+  // superseded — check before any further side effects (reconcile, createPr).
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
 
   // #29 (pull-model reconcile): before opening a PR, land an overlapped
   // dependent onto the merged integration base. Safe here — between dispatches,
@@ -245,6 +253,8 @@ async function runImplementLifecycle(
   }
 
   // 3. PR.
+  // #34: check before side effects — a superseded dispatch must not create a PR.
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
   const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
@@ -275,6 +285,8 @@ async function runImplementLifecycle(
     ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: false, manual: true });
     return { status: "done", branch, pr, rounds };
   }
+  // #34: check before merge — a superseded dispatch must not merge.
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
   try {
     await ctx.pullRequest.mergePr(pr, ctx.mergeStrategy);
     ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: true });
@@ -291,7 +303,7 @@ async function runImplementLifecycle(
   }
 }
 
-async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
+async function runSingleShot(t: Ticket, skill: string, ctx: RunContext, signal?: AbortSignal): Promise<TicketOutcome> {
   const branch = branchFor(t.number, `${t.title}-shot`);
   ctx.log("info", `${skill} (single-shot)`, t.number);
   const r = await emitTimedStep(
