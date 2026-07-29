@@ -1,5 +1,6 @@
 import { test, expect, describe } from "bun:test";
 import {
+  implFailReason,
   isConnectionError,
   isRateLimited,
   PaseoAgent,
@@ -74,6 +75,14 @@ describe("isConnectionError", () => {
     expect(isConnectionError("Error: socket hang up")).toBe(true);
   });
 
+  test("detects ETIMEDOUT (connect/read socket timeout — issue #39 'etc.')", () => {
+    // A pure ETIMEDOUT without an undici 'fetch failed' wrapper must still be
+    // classified transient; previously it relied on an unverified claim that
+    // such a timeout 'always' surfaces as fetch failed / socket hang up.
+    expect(isConnectionError("Error: connect ETIMEDOUT 203.0.113.10:443")).toBe(true);
+    expect(isConnectionError("read ETIMEDOUT")).toBe(true);
+  });
+
   test("detects human-readable 'connection reset/refused/closed'", () => {
     expect(isConnectionError("Connection reset by peer")).toBe(true);
     expect(isConnectionError("connect: connection refused")).toBe(true);
@@ -86,11 +95,57 @@ describe("isConnectionError", () => {
     expect(isConnectionError("")).toBe(false);
   });
 
+  test("high-confidence anchors never appear in clean prose (errno / undici / socket)", () => {
+    // The load-bearing signals — errno codes, undici 'fetch failed', Node
+    // 'socket hang up' — are error-specific and never occur in ordinary agent
+    // output. Real relay traces carry one of these; clean prose does not.
+    expect(isConnectionError("All 12 tests pass. Implementation complete.")).toBe(false);
+    expect(isConnectionError("fetching results from the database")).toBe(false);
+    expect(isConnectionError("reset the counter to zero")).toBe(false);
+    expect(isConnectionError("piped the output through the socket helper")).toBe(false);
+  });
+
+  test("verb-phrases are prose-prone by design (accepted, bounded trade-off)", () => {
+    // `stream closed` / `connection closed` etc. intentionally also match
+    // human-readable relay phrases (e.g. 'remote connection closed'), so they
+    // CAN false-positive when such a phrase appears verbatim in a FAILED
+    // dispatch's prose. Blast radius is bounded — one needless retry, then
+    // the genuine failure recurs and is classified terminal. Pinned here so a
+    // future tighten/loosen is a deliberate decision, not an accident.
+    expect(isConnectionError("the data stream ended at row 50")).toBe(true);
+    expect(isConnectionError("remote connection closed")).toBe(true);
+  });
+
   test("does not false-positive on a rate-limit string (distinct classification)", () => {
     // A 429 / quota message is a rate limit, NOT a transport error — the two
     // must stay distinguishable so the post-mortem reason is correct.
     expect(isConnectionError("429 usage limit reached")).toBe(false);
     expect(isConnectionError("rate limit exceeded")).toBe(false);
+  });
+});
+
+describe("implFailReason — dispatch flags → ImplFailReason (precedence)", () => {
+  // The rule is extracted from PaseoAgent.implement so the precedence is
+  // named and directly testable; these pin the order independent of the
+  // adapter wiring.
+  const f = implFailReason;
+
+  test("rate-limited wins over everything (fallback loop already retried it)", () => {
+    expect(f({ rateLimited: true, connectionError: true, timedOut: true })).toBe("rate-limited");
+  });
+
+  test("connection-error beats timeout (root-cause label; both are transient)", () => {
+    // A transport reset that also burned the wall clock is labelled by its
+    // root cause. Retry decision is identical (both in TRANSIENT_REASONS).
+    expect(f({ rateLimited: false, connectionError: true, timedOut: true })).toBe("connection-error");
+  });
+
+  test("timeout when neither rate-limit nor connection-error", () => {
+    expect(f({ rateLimited: false, connectionError: false, timedOut: true })).toBe("timeout");
+  });
+
+  test("terminal 'failed' catch-all when nothing else applies", () => {
+    expect(f({ rateLimited: false, connectionError: false, timedOut: false })).toBe("failed");
   });
 });
 

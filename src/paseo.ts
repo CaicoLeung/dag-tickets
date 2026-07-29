@@ -7,6 +7,7 @@ import type {
   DispatchOpts,
   DispatchResult,
   EventSink,
+  ImplFailReason,
   ImplResult,
   Logger,
   ReconcileResult,
@@ -87,18 +88,46 @@ export function isRateLimited(output: string): boolean {
  * shape of {@link RATE_LIMIT_RE}: a case-insensitive alternation over the
  * real errno codes / human phrases the relay prints.
  *
- * `ETIMEDOUT` (the socket errno) is deliberately NOT matched: it would
- * conflate with the wall-clock {@link DispatchResult.timedOut} path, which is
- * already its own transient reason (`agent-timeout`). A genuine connect/read
- * timeout almost always surfaces as `fetch failed` / `socket hang up` too, so
- * those aliases still catch it.
+ * Includes `ETIMEDOUT` (the socket errno): a connect/read timeout is a
+ * transport failure and belongs here. It can overlap with the wall-clock
+ * {@link DispatchResult.timedOut} path (`agent-timeout`); both are transient,
+ * so when both fire the only difference is the post-mortem label, not the
+ * retry decision — see {@link implFailReason} for the precedence.
  */
 const CONNECTION_ERROR_RE =
-  /\bECONNRESET\b|\bECONNREFUSED\b|\bEPIPE\b|fetch failed|socket hang up|stream (?:closed|ended|aborted)|connection (?:reset|refused|closed|aborted)/i;
+  /\bECONNRESET\b|\bECONNREFUSED\b|\bEPIPE\b|\bETIMEDOUT\b|fetch failed|socket hang up|stream (?:closed|ended|aborted)|connection (?:reset|refused|closed|aborted)/i;
 
 /** Detect a relay/stream transport failure in agent output. */
 export function isConnectionError(output: string): boolean {
   return CONNECTION_ERROR_RE.test(output);
+}
+
+/**
+ * Map a failed dispatch to its implement-failure reason, in precedence order:
+ * rate-limited → connection-error → timeout → failed.
+ *
+ * - rate-limited first: `dispatchWithFallback` already retried across
+ *   providers, so a surviving rate-limit is the dominant signal.
+ * - connection-error before timeout: a transport reset that also burned the
+ *   wall clock is labelled by its root cause. Both reasons are transient, so
+ *   the retry decision is identical either way — this only sets the
+ *   post-mortem label.
+ *
+ * Extracted from `PaseoAgent.implement` so the rule is named and directly
+ * unit-testable (the ternary there had grown to a 4-way cascade).
+ */
+export function implFailReason(r: {
+  rateLimited: boolean;
+  connectionError: boolean;
+  timedOut: boolean;
+}): ImplFailReason {
+  return r.rateLimited
+    ? "rate-limited"
+    : r.connectionError
+      ? "connection-error"
+      : r.timedOut
+        ? "timeout"
+        : "failed";
 }
 
 /**
@@ -477,20 +506,7 @@ export class PaseoAgent implements AgentPort {
       return {
         ok: false,
         commits: 0,
-        // Precedence: rate-limit (the fallback loop above owns it) →
-        // connection-error (relay transport blip, transient) → timeout (wall
-        // budget) → failed (terminal catch-all). Rate-limit is checked first
-        // because dispatchWithFallback already retried across providers; a
-        // connection error is checked before timeout so a transport reset that
-        // also burned the clock is labelled by its root cause (both labels are
-        // transient, so the retry decision is unchanged either way).
-        reason: r.rateLimited
-          ? "rate-limited"
-          : r.connectionError
-            ? "connection-error"
-            : r.timedOut
-              ? "timeout"
-              : "failed",
+        reason: implFailReason(r),
       };
     }
     // A rate-limited or empty agent still "completes" with no diff — count
