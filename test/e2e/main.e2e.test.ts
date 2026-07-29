@@ -396,6 +396,38 @@ describe("e2e: transient retry + backoff (#21)", () => {
       await teardown(env);
     }
   }, 30_000);
+
+  test("relay ECONNRESET on implement → transient connection-error retry converges (issue #39)", async () => {
+    // A transport blip makes `paseo run` exit non-zero with ECONNRESET on
+    // STDERR. Pre-fix this killed the batch as a hard implement-failed; now it
+    // is classified transient `connection-error` and the ticket backs off and
+    // retries, converging like a CI flake. The shim writes the errno to stderr
+    // (not stdout) so this also proves dispatch() scans stderr on the failure path.
+    const env = await setup({
+      issues: [issue(39, "Connection blip")],
+      verdicts: { "39": ["clean"] },
+      // First implement dispatch: ECONNRESET to stderr + exit 1. The latch lets
+      // the retry dispatch materialise a commit and exit 0.
+      connectionErrors: [39],
+    });
+    try {
+      expect(await runMain(env, ["39", "--max-ticket-retries", "1"])).toBe(0);
+
+      const t = ticketOf((await readState(env))!, 39);
+      expect(t.status).toBe("done");
+      expect(t.attempts).toBe(2); // 1 transport-blip + 1 succeeded
+      expect(t.reason).toBeUndefined(); // a settled-done ticket carries no failure reason
+
+      // A transient connection-error retry was emitted — NOT a terminal cascade.
+      const retries = (await readEvents(env))!.filter(
+        (e) => e.type === EVT.TICKET_RETRY && e.ticket === 39,
+      );
+      expect(retries.length).toBe(1);
+      expect(retries[0]?.data?.reason).toBe("connection-error");
+    } finally {
+      await teardown(env);
+    }
+  }, 30_000);
 });
 
 describe("e2e: rate-limit fallback (#7)", () => {

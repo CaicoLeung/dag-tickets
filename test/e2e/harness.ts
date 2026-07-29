@@ -73,6 +73,11 @@ export interface ScenarioOpts {
   /** Ticket numbers whose first primary-provider dispatch emits a 429 body
    *  (→ rate-limited) so runWithFallback retries on the fallback provider. */
   rateLimited?: number[];
+  /** Ticket numbers whose first implement dispatch writes a relay transport
+   *  error (ECONNRESET) to STDERR and exits non-zero — simulating issue #39 — so
+   *  the ticket is classified transient `connection-error` and retried with
+   *  backoff; the retry succeeds. */
+  connectionErrors?: number[];
   /** Overlap choreography: a ticket whose implement blocks until the ticket in
    *  the value has pushed its head (`loop/<v>-` appears in prHeads), so a
    *  dependent can overlap-launch while its blocker is still in flight. */
@@ -160,6 +165,7 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     runFails: opts.runFails ?? [],
     checksSeq: opts.checksSeq ?? {},
     rateLimited: opts.rateLimited ?? [],
+    connectionErrors: opts.connectionErrors ?? [],
     pacerUntil: opts.pacerUntil ?? {},
     holdWatch: opts.holdWatch ?? [],
     dependentImpl: opts.dependentImpl ?? [],

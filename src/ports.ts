@@ -70,7 +70,13 @@ export interface CheckResult {
 // ---------------------------------------------------------------------------
 
 /** Why an implement step did not produce a reviewable branch. */
-export type ImplFailReason = "failed" | "timeout" | "rate-limited" | "empty" | "stale-base";
+export type ImplFailReason =
+  | "failed"
+  | "timeout"
+  | "rate-limited"
+  | "empty"
+  | "stale-base"
+  | "connection-error"; // relay transport blip (ECONNRESET / stream closed) — transient, retried
 
 /** Outcome of an implement dispatch. `ok` implies real commits landed. */
 export interface ImplResult {
@@ -167,6 +173,11 @@ export interface DispatchResult {
   timedOut: boolean;
   /** True when the agent output indicates provider rate-limiting / quota exhaustion. */
   rateLimited: boolean;
+  /** True when the agent output indicates a relay transport failure (ECONNRESET,
+   *  stream closed, fetch failed, …). A transport blip is transient — paseo
+   *  auto-recovers in the daemon — so the caller retries the step instead of
+   *  declaring a hard `implement-failed`. Mirrors {@link rateLimited}. */
+  connectionError: boolean;
 }
 
 /**

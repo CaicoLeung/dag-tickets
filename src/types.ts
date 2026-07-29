@@ -81,6 +81,7 @@ export type FailureReason =
   | "stale-base" // origin/<base> fetch failed (offline?); refusing a stale branch-off
   | "merge-race" // gh merge failed (base moved / conflict / transient 5xx)
   | "agent-timeout" // an agent run exceeded its wall budget
+  | "connection-error" // relay transport blip (ECONNRESET / stream closed / fetch failed) — paseo auto-recovers in the daemon, so a backoff-and-retry clears it
   // terminal (retrying the whole ticket won't change the outcome):
   | "review-issues" // review still has actionable findings after maxFixRounds
   | "review-unknown" // review verdict stayed unknown (no ISSUES/CLEAN emitted)

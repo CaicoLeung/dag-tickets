@@ -1,5 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import {
+  implFailReason,
+  isConnectionError,
   isRateLimited,
   PaseoAgent,
   runWithFallback,
@@ -45,6 +47,105 @@ describe("isRateLimited", () => {
 
   test("does not false-positive on unrelated numbers", () => {
     expect(isRateLimited("Fixed 3 issues in 1429 lines")).toBe(false);
+  });
+});
+
+describe("isConnectionError", () => {
+  test("detects a relay ECONNRESET (the issue #39 failure mode)", () => {
+    const out =
+      "Error: Command timed out after 60s\npaseo run failed: fetch failed: " +
+      "Error: connect ECONNRESET 203.0.113.10:443";
+    expect(isConnectionError(out)).toBe(true);
+  });
+
+  test("detects bare errno codes", () => {
+    expect(isConnectionError("write ECONNRESET")).toBe(true);
+    expect(isConnectionError("connect ECONNREFUSED 127.0.0.1:443")).toBe(true);
+    expect(isConnectionError("write EPIPE")).toBe(true);
+  });
+
+  test("detects 'stream closed' / 'stream ended' (relay SSE teardown)", () => {
+    expect(isConnectionError("error: stream closed unexpectedly")).toBe(true);
+    expect(isConnectionError("the response stream ended early")).toBe(true);
+    expect(isConnectionError("stream aborted by the relay")).toBe(true);
+  });
+
+  test("detects undici 'fetch failed' / 'socket hang up'", () => {
+    expect(isConnectionError("TypeError: fetch failed")).toBe(true);
+    expect(isConnectionError("Error: socket hang up")).toBe(true);
+  });
+
+  test("detects ETIMEDOUT (connect/read socket timeout — issue #39 'etc.')", () => {
+    // A pure ETIMEDOUT without an undici 'fetch failed' wrapper must still be
+    // classified transient; previously it relied on an unverified claim that
+    // such a timeout 'always' surfaces as fetch failed / socket hang up.
+    expect(isConnectionError("Error: connect ETIMEDOUT 203.0.113.10:443")).toBe(true);
+    expect(isConnectionError("read ETIMEDOUT")).toBe(true);
+  });
+
+  test("detects human-readable 'connection reset/refused/closed'", () => {
+    expect(isConnectionError("Connection reset by peer")).toBe(true);
+    expect(isConnectionError("connect: connection refused")).toBe(true);
+    expect(isConnectionError("remote connection closed")).toBe(true);
+  });
+
+  test("does not flag normal agent output", () => {
+    expect(isConnectionError("REVIEW_VERDICT: CLEAN")).toBe(false);
+    expect(isConnectionError("All 12 tests pass. Implementation complete.")).toBe(false);
+    expect(isConnectionError("")).toBe(false);
+  });
+
+  test("high-confidence anchors never appear in clean prose (errno / undici / socket)", () => {
+    // The load-bearing signals — errno codes, undici 'fetch failed', Node
+    // 'socket hang up' — are error-specific and never occur in ordinary agent
+    // output. Real relay traces carry one of these; clean prose does not.
+    expect(isConnectionError("All 12 tests pass. Implementation complete.")).toBe(false);
+    expect(isConnectionError("fetching results from the database")).toBe(false);
+    expect(isConnectionError("reset the counter to zero")).toBe(false);
+    expect(isConnectionError("piped the output through the socket helper")).toBe(false);
+  });
+
+  test("verb-phrases are prose-prone by design (accepted, bounded trade-off)", () => {
+    // `stream closed` / `connection closed` etc. intentionally also match
+    // human-readable relay phrases (e.g. 'remote connection closed'), so they
+    // CAN false-positive when such a phrase appears verbatim in a FAILED
+    // dispatch's prose. Blast radius is bounded — one needless retry, then
+    // the genuine failure recurs and is classified terminal. Pinned here so a
+    // future tighten/loosen is a deliberate decision, not an accident.
+    expect(isConnectionError("the data stream ended at row 50")).toBe(true);
+    expect(isConnectionError("remote connection closed")).toBe(true);
+  });
+
+  test("does not false-positive on a rate-limit string (distinct classification)", () => {
+    // A 429 / quota message is a rate limit, NOT a transport error — the two
+    // must stay distinguishable so the post-mortem reason is correct.
+    expect(isConnectionError("429 usage limit reached")).toBe(false);
+    expect(isConnectionError("rate limit exceeded")).toBe(false);
+  });
+});
+
+describe("implFailReason — dispatch flags → ImplFailReason (precedence)", () => {
+  // The rule is extracted from PaseoAgent.implement so the precedence is
+  // named and directly testable; these pin the order independent of the
+  // adapter wiring.
+  const f = implFailReason;
+
+  test("rate-limited wins over everything (fallback loop already retried it)", () => {
+    expect(f({ rateLimited: true, connectionError: true, timedOut: true })).toBe("rate-limited");
+  });
+
+  test("connection-error beats timeout (root-cause label; both are transient)", () => {
+    // A transport reset that also burned the wall clock is labelled by its
+    // root cause. Retry decision is identical (both in TRANSIENT_REASONS).
+    expect(f({ rateLimited: false, connectionError: true, timedOut: true })).toBe("connection-error");
+  });
+
+  test("timeout when neither rate-limit nor connection-error", () => {
+    expect(f({ rateLimited: false, connectionError: false, timedOut: true })).toBe("timeout");
+  });
+
+  test("terminal 'failed' catch-all when nothing else applies", () => {
+    expect(f({ rateLimited: false, connectionError: false, timedOut: false })).toBe("failed");
   });
 });
 
@@ -149,7 +250,7 @@ class ScriptedDispatcher implements Dispatcher {
         ok: true,
         output: "",
         timedOut: false,
-        rateLimited: false,
+        rateLimited: false, connectionError: false,
       }
     );
   }
@@ -181,28 +282,60 @@ describe("PaseoAgent.implement — dispatch result → ImplResult.reason", () =>
 
   test("rate-limited dispatch → reason 'rate-limited'", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: false, output: "429 usage limit", timedOut: false, rateLimited: true }];
+    d.queue = [{ ok: false, output: "429 usage limit", timedOut: false, rateLimited: true, connectionError: false }];
     const r = await agent(d).a.implement(ticket(), "b1", "main");
     expect(r).toEqual({ ok: false, commits: 0, reason: "rate-limited" });
   });
 
   test("timed-out dispatch (not rate-limited) → reason 'timeout'", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: false, output: "", timedOut: true, rateLimited: false }];
+    d.queue = [{ ok: false, output: "", timedOut: true, rateLimited: false, connectionError: false }];
     const r = await agent(d).a.implement(ticket(), "b1", "main");
     expect(r).toEqual({ ok: false, commits: 0, reason: "timeout" });
   });
 
   test("failed dispatch (neither) → reason 'failed'", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: false, output: "boom", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: false, output: "boom", timedOut: false, rateLimited: false, connectionError: false }];
     const r = await agent(d).a.implement(ticket(), "b1", "main");
     expect(r).toEqual({ ok: false, commits: 0, reason: "failed" });
   });
 
+  test("connection-error dispatch (ECONNRESET in output) → reason 'connection-error' (transient, issue #39)", async () => {
+    // A relay transport blip makes `paseo run` exit non-zero even though the
+    // paseo daemon auto-recovers. The output carries the errno; the adapter
+    // surfaces a transient `connection-error` so the ticket backs off and
+    // retries instead of cascading as a hard `implement-failed`.
+    const d = new ScriptedDispatcher();
+    d.queue = [
+      {
+        ok: false,
+        output: "paseo run failed: fetch failed: Error: connect ECONNRESET 203.0.113.10:443",
+        timedOut: false,
+        rateLimited: false,
+        connectionError: true,
+      },
+    ];
+    const r = await agent(d).a.implement(ticket(), "b1", "main");
+    expect(r).toEqual({ ok: false, commits: 0, reason: "connection-error" });
+  });
+
+  test("rate-limit beats connection-error when both flags are set (fallback loop owns rate-limit)", async () => {
+    // Precedence: rate-limited is decided first because dispatchWithFallback
+    // already retried it across providers; a connection-error is the fallback
+    // only when it isn't rate-limiting. Both are transient, so the retry
+    // decision is unchanged — this just pins the post-mortem label.
+    const d = new ScriptedDispatcher();
+    d.queue = [
+      { ok: false, output: "429 usage limit; fetch failed: ECONNRESET", timedOut: false, rateLimited: true, connectionError: true },
+    ];
+    const r = await agent(d).a.implement(ticket(), "b1", "main");
+    expect(r).toEqual({ ok: false, commits: 0, reason: "rate-limited" });
+  });
+
   test("ok dispatch but zero commits → reason 'empty'", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     branch.counts["b1"] = 0;
     const cap = capturingLog();
@@ -213,7 +346,7 @@ describe("PaseoAgent.implement — dispatch result → ImplResult.reason", () =>
 
   test("ok dispatch with commits → ok:true", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const r = await agent(d).a.implement(ticket(), "b1", "main");
     expect(r).toEqual({ ok: true, commits: 3 });
   });
@@ -222,7 +355,7 @@ describe("PaseoAgent.implement — dispatch result → ImplResult.reason", () =>
 describe("PaseoAgent.review", () => {
   test("failed dispatch → { kind: 'unknown' } and a warn is logged", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: false, output: "agent exploded", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: false, output: "agent exploded", timedOut: false, rateLimited: false, connectionError: false }];
     const cap = capturingLog();
     const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
     const v = await a.review(ticket(), "b1", "main");
@@ -234,7 +367,7 @@ describe("PaseoAgent.review", () => {
 
   test("timeout failure still logs the (timeout) suffix", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: false, output: "", timedOut: true, rateLimited: false }];
+    d.queue = [{ ok: false, output: "", timedOut: true, rateLimited: false, connectionError: false }];
     const cap = capturingLog();
     const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
     const v = await a.review(ticket(), "b1", "main");
@@ -245,7 +378,7 @@ describe("PaseoAgent.review", () => {
   test("ok dispatch with REVIEW_VERDICT: CLEAN → parsed clean", async () => {
     const d = new ScriptedDispatcher();
     d.queue = [
-      { ok: true, output: "Looks good.\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+      { ok: true, output: "Looks good.\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const cap = capturingLog();
     const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
@@ -260,8 +393,8 @@ describe("PaseoAgent.onRateLimited (exercised via review)", () => {
     const d = new ScriptedDispatcher();
     // primary rate-limited, then the single fallback succeeds (CLEAN verdict).
     d.queue = [
-      { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true },
-      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+      { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true, connectionError: false },
+      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const branch = new FakeBranch();
     const cap = capturingLog();
@@ -292,7 +425,7 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
     const dispatchFn = async (_p: string, opts: DispatchOpts): Promise<DispatchResult> => {
       calls.push(opts.provider);
       const rl = opts.provider === "primary" || opts.provider === "a";
-      return { ok: !rl, output: opts.provider, timedOut: false, rateLimited: rl };
+      return { ok: !rl, output: opts.provider, timedOut: false, rateLimited: rl, connectionError: false };
     };
     const result = await runWithFallback(
       dispatchFn,
@@ -315,7 +448,7 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
       ok: false,
       output: "429",
       timedOut: false,
-      rateLimited: true,
+      rateLimited: true, connectionError: false,
     });
     const result = await runWithFallback(
       dispatchFn,
@@ -335,7 +468,7 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
     const calls: string[] = [];
     const dispatchFn = async (_p: string, opts: DispatchOpts): Promise<DispatchResult> => {
       calls.push(opts.provider);
-      return { ok: false, output: "", timedOut: false, rateLimited: true };
+      return { ok: false, output: "", timedOut: false, rateLimited: true, connectionError: false };
     };
     await runWithFallback(dispatchFn, "p", baseOpts("primary"), ["primary", "a"], async () => {});
     // "primary" dispatched once (initial); never re-dispatched as a fallback.
@@ -347,7 +480,7 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
     const calls: string[] = [];
     const dispatchFn = async (_p: string, opts: DispatchOpts): Promise<DispatchResult> => {
       calls.push(opts.provider);
-      return { ok: true, output: "done", timedOut: false, rateLimited: false };
+      return { ok: true, output: "done", timedOut: false, rateLimited: false, connectionError: false };
     };
     const result = await runWithFallback(
       dispatchFn,
@@ -377,7 +510,7 @@ describe("runWithFallback — the real dispatch fallback loop", () => {
 describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
   test("implement fetches origin/<base> once and resolves branch-off + commitCount to it", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     const cap = capturingLog();
     const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
@@ -410,7 +543,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
 
   test("review (checkout-branch) does NOT fetch — it is not a branch-off", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "REVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "REVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     const cap = capturingLog();
     const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
@@ -424,7 +557,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     // AC#1/#2: a base we couldn't refresh is not safe to branch off. Proceeding
     // would silently compose on pre-merge code — the exact failure #15 prevents.
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     branch.fetchOk = false; // simulate offline / unreachable remote
     const cap = capturingLog();
@@ -445,7 +578,7 @@ describe("PaseoAgent — base ref fetch before branch-off (#15)", () => {
     // gap commits as if they were the agent's — masking the empty impl. Counting
     // against the fetched origin/main reports 0, so empty is correctly detected.
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false }];
     const branch = new FakeBranch();
     branch.countsByBase[`origin/main..b1`] = 0; // truth: no agent commits vs fetched tip
     branch.countsByBase[`main..b1`] = 5; // stale local main would over-count
@@ -471,8 +604,8 @@ describe("PaseoAgent — provider.switch event", () => {
   test("review fallback emits provider.switch {skill:review, from, to, reason}", async () => {
     const d = new ScriptedDispatcher();
     d.queue = [
-      { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true },
-      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false },
+      { ok: false, output: "429 usage limit reached", timedOut: false, rateLimited: true, connectionError: false },
+      { ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const sink = new RecordingSink();
     const a = new PaseoAgent(
@@ -501,9 +634,9 @@ describe("PaseoAgent — provider.switch event", () => {
   test("implement fallback emits provider.switch {skill:implement, from, to}", async () => {
     const d = new ScriptedDispatcher();
     d.queue = [
-      { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true },
+      { ok: false, output: "429 quota exceeded", timedOut: false, rateLimited: true, connectionError: false },
       // second dispatch on the fallback succeeds with commits (FakeBranch counts=3)
-      { ok: true, output: "", timedOut: false, rateLimited: false },
+      { ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false },
     ];
     const sink = new RecordingSink();
     const a = new PaseoAgent(
@@ -530,7 +663,7 @@ describe("PaseoAgent — provider.switch event", () => {
 
   test("no rate-limiting emits no provider.switch", async () => {
     const d = new ScriptedDispatcher();
-    d.queue = [{ ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false }];
+    d.queue = [{ ok: true, output: "ok\nREVIEW_VERDICT: CLEAN", timedOut: false, rateLimited: false, connectionError: false }];
     const sink = new RecordingSink();
     const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, sink);
     await a.review(ticket(), "b1", "main");
