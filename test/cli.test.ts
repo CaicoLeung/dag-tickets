@@ -43,6 +43,60 @@ test("fallbackProviders defaults to empty", () => {
   expect(parseArgs([]).fallbackProviders).toEqual([]);
 });
 
+// --category-label / --skip-label (ADR-0001): add to the orphan-detection /
+// intentional-skip sets. Same shape as --fallback-provider (comma-split, trim,
+// repeatable) but defaults to empty here — the defaults live in
+// DEFAULT_ROUTING and are merged at buildRouting() time.
+
+test("--category-label accepts a single role", () => {
+  expect(parseArgs(["--category-label", "bug"]).categoryLabels).toEqual(["bug"]);
+});
+
+test("--category-label splits a comma-separated list and trims whitespace", () => {
+  expect(parseArgs(["--category-label", "bug, enhancement , type-bug"]).categoryLabels).toEqual([
+    "bug",
+    "enhancement",
+    "type-bug",
+  ]);
+});
+
+test("--category-label is repeatable and accumulates across flags", () => {
+  expect(
+    parseArgs(["--category-label", "bug", "--category-label", "enhancement,flaw"]).categoryLabels,
+  ).toEqual(["bug", "enhancement", "flaw"]);
+});
+
+test("--category-label filters empty segments (trailing/leading/double commas)", () => {
+  expect(parseArgs(["--category-label", ",bug,,enhancement,"]).categoryLabels).toEqual([
+    "bug",
+    "enhancement",
+  ]);
+});
+
+test("--skip-label mirrors --category-label: single, comma-split, repeatable", () => {
+  expect(parseArgs(["--skip-label", "needs-info"]).skipLabels).toEqual(["needs-info"]);
+  expect(parseArgs(["--skip-label", "needs-info, wontfix"]).skipLabels).toEqual([
+    "needs-info",
+    "wontfix",
+  ]);
+  expect(
+    parseArgs(["--skip-label", "needs-info", "--skip-label", "wontfix,blocked"]).skipLabels,
+  ).toEqual(["needs-info", "wontfix", "blocked"]);
+});
+
+test("--category-label=value and --skip-label=value forms are accepted (= splicing)", () => {
+  expect(parseArgs(["--category-label=bug,enhancement"]).categoryLabels).toEqual([
+    "bug",
+    "enhancement",
+  ]);
+  expect(parseArgs(["--skip-label=wontfix"]).skipLabels).toEqual(["wontfix"]);
+});
+
+test("categoryLabels / skipLabels default to empty", () => {
+  expect(parseArgs([]).categoryLabels).toEqual([]);
+  expect(parseArgs([]).skipLabels).toEqual([]);
+});
+
 // --max-ticket-retries (issue #21): transient whole-ticket retry budget.
 test("--max-ticket-retries sets the transient retry budget", () => {
   expect(parseArgs(["--max-ticket-retries", "5"]).maxTicketRetries).toBe(5);
