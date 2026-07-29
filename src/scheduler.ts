@@ -287,6 +287,11 @@ export async function runBatch(
   // `aborted` flag is needed — the delete IS the protection; see the abort
   // branch in applyCascade.)
   const inflight = new Map<number, Promise<SettledResult>>();
+  // #34: per-dispatch AbortControllers so superseded dispatches are explicitly
+  // cancelled instead of relying solely on inflight.delete() as the no-double-
+  // report guard. Signalled in applyCascade before the plan is applied; the
+  // dispatch promise resolves to a harmless sentinel on abort.
+  const controllers = new Map<number, AbortController>();
   // Resolve once: the event channel is optional on opts (most scheduler tests
   // omit it) but guaranteed from here on — no per-site `?.` below.
   const events = opts.events ?? NULL_SINK;
@@ -312,6 +317,16 @@ export async function runBatch(
       skipped,
       inflight: new Set(inflight.keys()),
     });
+    // #34: signal abort on superseded dispatches before applying the plan.
+    // This makes the dispatch promise resolve to a harmless sentinel instead
+    // of staying pending forever — even without inflight.delete() the sentinel
+    // can't cause double-reporting (belt-and-suspenders with the delete).
+    for (const a of plan) {
+      if (a.kind === "abort") {
+        controllers.get(a.dep)?.abort();
+        controllers.delete(a.dep);
+      }
+    }
     applyCascadePlan(plan, { completed, failed, skipped }, inflight, startedAt, {
       onSettle: opts.onSettle,
       abort: opts.abort,
@@ -333,19 +348,35 @@ export async function runBatch(
     if (info.overlapBlocker !== undefined) overlapInflight.add(n);
     startedAt.set(n, Date.now());
     events.emit(EVT.TICKET_START, n);
+    // #34: pair each dispatch with an AbortController so cascade-abort
+    // explicitly cancels the dispatch instead of leaving it pending.
+    const controller = new AbortController();
+    controllers.set(n, controller);
     const p = Promise.resolve(n)
-      .then((nn) => opts.process(nn, info))
+      .then((nn) => {
+        // #34: checkpoint before the side-effect-heavy process callback so an
+        // aborted dispatch short-circuits instead of running.
+        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        return opts.process(nn, info);
+      })
       .then((result): SettledResult => {
-        // Accept a bare status OR a SettleDetail carrying reason/error. The
-        // detail is what lets TICKET_END say WHY a ticket settled (0.3.0 B1
-        // review follow-up); a bare status keeps focused scheduler tests green.
+        // #34: re-check after process; then normalise to SettledResult carrying
+        // reason/error (0.3.0 B1 review follow-up) so TICKET_END can say WHY a
+        // ticket settled. Accept a bare status OR a SettleDetail.
+        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
         const detail = typeof result === "string" ? { status: result } : result;
         const out: SettledResult = { number: n, status: detail.status };
         if (detail.reason) out.reason = detail.reason;
         if (detail.error) out.error = detail.error;
         return out;
       })
-      .catch((): SettledResult => ({ number: n, status: "failed" as TicketStatus }));
+      .catch((e): SettledResult => {
+        // #34: if explicitly aborted, resolve to a harmless sentinel so the
+        // dispatch can't win a later race and double-report — even if a
+        // future edit forgets the inflight.delete guard.
+        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
+        return { number: n, status: "failed" as TicketStatus };
+      });
     inflight.set(n, p);
   };
 
@@ -396,11 +427,13 @@ export async function runBatch(
     if (inflight.size === 0) break; // nothing running, nothing launchable → done
 
     const settled = await Promise.race(inflight.values());
+    // #34: guard against a cascade-aborted dispatch that resolved to sentinel
+    // (the controller.abort() in applyCascade synchronously aborts the signal
+    // before the next race, but the check makes the invariant explicit).
+    if (!inflight.has(settled.number)) continue;
     inflight.delete(settled.number);
+    controllers.delete(settled.number);
     overlapInflight.delete(settled.number);
-    // An aborted ticket was already removed from `inflight` by applyCascade, so
-    // it can never be the one that won this race — no guard needed here. The
-    // `inflight.delete` inside applyCascade IS the no-double-report mechanism.
 
     if (settled.status === "skipped") {
       skipped.add(settled.number);
@@ -437,7 +470,10 @@ export async function runBatch(
     // Without it, an aborted dependent would keep biasing its (now-settled)
     // blocker's weight on the next frontier call.
     for (const n of [...overlapInflight]) {
-      if (!inflight.has(n)) overlapInflight.delete(n);
+      if (!inflight.has(n)) {
+        overlapInflight.delete(n);
+        controllers.delete(n); // #34: clean up orphaned controller
+      }
     }
   }
 
