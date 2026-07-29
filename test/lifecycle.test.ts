@@ -10,7 +10,7 @@ import type {
   ReconcileResult,
   StepResult,
 } from "../src/ports.ts";
-import type { ReviewVerdict, Ticket } from "../src/types.ts";
+import type { ReviewVerdict, Ticket, TicketStatus } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
 
@@ -677,6 +677,65 @@ describe("implement lifecycle — #29 overlap", () => {
     resolveGate();
     const out = await running;
     expect(out.status).toBe("done");
+    expect(repo.prs).toHaveLength(1);
+  });
+
+  test("overlap: a failed/skipped blocker does NOT release the createPr gate — stuck until cascade-abort (#31)", async () => {
+    // Models the fixed OverlapCoordinator gate: waiters registered before
+    // noteSettled, and only released on "done". A failed/skipped blocker
+    // must NOT release the gate — the cascade-abort owns the dependent.
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const t = ticket(2);
+    t.blockedBy = [1];
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
+
+    // Gate modeled after the fixed OverlapCoordinator: no settled Set needed
+    // (in the active path, waiters are registered before noteSettled fires).
+    const waiters = new Map<number, Array<() => void>>();
+    const note = (n: number, status: TicketStatus) => {
+      if (status !== "done") return; // #31: gate stays locked on non-done
+      const w = waiters.get(n);
+      if (w) { waiters.delete(n); for (const fn of w) fn(); }
+    };
+
+    const running = processTicket(
+      t,
+      ctx(agent, repo, {
+        waitForBlockers: async (bs) => Promise.all(bs.map((b) =>
+          new Promise<void>((r) => {
+            const arr = waiters.get(b) ?? [];
+            arr.push(r);
+            waiters.set(b, arr);
+          }),
+        )),
+      }),
+      overlap,
+    );
+
+    // Flush microtasks so the lifecycle reaches waitForBlockers and registers waiters.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(repo.prs).toHaveLength(0);
+
+    // Blocker settles failed — gate stays LOCKED (#31 fix).
+    note(1, "failed");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(repo.prs).toHaveLength(0); // still no PR — gate didn't release
+
+    // Blocker settles skipped — also stays locked.
+    note(1, "skipped");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(repo.prs).toHaveLength(0); // still no PR
+
+    // The dependent is stuck at the gate forever. In production,
+    // the cascade-abort kills it. From the lifecycle's perspective,
+    // createPr is never reached.
+
+    // Sanity: "done" releases (proves the gate is status-aware).
+    note(1, "done");
+    await running;
     expect(repo.prs).toHaveLength(1);
   });
 });

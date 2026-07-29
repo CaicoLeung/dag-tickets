@@ -481,18 +481,24 @@ class OverlapCoordinator {
     this.pushedHeads.add(n);
   };
 
-  /** RunContext hook: gate createPr on every blocker settling. Overlap can't
-   *  trigger at concurrency 1, so a blocker always holds its own slot while a
-   *  dependent waits here — no deadlock. */
+  /** RunContext hook: gate createPr on every blocker settling `done`.
+   *  Overlap can't trigger at concurrency 1, so a blocker always holds its own
+   *  slot while a dependent waits here — no deadlock. Does NOT resolve on
+   *  failed/skipped: the cascade-abort kills the dependent before createPr so
+   *  a dependent can never open a PR against a base missing a failed blocker's
+   *  commits (#31). */
   readonly waitForBlockers = async (blockers: number[]): Promise<void> => {
     await Promise.all(blockers.map((b) => this.awaitOne(b)));
   };
 
-  /** Scheduler onSettle hook: record `n` settled and release any overlap-
-   *  dependent waiting on it. Called before state persist so a resumed run
-   *  sees the blocker as settled too. */
-  noteSettled(n: number): void {
+  /** Scheduler onSettle hook: record `n` settled. Releases waiters only when
+   *  `status === "done"`: a failed/skipped blocker must NOT release an overlap-
+   *  dependent's gate — the cascade-abort owns that dependent instead (#31).
+   *  Called before state persist so a resumed run sees the blocker as settled
+   *  too. */
+  noteSettled(n: number, status: TicketStatus): void {
     this.settled.add(n);
+    if (status !== "done") return;
     const w = this.waiters.get(n);
     if (w) {
       this.waiters.delete(n);
@@ -818,7 +824,7 @@ export async function main(argv: string[]): Promise<number> {
         // #29: this ticket settled — release any overlap-dependent waiting in
         // its pre-createPr gate (waitForBlockers). Recorded before state persist
         // so a dependent resumed after a kill sees the blocker as settled too.
-        overlap.noteSettled(n);
+        overlap.noteSettled(n, status);
         // A cascade-abort `reason` is persisted on its own field (not overloaded
         // onto `error`) so a resumed run distinguishes a killed dependent from a
         // genuine error or an unknown-kind skip without scraping `error`.
