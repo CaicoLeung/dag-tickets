@@ -151,8 +151,12 @@ import {
     }
 
     if (outcome === "none") {
-      err("No checks.\n");
-      exit(0);
+      // Mirror real gh: a PR that triggers zero check workflows prints
+      // "no checks reported on the '<branch>' branch" to stderr and exits
+      // 1 (not 0). watchChecks must resolve this to `none` regardless of exit
+      // code (#37).
+      err("no checks reported on the 'head' branch\n");
+      exit(1);
     }
     if (outcome === "pass") exit(0);
     exit(1); // fail
