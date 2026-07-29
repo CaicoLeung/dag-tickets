@@ -39,7 +39,7 @@ class FakeAgent implements AgentPort {
   fixCalls = 0;
   implementBase: string | undefined;
   reviewBase: string | undefined;
-  async implement(_t: Ticket, _branch: string, base: string): Promise<ImplResult> {
+  async implement(_t: Ticket, _branch: string, base: string, _signal?: AbortSignal): Promise<ImplResult> {
     this.implementBase = base;
     return this.impl;
   }
@@ -50,7 +50,7 @@ class FakeAgent implements AgentPort {
   async fix(): Promise<StepResult> {
     return this.fixes[this.fixCalls++] ?? { ok: true };
   }
-  async singleShot(): Promise<StepResult> {
+  async singleShot(_skill?: string, _t?: Ticket, _branch?: string, _base?: string, _signal?: AbortSignal): Promise<StepResult> {
     return { ok: true };
   }
   providerLabel(s: "implement" | "review" | "triage" | "research"): string {

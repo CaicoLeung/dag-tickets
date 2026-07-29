@@ -5,6 +5,14 @@ import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
 import { NULL_SINK } from "./ports.ts";
 
+/** #34: single source for the AbortError name + message used by the scheduler's
+ *  dispatch AbortController and the lifecycle's side-effect checkpoints.
+ *  Prevents the 5× duplication flagged in code review. */
+export const ABORT_ERROR = {
+  name: "AbortError" as const,
+  message: "The operation was aborted" as const,
+};
+
 export interface BatchResult {
   completed: number[];
   failed: number[];
@@ -331,16 +339,18 @@ export async function runBatch(
     const signalInfo: LaunchInfo = { ...info, signal: controller.signal };
     const p = Promise.resolve(n)
       .then(async (nn) => {
-        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        if (controller.signal.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
         const status = await opts.process(nn, signalInfo);
-        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        if (controller.signal.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
         return { number: n, status };
       })
       .catch((e) => {
         // #34: if explicitly aborted, resolve to harmless sentinel so the
         // dispatch can't win a later race and double-report — even if a
-        // future edit forgets the Map.delete guard.
-        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
+        // future edit forgets the Map.delete guard. Only AbortError maps
+        // to skipped; a genuine failure that coincides with a concurrent
+        // abort must still surface as failed.
+        if (e instanceof DOMException && e.name === ABORT_ERROR.name) return { number: n, status: "skipped" as TicketStatus };
         return { number: n, status: "failed" as TicketStatus };
       });
     dispatch.set(n, { promise: p, controller });
