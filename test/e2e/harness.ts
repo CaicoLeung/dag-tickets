@@ -70,6 +70,14 @@ export interface ScenarioOpts {
    *  (e.g. `["fail","pass"]` → attempt 1 CI fails, attempt 2 passes). Drives
    *  the transient-retry loop with a real transient-then-success outcome. */
   checksSeq?: Record<string, string[]>;
+  /** Ticket numbers whose FIRST `gh pr checks --watch` sleeps past the
+   *  parent's `--ci-watch-timeout-minutes` ceiling so `run()` kills it
+   *  (timedOut) → `{state:"fail", failed:["checks-watch-timeout"]}` → transient
+   *  ci-failed → backoff-and-retry. The latch is persisted BEFORE the sleep
+   *  (the kill can't write), so the retry's watch falls through to the normal
+   *  scripted `checks` outcome. Pair with DAG_CI_WATCH_TIMEOUT_MS to collapse
+   *  the wait. Drives the #1 E2E gap (README's load-bearing availability path). */
+  stuckChecksFirst?: number[];
   /** Ticket numbers whose first primary-provider dispatch emits a 429 body
    *  (→ rate-limited) so runWithFallback retries on the fallback provider. */
   rateLimited?: number[];
@@ -88,6 +96,13 @@ export interface ScenarioOpts {
    *  Holding on the dependent's implement (not the pacer's merge) removes the
    *  race where the blocker would settle before the dependent launched. */
   holdWatch?: number[];
+  /** Subset of `holdWatch` whose held --watch returns `fail` (not `pass`) once
+   *  released — so a blocker stays in flight at CI (head already pushed →
+   *  dependents can overlap) and then settles terminally failed. With
+   *  `--max-ticket-retries 0` that ci-failed is terminal, which cascades a
+   *  still-in-flight overlap-dependent via the #20 abort branch (cascade-abort)
+   *  instead of the not-yet-started `mark` branch. Drives the #2 E2E gap. */
+  holdWatchFail?: number[];
   /** Ticket numbers whose implement dispatch sets state.dependentLaunched = true
    *  (the release signal for a held `holdWatch` blocker). */
   dependentImpl?: number[];
@@ -173,8 +188,10 @@ function buildScenario(opts: ScenarioOpts): Record<string, unknown> {
     connectionErrors: opts.connectionErrors ?? [],
     pacerUntil: opts.pacerUntil ?? {},
     holdWatch: opts.holdWatch ?? [],
+    holdWatchFail: opts.holdWatchFail ?? [],
     dependentImpl: opts.dependentImpl ?? [],
     mergeDeleteBranchFails: opts.mergeDeleteBranchFails ?? [],
+    stuckChecksFirst: opts.stuckChecksFirst ?? [],
   };
 }
 

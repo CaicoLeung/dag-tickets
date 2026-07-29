@@ -42,6 +42,16 @@ const MS_PER_MINUTE = 60_000;
 const retryBaseMs = (): number => Number(process.env.DAG_RETRY_BASE_MS ?? 30_000) || 30_000;
 const retryMaxMs = (): number => Number(process.env.DAG_RETRY_MAX_MS ?? 5 * MS_PER_MINUTE) || 5 * MS_PER_MINUTE;
 
+/** Resolve the `gh pr checks --watch` ceiling in ms. Honours the
+ *  `--ci-watch-timeout-minutes` flag (whole minutes), then the raw-ms
+ *  `DAG_CI_WATCH_TIMEOUT_MS` escape hatch (e2e / per-host override), then the
+ *  default. 0 / unset → undefined → unbounded watch (the pre-flag behaviour). */
+function ciWatchMsFromOpts(minutes: number): number | undefined {
+  const envMs = Number(process.env.DAG_CI_WATCH_TIMEOUT_MS);
+  if (Number.isFinite(envMs) && envMs > 0) return envMs;
+  return minutes > 0 ? minutes * MS_PER_MINUTE : undefined;
+}
+
 /** Default ceiling on `gh pr checks --watch`, in minutes. A stuck / never-
  *  completing check otherwise polls indefinitely and starves a concurrency slot
  *  for the rest of the batch — the one load-bearing availability risk in an
@@ -668,8 +678,12 @@ export async function main(argv: string[]): Promise<number> {
     // Only a positive budget becomes a ms ceiling. 0 → undefined → unbounded
     // watch (the pre-flag behaviour); negatives never reach here because
     // nonNegInt rejects them at parse time, leaving the default in place.
-    const ciWatchMs =
-      a.ciWatchTimeoutMinutes > 0 ? a.ciWatchTimeoutMinutes * MS_PER_MINUTE : undefined;
+    //
+    // DAG_CI_WATCH_TIMEOUT_MS (raw ms) overrides the flag when set + valid, so
+    // the e2e suite can collapse a stuck-check timeout to ~ms (the flag is in
+    // whole minutes — too coarse for a fast test) exactly like DAG_RETRY_*
+    // collapses the backoff. Prod leaves it unset → the flag/default stands.
+    const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
     const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, undefined, undefined, events);
     agentRef = agent;

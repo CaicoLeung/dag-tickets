@@ -38,6 +38,11 @@ export interface ShimState {
   /** ticket -> nth `gh pr checks --watch` call this run (drives a per-ticket
    *  checks sequence so a transient-then-pass CI outcome is scriptable). */
   checksIdx: Record<string, number>;
+  /** ticket -> bool: a `stuckChecksFirst` ticket has already burned its one
+   *  stuck (timeout-killed) --watch, so the retry's --watch falls through to
+   *  the normal scripted outcome. Latched BEFORE the stuck sleep because the
+   *  timeout kill can't write it. */
+  stuckHit: Record<string, boolean>;
   /** ticket -> provider string the paseo shim last received (proves
    *  --provider / --review-provider override wiring through real argv). */
   providers: Record<string, Record<string, string>>;
@@ -62,6 +67,7 @@ export const DEFAULT_STATE: ShimState = Object.freeze({
   currentVerdict: {},
   rateLimitedHit: {},
   checksIdx: {},
+  stuckHit: {},
   providers: {},
   dependentLaunched: false,
 });
