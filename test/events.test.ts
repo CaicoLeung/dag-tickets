@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -149,6 +149,62 @@ describe("JsonlEventLog — per-emit durability (issue #41)", () => {
     // persisted, so the very first line is durable the moment it happens.
     const [first] = await readEvents(cwd, "run-firstline");
     expect(first?.type).toBe(EVT.RUN_START);
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  test("emitted lines survive a SIGKILL (hard-termination durability)", async () => {
+    // The spec's recommended form: prove the guarantee across a real process
+    // boundary. The child emits three lines synchronously, signals ready only
+    // AFTER those appends returned, then hangs. We SIGKILL it — no graceful
+    // flush is possible — and assert every line is nonetheless present.
+    const cwd = await tmpCwd();
+    const readyPath = join(cwd, "child-ready");
+    const eventsSrc = join(import.meta.dir, "..", "src", "events.ts");
+    const childScript = `
+import { JsonlEventLog, EVT } from ${JSON.stringify(eventsSrc)};
+import { writeFile } from "node:fs/promises";
+const [cwd, runId, readyPath] = process.argv.slice(1);
+const log = new JsonlEventLog(runId, cwd);
+await log.ensure();
+log.emit(EVT.RUN_START, undefined, { source: "child" });
+log.emit(EVT.TICKET_START, 1);
+log.emit(EVT.STEP_START, 1, { step: "implement" });
+// All three appends returned → the lines are in the OS kernel. Tell the
+// parent, then hang until the SIGKILL arrives.
+await writeFile(readyPath, "ready");
+await new Promise(() => {});
+`;
+    const child = Bun.spawn({
+      cmd: [process.execPath, "-e", childScript, cwd, "run-sigkill", readyPath],
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    // Poll for the ready file (written only after the three sync appends).
+    let readySeen = false;
+    for (let i = 0; i < 300; i++) {
+      try {
+        await readFile(readyPath);
+        readySeen = true;
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
+    if (!readySeen) {
+      const errText = await new Response(child.stderr).text();
+      try {
+        process.kill(child.pid!, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      throw new Error(`child never signaled ready; stderr:\n${errText}`);
+    }
+    // Hard kill — durability rests entirely on appendFileSync having returned.
+    process.kill(child.pid!, "SIGKILL");
+    await child.exited;
+    const lines = await readEvents(cwd, "run-sigkill");
+    expect(lines.map((l) => l.type)).toEqual([EVT.RUN_START, EVT.TICKET_START, EVT.STEP_START]);
+    expect(lines.map((l) => l.seq)).toEqual([0, 1, 2]);
     await rm(cwd, { recursive: true, force: true });
   });
 });

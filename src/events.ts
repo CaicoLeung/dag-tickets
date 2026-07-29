@@ -19,10 +19,13 @@
  *    step/ticket event the instant it happens, not only at run end. Sync
  *    appends are inherently ordered, so burst-ordering and resume-seq hold
  *    without a promise chain. `flush()` is retained as a no-op shim for the
- *    cli's try/finally + signal-exit wiring. Because writes are synchronous,
- *    even SIGKILL can no longer drop a staged line — at most the single
- *    mid-syscall append is truncated, and the surviving prefix stays ordered
- *    because appends are line-atomic.
+ *    cli's try/finally + signal-exit wiring. `appendFileSync` hands the line
+ *    to the OS kernel before returning, so process death (SIGKILL / exit /
+ *    throw) can no longer drop a staged line — at most a single in-flight
+ *    append is truncated, and the surviving prefix stays ordered (small JSON
+ *    lines are appended atomically). This is kernel-level durability, NOT an
+ *    fsync: a power loss / OS crash could still lose dirty pages — a
+ *    deliberate trade for an infrequent post-mortem channel.
  *  - runId / ts / seq are auto-stamped; callers supply only the discriminating
  *    `type`, an optional ticket number, and optional structured `data`.
  *
@@ -154,14 +157,15 @@ export class JsonlEventLog implements EventSink {
       ...(data ? { data } : {}),
     };
     const line = JSON.stringify(e) + "\n";
-    // #41: durable per-emit. Each line is appended SYNCHRONOUSLY so a reader
-    // tailing the file mid-run — a dashboard, scheduler, or resume check —
-    // sees every step/ticket event the instant it happens, not only at run
-    // end. Sync appends are inherently ordered, so burst-ordering and
-    // resume-seq hold without a promise chain. The cost (blocking the event
-    // loop for one line append) is negligible for an infrequent post-mortem
-    // channel and is the price of the durability guarantee. mkdir on first
-    // write keeps emit self-sufficient even if ensure() was skipped or raced.
+    // #41: durable per-emit. appendFileSync hands the line to the OS kernel
+    // before this returns, so a reader tailing the file mid-run (a dashboard,
+    // scheduler, or resume check) sees every step/ticket event the instant it
+    // happens, not only at run end, and the line survives a hard kill
+    // (SIGKILL). Sync appends are inherently ordered, so burst-ordering and
+    // resume-seq hold without a promise chain. This is NOT an fsync — a power
+    // loss could still drop dirty pages — which is the deliberate trade for an
+    // infrequent post-mortem channel. mkdir on first write keeps emit
+    // self-sufficient even if ensure() was skipped or raced.
     try {
       if (!this.ensured) {
         mkdirSync(dirname(this.full), { recursive: true });

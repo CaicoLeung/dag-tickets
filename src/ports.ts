@@ -48,8 +48,10 @@ export type Logger = (level: LogLevel, msg: string, ticketNumber?: number) => vo
  * the same cross-seam property that puts {@link Logger} here. The real adapter
  * is `JsonlEventLog` (events.ts, append-only file); tests pass {@link NULL_SINK}
  * or a capturing fake. `emit` never throws and is durable per-call: each line
- * is on disk before `emit` returns (issue #41), so mid-run monitoring sees
- * every event without waiting for a flush.
+ * is appended synchronously (issue #41) and handed to the OS kernel before
+ * `emit` returns, so it survives process death (SIGKILL / exit / throw) and a
+ * mid-run reader sees it without a flush. It is not fsync'd (a power loss is
+ * still a rare risk) — a deliberate trade for an infrequent post-mortem.
  */
 export interface EventSink {
   emit(type: string, ticket: number | undefined, data?: Record<string, unknown>): void;
