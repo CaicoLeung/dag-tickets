@@ -399,3 +399,68 @@ test("gc (D3): removes stale dag-* linked worktrees", async () => {
   expect(list.stdout).not.toContain("dag-preflight-codex-gpt-5-4");
   expect(list.stdout).toContain("other-wt"); // untouched
 });
+
+// ---------------------------------------------------------------------------
+// 0.2.0 review fixes: `ls-runs` is a true positional subcommand now (spec #55
+// framed it as one); and listRuns orders by startedAt, not the formatted row.
+// ---------------------------------------------------------------------------
+
+/** Capture process.stdout (listRuns prints its table there) into a buffer. */
+function captureStdout(): { restore: () => void; text: () => string } {
+  const orig = process.stdout.write.bind(process.stdout);
+  let buf = "";
+  process.stdout.write = ((chunk: unknown) => {
+    buf += typeof chunk === "string" ? chunk : String(chunk);
+    return true;
+  }) as typeof process.stdout.write;
+  return {
+    restore: () => {
+      process.stdout.write = orig;
+    },
+    text: () => buf,
+  };
+}
+
+test("parseArgs: `ls-runs` is a positional subcommand (D2 form fix, #55)", () => {
+  // The spec framed ls-runs as a subcommand (like `gc`); the original PR shipped
+  // it as a `--ls-runs` flag. Both forms now work.
+  expect(parseArgs(["ls-runs"]).lsRuns).toBe(true);
+  expect(parseArgs(["--ls-runs"]).lsRuns).toBe(true); // alias retained
+  // It is NOT mistaken for an issue number.
+  expect(parseArgs(["ls-runs"]).numbers).toEqual([]);
+});
+
+test("listRuns (D2): orders runs by startedAt, not the formatted row", async () => {
+  // An arbitrary --run-id isn't timestamp-suffixed, so the old
+  // `rows.sort().reverse()` (which sorted formatted strings) mis-ordered.
+  // Seed two runs whose NAMES sort opposite to their TIMESTAMPS and assert
+  // newest-first follows the timestamp.
+  const cwd = await mkdtemp(join(tmpdir(), "dag-ls-sort-"));
+  const state = (startedAt: string, tickets: object) => ({
+    runId: "r",
+    target: "frontier",
+    startedAt,
+    updatedAt: startedAt,
+    tickets,
+  });
+  await mkdir(join(cwd, ".scratch/dag-tickets/zzz-name"), { recursive: true });
+  await writeFile(
+    join(cwd, ".scratch/dag-tickets/zzz-name/state.json"),
+    JSON.stringify(state("2026-07-29T00:00:00.000Z", { "1": { status: "done" } })),
+  );
+  await mkdir(join(cwd, ".scratch/dag-tickets/aaa-name"), { recursive: true });
+  await writeFile(
+    join(cwd, ".scratch/dag-tickets/aaa-name/state.json"),
+    JSON.stringify(state("2026-07-30T00:00:00.000Z", { "2": { status: "done" } })),
+  );
+  const cap = captureStdout();
+  try {
+    expect(await listRuns(cwd)).toBe(0);
+  } finally {
+    cap.restore();
+  }
+  const out = cap.text();
+  // aaa-name (newer timestamp) appears BEFORE zzz-name, despite the reverse
+  // lexicographic name order — proving the sort is on startedAt.
+  expect(out.indexOf("aaa-name")).toBeLessThan(out.indexOf("zzz-name"));
+});

@@ -1,7 +1,7 @@
 import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
 import { processTicket, type OverlapContext, type RunContext } from "./lifecycle.ts";
-import { loadPrefs, PaseoAgent, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary } from "./paseo.ts";
+import { loadPrefs, PaseoAgent, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary, isDagWorktreeSegment, modelOverrideWarning } from "./paseo.ts";
 import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
@@ -14,6 +14,7 @@ import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
 import type { FailureReason, SettleReason, Ticket, TicketKind, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
 import { EVT, JsonlEventLog, logsPath } from "./events.ts";
+import { resolveUnder } from "./paths.ts";
 import { run } from "./shell.ts";
 import { readdir, readFile as readFileAsync } from "node:fs/promises";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
@@ -132,7 +133,8 @@ USAGE
   dag-tickets --parent 42           # sub-issues of parent #42
   dag-tickets 12 15 23              # explicit issue numbers
   dag-tickets gc [--force]          # remove stale dag-* worktrees (0.2.0 D3)
-  dag-tickets --ls-runs             # list prior run-ids + outcomes (0.2.0 D2)
+  dag-tickets ls-runs               # list prior run-ids + outcomes (0.2.0 D2)
+  dag-tickets --ls-runs             # (alias for the ls-runs subcommand)
 
 OPTIONS
   --parent <n>            Process sub-issues of parent issue <n>.
@@ -286,6 +288,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
       case "--no-merged-check":
         a.noMergedCheck = true; break;
       case "--ls-runs":
+        a.lsRuns = true; break;
+      case "ls-runs":
         a.lsRuns = true; break;
       case "gc":
         a.gc = true; break;
@@ -589,6 +593,12 @@ export async function main(argv: string[]): Promise<number> {
   const prefs: ProviderPrefs = await loadPrefs();
   if (a.provider) prefs.impl = a.provider;
   if (a.reviewProvider) prefs.review = a.reviewProvider;
+  // 0.2.0 feedback A3 (warn half): when dag-tickets overrides the model the
+  // user configured in ~/.codex/config.toml, say so once, up front. Computed
+  // AFTER the --provider override so a CLI override warns too. No-op when the
+  // prefs already honour the codex config (or there's no codex config).
+  const overrideWarn = modelOverrideWarning(prefs);
+  if (overrideWarn) log("warn", overrideWarn);
 
   // Discover.
   let tickets: Ticket[];
@@ -649,9 +659,11 @@ export async function main(argv: string[]): Promise<number> {
     log("ok", `preflight ok: ${preflightSummary(results)}`);
   }
 
-  // 0.2.0 feedback B2: drop implement-kind tickets whose work already landed on
+  // 0.2.0 feedback B2: drop actionable tickets whose work already landed on
   // base (a merged commit precisely references #n) so the run doesn't
-  // re-implement merged work into the void. Read-only; --no-merged-check skips.
+  // re-dispatch merged work into the void. Applies to every dispatchable kind
+  // — a merged `Closes #n` means the issue is resolved whether it was headed
+  // for /implement or a single-shot /triage. Read-only; --no-merged-check skips.
   // Fetch origin/<base> ONCE up-front (not per-ticket) so a batch of N tickets
   // doesn't fire N parallel git fetches of the same ref — they'd serialize on
   // the git lock and waste a round-trip per ticket. The per-ticket scan then
@@ -660,9 +672,7 @@ export async function main(argv: string[]): Promise<number> {
     await ensureMergedBase(baseBranch, a.cwd);
     const merged: number[] = [];
     await Promise.all(
-      actionable
-        .filter((t) => t.kind === "implement")
-        .map(async (t) => {
+      actionable.map(async (t) => {
           const m = await mergedReference(t.number, baseBranch, a.cwd, { fetch: false });
           if (m.merged) {
             merged.push(t.number);
@@ -734,9 +744,7 @@ export async function main(argv: string[]): Promise<number> {
   // 0.2.0 feedback A1: per-step agent output logs live alongside events.jsonl.
   // Resolved the same way JsonlEventLog resolves its full path (cwd-prefixed
   // when --cwd is set, relative otherwise) so logs land beside state.json.
-  const stepLogDir = a.cwd
-    ? `${a.cwd.replace(/\/$/, "")}/${logsPath(runId)}`
-    : logsPath(runId);
+  const stepLogDir = resolveUnder(logsPath(runId), a.cwd);
 
   // Acquire the repo-wide run lock so a concurrent dag-tickets on this
   // checkout can't fight over the shared dag-<n> worktrees/branches. --dry-run
@@ -1005,7 +1013,7 @@ export function routeActionable(open: Ticket[], explicit: boolean): Ticket[] {
 
 /** Where a run's state lives, relative to a checkout. */
 function scratchDir(cwd?: string): string {
-  return cwd ? `${cwd.replace(/\/$/, "")}/.scratch/dag-tickets` : ".scratch/dag-tickets";
+  return resolveUnder(".scratch/dag-tickets", cwd);
 }
 
 /**
@@ -1023,7 +1031,12 @@ export async function listRuns(cwd?: string): Promise<number> {
     process.stdout.write(`No runs found at ${root}\n`);
     return 0;
   }
-  const rows: string[] = [];
+  // Carry the raw startedAt alongside the formatted line so the sort is stable
+  // on the actual timestamp — not on the formatted tab-row (the 0.2.0 review
+  // flagged `rows.sort().reverse()` as fragile: it only worked because default
+  // run-ids happen to be timestamp-suffixed; an arbitrary --run-id mis-ordered).
+  interface RunRow { startedAt: string; line: string; }
+  const rows: RunRow[] = [];
   for (const runId of entries) {
     const file = `${root}/${runId}/state.json`;
     let j: RunState;
@@ -1034,8 +1047,9 @@ export async function listRuns(cwd?: string): Promise<number> {
     }
     const tickets = Object.values(j.tickets ?? {});
     const count = (s: TicketStatus) => tickets.filter((t) => t.status === s).length;
-    rows.push(
-      [
+    rows.push({
+      startedAt: j.startedAt ?? "",
+      line: [
         runId,
         j.startedAt?.slice(0, 19) ?? "?",
         j.target ?? "?",
@@ -1044,16 +1058,16 @@ export async function listRuns(cwd?: string): Promise<number> {
         `skipped=${count("skipped")}`,
         `running=${count("running")}`,
       ].join("\t"),
-    );
+    });
   }
   if (rows.length === 0) {
     process.stdout.write(`No runs found at ${root}\n`);
     return 0;
   }
   process.stdout.write(`run-id\tstarted\ttarget\toutcomes\n`);
-  // Newest first (run-ids are timestamp-suffixed by default).
-  rows.sort().reverse();
-  process.stdout.write(rows.join("\n") + "\n");
+  // Newest first, by the real timestamp (empty/missing startedAt sorts last).
+  rows.sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
+  process.stdout.write(rows.map((r) => r.line).join("\n") + "\n");
   return 0;
 }
 
@@ -1071,27 +1085,23 @@ export async function gc(cwd?: string, force = false): Promise<number> {
 `);
     return 2;
   }
-  // Same dag-* layout contract the paseo adapter ownsWorktreeSegment() uses
-  // for TICKET worktrees (dag-<n> / dag-<n>-…), broadened to also cover the
-  // dag-preflight-<provider> worktrees the A2 preflight check creates. Both
-  // are dag-tickets-owned layouts; gc is the safety net that reclaims either
-  // after a crash / kill / failed preflight. `dag-` then either digits or the
-  // literal `preflight`, then a separator or end — so dag-12, dag-12-review,
-  // dag-preflight-codex-gpt-5-4 all match, but dag-foo / the main checkout /
-  // unrelated worktrees never do.
-  const isDag = (dir: string): boolean => {
-    const seg = dir.split("/").pop() ?? "";
-    return /^dag-(?:\d+|preflight)(?:-|$)/.test(seg);
-  };
+  // gc reclaims every dag-tickets-owned worktree layout: TICKET worktrees
+  // (dag-<n> / dag-<n>-… — the contract paseo.isDagWorktreeSegment owns, reused
+  // here instead of re-derived) AND the dag-preflight-<provider> worktrees the
+  // A2 preflight check creates. gc is the safety net that reclaims either after
+  // a crash / kill / failed preflight; dag-foo / the main checkout / unrelated
+  // worktrees never match.
+  const isGcTarget = (dir: string): boolean =>
+    isDagWorktreeSegment(dir) || /^dag-preflight(?:-|$)/.test(dir.split("/").pop() ?? "");
   const targets: string[] = [];
   let path = "";
   for (const line of r.stdout.split("\n")) {
     if (line.startsWith("worktree ")) {
-      if (path && isDag(path)) targets.push(path);
+      if (path && isGcTarget(path)) targets.push(path);
       path = line.slice("worktree ".length).trim();
     }
   }
-  if (path && isDag(path)) targets.push(path);
+  if (path && isGcTarget(path)) targets.push(path);
   if (targets.length === 0) {
     process.stdout.write("gc: no stale dag-* worktrees found.\n");
     return 0;

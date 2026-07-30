@@ -1,6 +1,7 @@
 import type { FailureReason, ReviewVerdict, Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
 import type { AgentPort, EventSink, ImplFailReason, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
+import { withLog } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 import { EVT } from "./events.ts";
 
@@ -121,7 +122,7 @@ async function runImplementLifecycle(
     "implement",
     t.number,
     () => ctx.agent.implement(t, branch, branchBase),
-    (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason, ...(r.logPath ? { logPath: r.logPath } : {}) }),
+    (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason, ...withLog(r) }),
   );
   if (!impl.ok) {
     // One exhaustive lookup replaces two parallel ternary cascades (the human
@@ -142,7 +143,7 @@ async function runImplementLifecycle(
       "review",
       t.number,
       () => ctx.agent.review(t, branch, branchBase),
-      (r) => ({ verdict: r.kind, issueCount: r.issueCount, ...(r.logPath ? { logPath: r.logPath } : {}) }),
+      (r) => ({ verdict: r.kind, issueCount: r.issueCount, ...withLog(r) }),
     );
 
   let rounds = 0;
@@ -155,7 +156,7 @@ async function runImplementLifecycle(
       "fix",
       t.number,
       () => ctx.agent.fix(t, verdict, branch, rounds),
-      (r) => ({ round: rounds, ok: r.ok, ...(r.logPath ? { logPath: r.logPath } : {}) }),
+      (r) => ({ round: rounds, ok: r.ok, ...withLog(r) }),
       { round: rounds },
     );
     if (!fix.ok) return fail(t, ctx, { reason: "fix-failed", error: `fix round ${rounds} failed` }, branch, undefined, fix.logPath);
@@ -262,7 +263,7 @@ async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise
     skill,
     t.number,
     () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch),
-    (res) => ({ ok: res.ok, timedOut: res.timedOut, ...(res.logPath ? { logPath: res.logPath } : {}) }),
+    (res) => ({ ok: res.ok, timedOut: res.timedOut, ...withLog(res) }),
   );
   if (!r.ok) return fail(t, ctx, { reason: "single-shot-failed", error: `${skill} agent failed${r.timedOut ? " (timeout)" : ""}` }, branch, undefined, r.logPath);
   ctx.log("ok", `${skill} complete`, t.number);
@@ -369,5 +370,5 @@ function fail(
 ): TicketOutcome {
   ctx.log("error", failure.error, t.number);
   if (logPath) ctx.log("dim", `log: ${logPath}`, t.number);
-  return { status: "failed", branch, pr, reason: failure.reason, error: failure.error, ...(logPath ? { logPath } : {}) };
+  return { status: "failed", branch, pr, reason: failure.reason, error: failure.error, ...withLog({ logPath }) };
 }

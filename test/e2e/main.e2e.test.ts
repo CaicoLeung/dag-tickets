@@ -31,7 +31,7 @@ import {
 import { EVT } from "../../src/events.ts";
 import { statePath, type RunState, type TicketState } from "../../src/state.ts";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { mkdir, writeFile } from "node:fs/promises";
 
@@ -1002,6 +1002,45 @@ describe("e2e: SIGINT releases the lock + flushes the event trace (#40)", () => 
       await teardown(env);
     }
   }, 20_000);
+});
+
+// 0.2.0 feedback B2 (all kinds): the already-merged-on-base skip used to
+// filter to kind==="implement" only, so a single-shot ticket whose work had
+// already merged was dispatched into the void. Now every dispatchable kind is
+// checked.
+describe("e2e: merged-check covers single-shot tickets (0.2.0 B2, all kinds)", () => {
+  test("a triage ticket whose number already landed on base is skipped, not dispatched", async () => {
+    const env = await setup({
+      issues: [{ number: 77, title: "Triage me", labels: ["needs-triage"] }],
+    });
+    try {
+      // Seed origin/main with a squash-merge-style commit precisely referencing #77.
+      await writeFile(join(env.repo, "landed.txt"), "x\n");
+      const git = (args: string[]) => spawnSync("git", args, { cwd: env.repo, encoding: "utf8" });
+      git(["add", "-A"]);
+      git(["commit", "-m", "feat: already landed (#77)"]);
+      git(["push", "-q", "origin", "main"]);
+
+      const cap = captureStderr();
+      let code: number | undefined;
+      try {
+        code = await runMain(env, ["--label", "needs-triage"]);
+      } finally {
+        cap.restore();
+      }
+      // No actionable tickets after the merged-skip → clean exit 0.
+      expect(code).toBe(0);
+      // The merged-check warned it's skipping #77.
+      expect(cap.text()).toContain("work already merged");
+      // Nothing dispatched: no PR, no merge, no state written.
+      const shim = await readShimState(env);
+      expect(shim.prCounter).toBe(1000);
+      expect(shim.merged).toEqual([]);
+      expect(await readState(env)).toBeNull();
+    } finally {
+      await teardown(env);
+    }
+  });
 });
 
 // --- helpers ---------------------------------------------------------------

@@ -16,7 +16,7 @@ import type {
   ReconcileResult,
   StepResult,
 } from "./ports.ts";
-import { normalizeBase, remoteRef } from "./ports.ts";
+import { normalizeBase, remoteRef, withLog } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 import { EVT } from "./events.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -102,6 +102,37 @@ export async function loadPrefs(): Promise<ProviderPrefs> {
     };
   }
   return { ...FALLBACK_PREFS };
+}
+
+/**
+ * 0.2.0 feedback A3 (the warn half the original PR dropped): when dag-tickets
+ *  overrides the model the user configured in `~/.codex/config.toml`, say so.
+ *  Returns a human warning string when a codex-bearing provider the run will use
+ *  (impl / research) diverges from `codex/<codexModel>`, or `undefined` when
+ *  there's nothing to override (no codex config, or the prefs already honour
+ *  it). review/triage use category defaults (typically a non-codex provider), so
+ *  they aren't checked — only the skills whose default is the codex provider.
+ *
+ *  Pure + exported so the policy is unit-testable without driving main(); the
+ *  cli computes it AFTER applying `--provider` so a CLI override warns too.
+ */
+export function modelOverrideWarning(
+  prefs: ProviderPrefs,
+  home: string = process.env.HOME ?? "",
+): string | undefined {
+  const codexModel = readCodexModel(home);
+  if (!codexModel) return undefined; // nothing configured to override
+  const configured = `codex/${codexModel}`;
+  const diverges = (p: string): boolean => p.startsWith("codex/") && p !== configured;
+  const skills: string[] = [];
+  if (diverges(prefs.impl)) skills.push(`implement=${prefs.impl}`);
+  if (diverges(prefs.research)) skills.push(`research=${prefs.research}`);
+  if (skills.length === 0) return undefined;
+  return (
+    `overriding codex config model ${configured} with: ${skills.join(", ")} ` +
+    `(align ~/.paseo/orchestration-preferences.json or pass --provider to match, ` +
+    `or ignore if intentional)`
+  );
 }
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
@@ -571,6 +602,24 @@ const SLUG = (n: number) => `dag-${n}`;
  * `dag-<n>` shape has a single source (it was previously re-derived here and
  * in the slug itself).
  */
+/** Does a worktree path's final segment belong to ANY ticket (the `dag-<n>`
+ *  layout)? The single source of the `dag-<n>` shape: a ticket's agent lives in
+ *  a dir whose final segment is `dag-<n>` (implement/fix) or `dag-<n>-…`
+ *  (`-review`, or a `-<counter>` reuse suffix). Exported so `gc` reuses this
+ *  instead of re-deriving `/^dag-\d+(-|$)/` (the Duplicated-Code smell the
+ *  0.2.0 review flagged). The per-ticket {@link ownsWorktreeSegment} below adds
+ *  the `=== SLUG(n)` exactness on top of this general predicate. */
+export const isDagWorktreeSegment = (dir: string): boolean => {
+  const seg = dir.split("/").pop() ?? "";
+  return /^dag-\d+(-|$)/.test(seg);
+};
+
+/**
+ * Does a worktree path's final segment belong to ticket `n` specifically?
+ * Tighter than {@link isDagWorktreeSegment}: requiring the segment to equal
+ * {@link SLUG} or continue with `-` disambiguates siblings — `dag-1` /
+ * `dag-1-review` never match `dag-12-1` / `dag-11-review-1`.
+ */
 const ownsWorktreeSegment = (dir: string, n: number): boolean => {
   const seg = dir.split("/").pop() ?? "";
   return seg === SLUG(n) || seg.startsWith(`${SLUG(n)}-`);
@@ -766,19 +815,19 @@ export class PaseoAgent implements AgentPort {
       },
     );
     if (!r.ok) {
-      return {
-        ok: false,
-        commits: 0,
-        reason: implFailReason(r),
-        ...(r.logPath ? { logPath: r.logPath } : {}),
-      };
+      return { ok: false, commits: 0, reason: implFailReason(r), ...withLog(r) };
     }
+    // 0.2.0 feedback D1: print the worktree path as soon as the dispatch
+    // succeeded (envelope parsed) — before the commit count — so an operator
+    // can match `paseo worktree list` / `ls` even when the implement later
+    // fails for another reason (e.g. empty). Review/fix reuse this worktree,
+    // so a ticket prints its path exactly once (at implement), not per step.
+    if (r.worktreeCwd) this.log("dim", `worktree: ${r.worktreeCwd}`, t.number);
     // A rate-limited or empty agent still "completes" with no diff — count
     // against the fetched origin/<base> so a stale local main can't mask it.
     const commits = await this.branch.commitCount(baseRef, branch);
-    if (commits === 0) return { ok: false, commits: 0, reason: "empty", ...(r.logPath ? { logPath: r.logPath } : {}) };
-    if (r.worktreeCwd) this.log("dim", `worktree: ${r.worktreeCwd}`, t.number);
-    return { ok: true, commits, ...(r.logPath ? { logPath: r.logPath } : {}) };
+    if (commits === 0) return { ok: false, commits: 0, reason: "empty", ...withLog(r) };
+    return { ok: true, commits, ...withLog(r) };
   }
 
   /** Single review attempt. Stable-log polling in dispatch guarantees the full
@@ -802,10 +851,10 @@ export class PaseoAgent implements AgentPort {
     );
     if (!r.ok) {
       this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
-      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800), ...(r.logPath ? { logPath: r.logPath } : {}) };
+      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800), ...withLog(r) };
     }
     const v = parseReviewVerdict(r.output);
-    return r.logPath ? { ...v, logPath: r.logPath } : v;
+    return { ...v, ...withLog(r) };
   }
 
   async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
@@ -825,7 +874,7 @@ export class PaseoAgent implements AgentPort {
       this.fallbacks,
       this.onRateLimited("fix", this.prefs.impl, t, branch),
     );
-    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...(r.logPath ? { logPath: r.logPath } : {}) };
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
@@ -846,7 +895,11 @@ export class PaseoAgent implements AgentPort {
       base: baseRef,
       logFile: this.logFileFor(t.number, skill),
     });
-    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...(r.logPath ? { logPath: r.logPath } : {}) };
+    // 0.2.0 feedback D1: single-shot tickets (triage/research) create their own
+    // worktree too — print its path so an operator can find it post-run, the
+    // same way implement-kind tickets do.
+    if (r.worktreeCwd) this.log("dim", `worktree: ${r.worktreeCwd}`, t.number);
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
 
   providerLabel(skill: "implement" | "review" | "triage" | "research"): string {

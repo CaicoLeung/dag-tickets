@@ -28,6 +28,7 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { EventSink, Logger } from "./ports.ts";
+import { resolveUnder } from "./paths.ts";
 
 /** Where a run's event stream lives. Sibling of `state.json`. */
 export function eventsPath(runId: string): string {
@@ -105,8 +106,7 @@ export class JsonlEventLog implements EventSink {
     cwd?: string,
     private readonly log?: Logger,
   ) {
-    const rel = eventsPath(runId);
-    this.full = cwd ? `${cwd.replace(/\/$/, "")}/${rel}` : rel;
+    this.full = resolveUnder(eventsPath(runId), cwd);
   }
 
   /**

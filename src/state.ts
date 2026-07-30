@@ -1,6 +1,7 @@
 import type { FailureReason, SettleReason, TicketStatus } from "./types.ts";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { resolveUnder } from "./paths.ts";
 
 /**
  * Resume state. Persisted after every ticket transition so a killed run can be
@@ -48,8 +49,7 @@ export function statePath(runId: string): string {
 }
 
 export async function saveState(state: RunState, cwd?: string): Promise<void> {
-  const path = statePath(state.runId);
-  const full = cwd ? `${cwd.replace(/\/$/, "")}/${path}` : path;
+  const full = resolveUnder(statePath(state.runId), cwd);
   state.updatedAt = new Date().toISOString();
   await mkdir(dirname(full), { recursive: true });
   await writeFile(full, JSON.stringify(state, null, 2) + "\n", "utf8");
@@ -64,8 +64,7 @@ export function ticketsWithStatus(state: RunState, status: TicketStatus): number
 }
 
 export async function loadState(runId: string, cwd?: string): Promise<RunState | null> {
-  const path = statePath(runId);
-  const full = cwd ? `${cwd.replace(/\/$/, "")}/${path}` : path;
+  const full = resolveUnder(statePath(runId), cwd);
   const f = Bun.file(full);
   if (!(await f.exists())) return null;
   return (await f.json()) as RunState;

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import {
   implFailReason,
   isConnectionError,
+  isDagWorktreeSegment,
   isRateLimited,
+  modelOverrideWarning,
   PaseoAgent,
   preflight,
   preflightOk,
@@ -1281,5 +1283,128 @@ describe("preflight (A2) — provider reachability gate", () => {
       { provider: "claude/y", ok: false, error: "401 Unauthorized" },
     ]);
     expect(s).toBe("codex/x: ok, claude/y: FAIL (401 Unauthorized)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 review (Standards): isDagWorktreeSegment is the single source of the
+// `dag-<n>` worktree-layout predicate, exported so `gc` reuses it instead of
+// re-deriving /^dag-\d+(-|$)/.
+// ---------------------------------------------------------------------------
+describe("isDagWorktreeSegment — the dag-<n> layout predicate", () => {
+  test("matches a bare dag-<n> final segment", () => {
+    expect(isDagWorktreeSegment("/wt/dag-12")).toBe(true);
+    expect(isDagWorktreeSegment("/wt/dag-465")).toBe(true);
+  });
+
+  test("matches a dag-<n>-… reuse / review suffix", () => {
+    expect(isDagWorktreeSegment("/wt/dag-12-review")).toBe(true);
+    expect(isDagWorktreeSegment("/wt/dag-12-1")).toBe(true);
+  });
+
+  test("rejects a non-numeric dag- prefix", () => {
+    expect(isDagWorktreeSegment("/wt/dag-foo")).toBe(false);
+    expect(isDagWorktreeSegment("/wt/dag-")).toBe(false);
+  });
+
+  test("rejects an unrelated worktree name", () => {
+    expect(isDagWorktreeSegment("/wt/other-wt")).toBe(false);
+    expect(isDagWorktreeSegment("/repo")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback A3 (warn half the original PR dropped): when dag-tickets
+// overrides the model the user configured in ~/.codex/config.toml, say so.
+// Only codex-bearing providers (impl/research) are checked — a different
+// provider is an explicit choice, not a silent model override.
+// ---------------------------------------------------------------------------
+describe("modelOverrideWarning (A3) — codex-model override detection", () => {
+  const makeHome = (toml: string | null): string => {
+    const home = mkdtempSync(join(tmpdir(), "dag-ow-"));
+    if (toml === null) return home; // no .codex/config.toml
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "config.toml"), toml, "utf8");
+    return home;
+  };
+  // prefs that HONOUR a codex config of `model = "gpt-5.6-sol"` → no warn.
+  const HONOUR: ProviderPrefs = {
+    impl: "codex/gpt-5.6-sol",
+    review: "claude/opus",
+    research: "codex/gpt-5.6-sol",
+    triage: "claude/opus",
+  };
+
+  test("no codex config → undefined (nothing to override)", () => {
+    expect(modelOverrideWarning(HONOUR, makeHome(null))).toBeUndefined();
+  });
+
+  test("prefs honour the codex config model → undefined", () => {
+    expect(modelOverrideWarning(HONOUR, makeHome('model = "gpt-5.6-sol"\n'))).toBeUndefined();
+  });
+
+  test("prefs.impl diverges from codex config → warns naming the configured model + the skill", () => {
+    // The exact #51 footgun: a prefs file (or the gpt-5.4 fallback) overrides
+    // the user's configured codex model.
+    const prefs: ProviderPrefs = { ...HONOUR, impl: "codex/gpt-5.4" };
+    const w = modelOverrideWarning(prefs, makeHome('model = "gpt-5.6-sol"\n'));
+    expect(w).toBeDefined();
+    expect(w).toContain("codex/gpt-5.6-sol"); // the configured model
+    expect(w).toContain("implement=codex/gpt-5.4"); // the diverging skill
+  });
+
+  test("a non-codex impl provider (claude) is NOT flagged — a different provider is an explicit choice", () => {
+    // Overriding codex with a different PROVIDER isn't the silent-model-override
+    // footgun; research still honours the codex config, so no warn.
+    const prefs: ProviderPrefs = { ...HONOUR, impl: "claude/opus" };
+    expect(modelOverrideWarning(prefs, makeHome('model = "gpt-5.6-sol"\n'))).toBeUndefined();
+  });
+
+  test("both impl and research diverge → warns for both skills", () => {
+    const prefs: ProviderPrefs = { ...HONOUR, impl: "codex/gpt-5.4", research: "codex/gpt-5.4" };
+    const w = modelOverrideWarning(prefs, makeHome('model = "gpt-5.6-sol"\n'));
+    expect(w).toContain("implement=codex/gpt-5.4");
+    expect(w).toContain("research=codex/gpt-5.4");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback D1 (the half the original PR dropped): print the worktree
+// path per ticket on a real run, regardless of success and for every step
+// kind — not only implement-success. The adapter now logs it as soon as the
+// dispatch envelope parses a cwd (implement: before the commit-count check, so
+// an empty impl still shows its worktree; singleShot: on its own dispatch).
+// ---------------------------------------------------------------------------
+describe("PaseoAgent — worktree path printed per ticket (D1)", () => {
+  test("implement prints the worktree path even when it later fails empty", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false, worktreeCwd: "/wt/dag-15" }];
+    const branch = new FakeBranch();
+    branch.counts["b1"] = 0; // empty impl — the path must still print
+    const cap = capturingLog();
+    const a = new PaseoAgent(branch, PREFS, [], cap.log, undefined, 1000, d);
+    const r = await a.implement(ticket(), "b1", "main");
+    expect(r).toEqual({ ok: false, commits: 0, reason: "empty" });
+    expect(logged(cap.lines, "dim", /worktree: \/wt\/dag-15/)).toBe(true);
+  });
+
+  test("a failed implement (dispatch !ok) prints nothing — no envelope, no path", async () => {
+    // On a failed dispatch the envelope isn't parsed, so there's genuinely no
+    // worktree path to print. Guards against a regression that prints garbage.
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: false, output: "boom", timedOut: false, rateLimited: false, connectionError: false }];
+    const cap = capturingLog();
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    await a.implement(ticket(), "b1", "main");
+    expect(cap.lines.some(([, msg]) => /worktree:/.test(msg))).toBe(false);
+  });
+
+  test("singleShot (triage) prints its own worktree path", async () => {
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "", timedOut: false, rateLimited: false, connectionError: false, worktreeCwd: "/wt/dag-17" }];
+    const cap = capturingLog();
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], cap.log, undefined, 1000, d);
+    await a.singleShot("triage", ticket(), "b1", "main");
+    expect(logged(cap.lines, "dim", /worktree: \/wt\/dag-17/)).toBe(true);
   });
 });
