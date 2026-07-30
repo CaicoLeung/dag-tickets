@@ -26,6 +26,12 @@ export interface TicketState {
    *  run can tell a cascade-aborted dependent from an unknown-kind skip without
    *  scraping `error`. */
   skipReason?: SettleReason;
+  /** 0.2.0 feedback A1: path to the captured output log for the step that
+   *  failed this ticket (set only on a `failed` settle). Lets an operator jump
+   *  straight to the agent's stdout/stderr without `cd`-ing into the worktree.
+   *  All step logs (success + failure) are also referenced from events.jsonl's
+   *  step.end payloads; this field is the headline pointer on a failed ticket. */
+  logPath?: string;
 }
 
 export interface RunState {

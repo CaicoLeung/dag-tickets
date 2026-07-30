@@ -39,6 +39,14 @@ export interface Ticket {
   state: "open" | "closed";
   /** Issue numbers this ticket depends on, parsed from the body + native links. */
   blockedBy: number[];
+  /**
+   * 0.2.0 feedback C1: soft serialisation peers parsed from a `Coordinate with` /
+   * `Conflicts with` block. NOT a dependency — both tickets run, just not
+   * concurrently (they touch the same code). Symmetrised at graph build so a
+   * one-directional body reference still yields mutual exclusion. Optional —
+   * absent on tickets/literals that don't declare it (defaults to []).
+   */
+  coordinateWith?: number[];
   /** Resolved from labels via the routing config. */
   kind: TicketKind;
 }
@@ -49,6 +57,8 @@ export interface ReviewVerdict {
   issueCount: number;
   /** Tail of the agent output, for logs / human escalation. */
   raw: string;
+  /** 0.2.0 feedback A1: path to this review dispatch's captured output log. */
+  logPath?: string;
 }
 
 /** Per-kind execution shape. */

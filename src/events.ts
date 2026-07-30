@@ -34,6 +34,13 @@ export function eventsPath(runId: string): string {
   return `.scratch/dag-tickets/${runId}/events.jsonl`;
 }
 
+/** 0.2.0 feedback A1: where a run's per-step agent output logs live. Sibling
+ *  directory of `events.jsonl` / `state.json` (`<runId>/logs/`). Each dispatch
+ *  writes `<n>-<step>.log` here. */
+export function logsPath(runId: string): string {
+  return `.scratch/dag-tickets/${runId}/logs`;
+}
+
 /**
  * Canonical event names. Using the constants (not bare strings) keeps the
  * post-mortem vocabulary grep-able and typo-proof across the three emitters.

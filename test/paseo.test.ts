@@ -1,11 +1,19 @@
 import { test, expect, describe } from "bun:test";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   implFailReason,
   isConnectionError,
   isRateLimited,
   PaseoAgent,
+  preflight,
+  preflightOk,
+  preflightSummary,
+  readCodexModel,
   runWithFallback,
   stopRunningAgent,
+  writeDispatchLog,
   type ProviderPrefs,
 } from "../src/paseo.ts";
 import type {
@@ -1014,5 +1022,264 @@ describe("PaseoAgent.stopInFlight (#40)", () => {
 describe("stopRunningAgent — never throws (no paseo in unit-test env)", () => {
   test("returns without throwing when paseo is absent from PATH", async () => {
     await expect(stopRunningAgent(undefined, 11)).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback A3 — readCodexModel: honour the user's ~/.codex/config.toml
+// `model = "…"` instead of the hardcoded gpt-5.4 default. Only the top-level
+// model wins; a `model` inside a [table] block must not.
+// ---------------------------------------------------------------------------
+describe("readCodexModel (A3) — codex config model", () => {
+  const makeHome = (toml: string): string => {
+    const home = mkdtempSync(join(tmpdir(), "dag-codex-"));
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "config.toml"), toml, "utf8");
+    return home;
+  };
+
+  test("reads the top-level model line", () => {
+    const home = makeHome('model = "gpt-5.6-sol"\nbase_url = "x"\n');
+    expect(readCodexModel(home)).toBe("gpt-5.6-sol");
+  });
+
+  test("ignores a model inside a [table] block", () => {
+    const home = makeHome(
+      'model = "gpt-5.6-sol"\n[mcp_servers]\nmodel = "trapped"\n',
+    );
+    expect(readCodexModel(home)).toBe("gpt-5.6-sol");
+  });
+
+  test("stops at the first table header even with no top-level model", () => {
+    const home = makeHome('[tui]\nmodel = "should-not-win"\n');
+    expect(readCodexModel(home)).toBeUndefined();
+  });
+
+  test("returns undefined when the file is missing", () => {
+    // mkdtemp dir with no .codex/config.toml
+    const home = mkdtempSync(join(tmpdir(), "dag-codex-"));
+    expect(readCodexModel(home)).toBeUndefined();
+  });
+
+  test("returns undefined for malformed / no model line", () => {
+    const home = makeHome('# just a comment\nbase_url = "x"\n');
+    expect(readCodexModel(home)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback A1 — per-step agent output logs: writeDispatchLog writes the
+// agent transcript + relay stderr + exit code to opts.logFile, and PaseoAgent
+// threads the resulting logPath onto its results + a failed outcome.
+// ---------------------------------------------------------------------------
+describe("writeDispatchLog (A1) — dispatch output capture", () => {
+  const tmp = () => mkdtempSync(join(tmpdir(), "dag-log-"));
+
+  test("returns undefined when opts.logFile is absent (unit tests / no run dir)", () => {
+    const opts = {
+      provider: "codex/x",
+      title: "implement #15",
+      slug: "dag-15",
+      branchMode: "branch-off" as const,
+    };
+    expect(writeDispatchLog(opts, { code: 0, stderr: "", timedOut: false }, "out")).toBeUndefined();
+  });
+
+  test("honors opts.logFile: creates parent dir, writes formatted body, returns path", () => {
+    const dir = tmp();
+    const file = join(dir, "deep", "logs", "15-implement.log");
+    const opts = {
+      provider: "codex/gpt-5.6-sol",
+      title: "implement #15",
+      slug: "dag-15",
+      branchMode: "branch-off" as const,
+      logFile: file,
+    };
+    const path = writeDispatchLog(
+      opts,
+      { code: 1, stderr: "wss://api.openai.com 401 Unauthorized", timedOut: false },
+      "REVIEW_VERDICT: CLEAN",
+    );
+    expect(path).toBe(file);
+    expect(existsSync(file)).toBe(true);
+    const body = readFileSync(file, "utf8");
+    expect(body).toContain("provider: codex/gpt-5.6-sol");
+    expect(body).toContain("exit: 1");
+    expect(body).toContain("## agent output");
+    expect(body).toContain("REVIEW_VERDICT: CLEAN");
+    expect(body).toContain("## stderr");
+    expect(body).toContain("401 Unauthorized");
+  });
+
+  test("returns undefined (never throws) when the path is unwritable", () => {
+    const opts = {
+      provider: "x",
+      title: "t",
+      slug: "s",
+      branchMode: "branch-off" as const,
+      logFile: "/proc/cannot/write/here/x.log",
+    };
+    expect(
+      writeDispatchLog(opts, { code: 0, stderr: "", timedOut: false }, "out"),
+    ).toBeUndefined();
+  });
+});
+
+describe("PaseoAgent (A1) — threads logFile + logPath through results", () => {
+  const makeLoggingDispatcher = (result: (o: DispatchOpts) => DispatchResult): Dispatcher => ({
+    dispatch: async (_prompt, o) => {
+      if (o.logFile) {
+        try {
+          mkdirSync(join(o.logFile, ".."), { recursive: true });
+        } catch {}
+        try {
+          writeFileSync(o.logFile, "stub dispatch log", "utf8");
+        } catch {}
+      }
+      const r = result(o);
+      return o.logFile ? { ...r, logPath: o.logFile } : r;
+    },
+    dispatchWithFallback: async (prompt, o, _fb, onSwitch) => {
+      const r = await makeLoggingDispatcher(result).dispatch(prompt, o);
+      // honour the rate-limit switch path so implement's branch-off callback runs
+      if (r.rateLimited && _fb.length) {
+        for (const fb of _fb) {
+          if (fb === o.provider) continue;
+          if (onSwitch) await onSwitch(fb);
+          const r2 = await makeLoggingDispatcher(result).dispatch(prompt, { ...o, provider: fb });
+          if (!r2.rateLimited) return o.logFile ? { ...r2, logPath: o.logFile } : r2;
+        }
+      }
+      return r;
+    },
+  });
+
+  test("a failed implement carries logPath + writes the log file", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dag-agent-"));
+    const stepLogDir = join(dir, "logs");
+    const d = makeLoggingDispatcher(() => ({
+      ok: false,
+      output: "401 Unauthorized",
+      timedOut: false,
+      rateLimited: false,
+      connectionError: false,
+    }));
+    const branch: BranchPort = {
+      cleanBranch: async () => {},
+      commitCount: async () => 0,
+      deleteBranch: async () => {},
+      ensureBaseRefFresh: async () => true,
+      rebaseOnto: async () => true,
+      resolveRemoteTip: async () => null,
+    };
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, d, undefined, undefined, stepLogDir);
+    const t: Ticket = { number: 15, title: "x", url: "", body: "", labels: [], state: "open", blockedBy: [], kind: "implement" };
+    const r = await a.implement(t, "loop/15-x", "main");
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("failed");
+    expect(r.logPath).toBe(join(stepLogDir, "15-implement.log"));
+    expect(existsSync(r.logPath!)).toBe(true);
+    expect(readFileSync(r.logPath!, "utf8")).toBe("stub dispatch log");
+  });
+
+  test("a clean review propagates logPath onto the verdict", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dag-agent-"));
+    const stepLogDir = join(dir, "logs");
+    const d = makeLoggingDispatcher(() => ({
+      ok: true,
+      output: "ok\nREVIEW_VERDICT: CLEAN",
+      timedOut: false,
+      rateLimited: false,
+      connectionError: false,
+    }));
+    const branch: BranchPort = {
+      cleanBranch: async () => {},
+      commitCount: async () => 0,
+      deleteBranch: async () => {},
+      ensureBaseRefFresh: async () => true,
+      rebaseOnto: async () => true,
+      resolveRemoteTip: async () => null,
+    };
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, d, undefined, undefined, stepLogDir);
+    const t: Ticket = { number: 16, title: "x", url: "", body: "", labels: [], state: "open", blockedBy: [], kind: "implement" };
+    const v = await a.review(t, "loop/16-x", "main");
+    expect(v.kind).toBe("clean");
+    expect(v.logPath).toBe(join(stepLogDir, "16-review.log"));
+  });
+
+  test("fix round logs get a -r<round> suffix", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "dag-agent-"));
+    const stepLogDir = join(dir, "logs");
+    const d = makeLoggingDispatcher(() => ({
+      ok: true,
+      output: "",
+      timedOut: false,
+      rateLimited: false,
+      connectionError: false,
+    }));
+    const branch: BranchPort = {
+      cleanBranch: async () => {},
+      commitCount: async () => 0,
+      deleteBranch: async () => {},
+      ensureBaseRefFresh: async () => true,
+      rebaseOnto: async () => true,
+      resolveRemoteTip: async () => null,
+    };
+    const a = new PaseoAgent(branch, PREFS, [], NOOP_LOG, undefined, 1000, d, undefined, undefined, stepLogDir);
+    const t: Ticket = { number: 17, title: "x", url: "", body: "", labels: [], state: "open", blockedBy: [], kind: "implement" };
+    const r = await a.fix(t, { kind: "issues", issueCount: 2, raw: "" }, "loop/17-x", 2);
+    expect(r.ok).toBe(true);
+    expect(existsSync(join(stepLogDir, "17-fix-r2.log"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback A2 — preflight orchestration: dedupes providers, checks each
+// once, reports per-provider ok/fail. preflightOk gates the cli's run.start abort.
+// ---------------------------------------------------------------------------
+describe("preflight (A2) — provider reachability gate", () => {
+  test("checks each distinct provider once (dedupes primary reappearing as fallback)", async () => {
+    const seen: string[] = [];
+    const results = await preflight(
+      ["codex/x", "codex/x", "claude/y", ""],
+      async (p) => {
+        seen.push(p);
+        return { ok: true };
+      },
+    );
+    expect(seen).toEqual(["codex/x", "claude/y"]); // deduped + empty dropped
+    expect(results).toHaveLength(2);
+    expect(results.map((r) => r.provider)).toEqual(["codex/x", "claude/y"]);
+  });
+
+  test("reports the per-provider error so the abort message is actionable", async () => {
+    const results = await preflight(
+      ["codex/gpt-5.6-sol", "claude/opus"],
+      async (p) =>
+        p === "codex/gpt-5.6-sol"
+          ? { ok: false, error: "401 Unauthorized" }
+          : { ok: true },
+    );
+    expect(preflightOk(results)).toBe(false);
+    expect(results[0]).toEqual({ provider: "codex/gpt-5.6-sol", ok: false, error: "401 Unauthorized" });
+    expect(results[1]?.ok).toBe(true);
+  });
+
+  test("preflightOk is true only when every provider passed", () => {
+    expect(preflightOk([{ provider: "a", ok: true }])).toBe(true);
+    expect(
+      preflightOk([
+        { provider: "a", ok: true },
+        { provider: "b", ok: false, error: "x" },
+      ]),
+    ).toBe(false);
+  });
+
+  test("preflightSummary renders ok + FAIL with the error", () => {
+    const s = preflightSummary([
+      { provider: "codex/x", ok: true },
+      { provider: "claude/y", ok: false, error: "401 Unauthorized" },
+    ]);
+    expect(s).toBe("codex/x: ok, claude/y: FAIL (401 Unauthorized)");
   });
 });

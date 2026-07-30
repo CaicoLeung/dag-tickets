@@ -101,6 +101,42 @@ function ctx(agent: FakeAgent, pr: FakePullRequest, over: Partial<RunContext> = 
   };
 }
 
+describe("implement lifecycle — step log path propagation (0.2.0 A1)", () => {
+  test("a failed implement carries logPath onto the outcome + step.end event", async () => {
+    const agent = new FakeAgent();
+    agent.impl = { ok: false, commits: 0, reason: "failed", logPath: "/run/logs/1-implement.log" };
+    const sink = new RecordingSink();
+    const out = await processTicket(ticket(), ctx(agent, new FakePullRequest(), { events: sink }));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("implement-failed");
+    expect(out.logPath).toBe("/run/logs/1-implement.log");
+    const end = sink.of(1).find((e) => e.type === EVT.STEP_END && e.data?.step === "implement");
+    expect(end?.data?.logPath).toBe("/run/logs/1-implement.log");
+  });
+
+  test("review-issues after fix loop carries the last review's logPath", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [
+      { kind: "issues", issueCount: 2, raw: "", logPath: "/run/logs/1-review.log" },
+      { kind: "issues", issueCount: 2, raw: "", logPath: "/run/logs/1-review.log" },
+      { kind: "issues", issueCount: 2, raw: "", logPath: "/run/logs/1-review.log" },
+    ];
+    agent.fixes = [{ ok: true, logPath: "/run/logs/1-fix-r1.log" }, { ok: true, logPath: "/run/logs/1-fix-r2.log" }];
+    const out = await processTicket(ticket(), ctx(agent, new FakePullRequest()));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("review-issues");
+    expect(out.logPath).toBe("/run/logs/1-review.log");
+  });
+
+  test("a successful ticket sets NO logPath on the outcome", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [{ ...CLEAN, logPath: "/run/logs/1-review.log" }];
+    const out = await processTicket(ticket(), ctx(agent, new FakePullRequest()));
+    expect(out.status).toBe("done");
+    expect(out.logPath).toBeUndefined();
+  });
+});
+
 describe("implement lifecycle — happy path", () => {
   test("clean on first review: one PR, merged, closed, zero fix rounds", async () => {
     const agent = new FakeAgent();

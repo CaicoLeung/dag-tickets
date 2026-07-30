@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { parseArgs, stopInFlightAgents, RunExit } from "../src/cli.ts";
+import { parseArgs, stopInFlightAgents, RunExit, routeActionable, listRuns, gc } from "../src/cli.ts";
 import type { Logger } from "../src/ports.ts";
 
 test("--version / -V set the version flag", () => {
@@ -288,4 +288,109 @@ test("RunExit.register adds all 4 listeners and detach removes them", () => {
   }
   const after = evs.map((e, i) => process.listenerCount(e) - before[i]!);
   expect(after).toEqual([0, 0, 0, 0]); // detach restored baseline
+});
+
+// 0.2.0 feedback B1 — explicit CLI numbers bypass the routing label gate.
+import type { Ticket } from "../src/types.ts";
+const t = (n: number, kind: Ticket["kind"]): Ticket => ({
+  number: n,
+  title: `T${n}`,
+  url: "",
+  body: "",
+  labels: [],
+  state: "open",
+  blockedBy: [],
+  kind,
+});
+
+test("routeActionable: a frontier run drops unknown-kind tickets", () => {
+  const out = routeActionable([t(1, "implement"), t(2, "unknown"), t(3, "skip")], false);
+  expect(out.map((x) => x.number)).toEqual([1]);
+});
+
+test("routeActionable: an explicit-number run promotes unknown → implement (warn, don't skip)", () => {
+  const out = routeActionable([t(1, "implement"), t(2, "unknown"), t(3, "skip")], true);
+  expect(out.map((x) => x.number)).toEqual([1, 2]);
+  expect(out[1]?.kind).toBe("implement"); // promoted
+});
+
+test("routeActionable: explicit never promotes an intentional skip", () => {
+  const out = routeActionable([t(1, "skip"), t(2, "unknown")], true);
+  expect(out.map((x) => x.number)).toEqual([2]);
+});
+
+test("parseArgs: --preflight (A2) + auto-merge default off (C2)", () => {
+  expect(parseArgs(["--preflight"]).preflight).toBe(true);
+  expect(parseArgs([]).preflight).toBe(false);
+  // C2: auto-merge is opt-in now — bare autoMerge flag is false until --auto-merge.
+  expect(parseArgs([]).autoMerge).toBe(false);
+  expect(parseArgs(["--auto-merge"]).autoMerge).toBe(true);
+  expect(parseArgs(["--no-auto-merge"]).noAutoMerge).toBe(true);
+});
+
+test("parseArgs: D2/D3 subcommands (gc / --ls-runs / --force / --no-merged-check)", () => {
+  expect(parseArgs(["--ls-runs"]).lsRuns).toBe(true);
+  expect(parseArgs(["gc"]).gc).toBe(true);
+  expect(parseArgs(["gc", "--force"]).gcForce).toBe(true);
+  expect(parseArgs(["--no-merged-check"]).noMergedCheck).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback D2/D3 — listRuns reads .scratch run state; gc removes stale
+// dag-* worktrees. Hermetic: a temp scratch dir for listRuns, a temp git repo
+// with a linked dag-12 worktree for gc.
+// ---------------------------------------------------------------------------
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { run } from "../src/shell.ts";
+
+test("listRuns (D2): summarises prior run state files, skips unreadable ones", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dag-ls-"));
+  const cwd = root; // scratchDir(cwd) = root/.scratch/dag-tickets
+  const state = (tickets: object) => ({
+    runId: "r",
+    target: "frontier",
+    startedAt: "2026-07-29T00:00:00.000Z",
+    updatedAt: "2026-07-29T00:00:00.000Z",
+    tickets,
+  });
+  await mkdir(join(cwd, ".scratch/dag-tickets/run-a"), { recursive: true });
+  await writeFile(
+    join(cwd, ".scratch/dag-tickets/run-a/state.json"),
+    JSON.stringify(state({ "1": { status: "done" }, "2": { status: "failed" } })),
+  );
+  // a run dir with no state.json (killed before first settle) — must be skipped
+  await mkdir(join(cwd, ".scratch/dag-tickets/run-b"), { recursive: true });
+
+  const code = await listRuns(cwd);
+  expect(code).toBe(0);
+});
+
+test("listRuns (D2): empty/missing scratch dir reports no runs, exit 0", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "dag-ls-empty-"));
+  expect(await listRuns(cwd)).toBe(0);
+});
+
+test("gc (D3): removes stale dag-* linked worktrees", async () => {
+  const GENV = {
+    GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t",
+  };
+  const mainRepo = await mkdtemp(join(tmpdir(), "dag-gc-main-"));
+  const g = (args: string[]) => run(["git", ...args], { cwd: mainRepo, env: GENV });
+  await g(["init", "-b", "main", "."]);
+  await writeFile(join(mainRepo, "a.txt"), "x\n");
+  await g(["add", "-A"]);
+  await g(["commit", "-m", "init"]);
+  // a linked worktree whose dir is dag-12 (the stale layout a fail leaves behind)
+  await g(["worktree", "add", "--detach", join(mainRepo, "dag-12")]);
+  // a non-dag worktree that must NOT be touched
+  await g(["worktree", "add", "--detach", join(mainRepo, "other-wt")]);
+
+  const code = await gc(mainRepo, true);
+  expect(code).toBe(0);
+  const list = await g(["worktree", "list", "--porcelain"]);
+  expect(list.stdout).not.toContain("dag-12");
+  expect(list.stdout).toContain("other-wt"); // untouched
 });

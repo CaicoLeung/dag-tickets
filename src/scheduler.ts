@@ -329,7 +329,21 @@ export async function runBatch(
         inflight: overlapInflight,
       });
       if (ready.length === 0) break;
-      const n = ready[0]!;
+      // 0.2.0 feedback C1: a `Coordinate with` / `Conflicts with` peer in flight
+      // removes a ready ticket from THIS launch pass (soft serialisation, not a
+      // dependency). The peer holds its slot until it settles; once it does the
+      // ticket re-enters ready and launches. Filter preserves frontier ordering;
+      // an empty launchable set (every ready ticket conflicts with something in
+      // flight) breaks to await the next settle — no deadlock, since at least
+      // one peer is always startable when nothing is in flight.
+      const inflightSet = new Set(inflight.keys());
+      const launchable = ready.filter((n) => {
+        const t = graph.byNumber.get(n);
+        if (!t) return true;
+        return !(t.coordinateWith ?? []).some((p) => inflightSet.has(p));
+      });
+      if (launchable.length === 0) break;
+      const n = launchable[0]!;
       // #29: capture the single blocker n overlapped (if any) so the caller can
       // branch off its head + capture its tip for the pull-model reconcile.
       // overlapBlockerFor returns undefined for fan-in (>1 in-flight blocker),

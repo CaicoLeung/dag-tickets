@@ -43,6 +43,54 @@ export function branchFor(number: number, title: string): string {
 }
 
 /**
+ * 0.2.0 feedback B2: has the work for issue `n` already landed on `base`? Scans
+ *  merged commit subjects on `origin/<base>` for a precise reference to `#n` —
+ *  the GitHub squash-merge title form `Title (#465)` or a `Closes/Fixes/Resolves
+ *  #465` trailer — so dag-tickets doesn't re-implement already-merged work into
+ *  the void. `n` is a parsed integer, safe to interpolate into the grep.
+ *
+ *  Conservative on purpose: a coincidental `#465` inside `#4650` or prose like
+ *  "relates to #465" is rejected by the precise alternation, so a real merge is
+ *  the only thing that triggers a skip. Best-effort: a failed fetch / git log
+ *  returns `{ merged: false }` (the run proceeds) rather than blocking.
+ */
+export async function mergedReference(
+  n: number,
+  base: string,
+  cwd?: string,
+): Promise<{ merged: boolean; sha?: string; subject?: string }> {
+  const bare = normalizeBase(base);
+  // Fetch so origin/<base> reflects merges that landed since the last fetch; a
+  // failed fetch is non-fatal (we scan whatever origin/<base> currently holds).
+  await run(["git", "fetch", "origin", bare], { cwd });
+  // git --grep scans all history (full message: subject + body) fast; limit
+  // to the most recent 50 matches so a very old coincidental reference can't
+  // mask a recent precise one. %B carries the whole message so a Closes/Fixes
+  // trailer in the body is verifiable, not just the subject.
+  const r = await run(
+    ["git", "log", `origin/${bare}`, "--grep", `#${n}`, "-i", "--format=%H%x09%B", "-50"],
+    { cwd },
+  );
+  if (!r.ok) return { merged: false };
+  // Precise: `(#465)` (the squash-merge title trailer) OR a Closes/Fixes/Resolves
+  // trailer, with the number not followed by another digit (so #4650 can't match).
+  const precise = new RegExp(
+    `(^|[^\\d])#${n}(?!\\d)|\\b(?:closes|fixes|resolves)\\s+#${n}(?!\\d)`,
+    "i",
+  );
+  for (const line of r.stdout.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const idx = line.indexOf("\t");
+    const sha = idx >= 0 ? line.slice(0, idx) : "";
+    // %B can span multiple lines; a trailer sits on its own line, so testing
+    // each line independently is correct (and the subject line carries (#n)).
+    const text = idx >= 0 ? line.slice(idx + 1) : line;
+    if (precise.test(text)) return { merged: true, sha: sha || undefined, subject: text.slice(0, 120) };
+  }
+  return { merged: false };
+}
+
+/**
  * Real {@link BranchPort} adapter: git worktree/branch hygiene. Owns the
  * invariant that each agent step starts on a clean branch (git forbids a
  * branch in more than one worktree). Driven by {@link PaseoAgent}; the

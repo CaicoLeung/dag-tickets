@@ -85,6 +85,8 @@ export interface ImplResult {
   commits: number;
   /** Present iff `!ok`. */
   reason?: ImplFailReason;
+  /** 0.2.0 feedback A1: path to this dispatch's captured output log. */
+  logPath?: string;
 }
 
 /** #29: outcome of an overlap reconcile — rebase a dependent's branch onto its
@@ -101,6 +103,8 @@ export interface StepResult {
   ok: boolean;
   timedOut?: boolean;
   rateLimited?: boolean;
+  /** 0.2.0 feedback A1: path to this dispatch's captured output log. */
+  logPath?: string;
 }
 
 /**
@@ -173,6 +177,11 @@ export interface DispatchOpts {
   base?: string;
   /** checkout-branch: existing branch to check out. */
   branch?: string;
+  /** 0.2.0 feedback A1: absolute path to persist this dispatch's full output
+   *  (agent transcript + relay stderr + exit code) so a failed step is
+   *  debuggable without `cd`-ing into the worktree. Best-effort: unset in unit
+   *  tests / when no run dir is wired → dispatch skips writing. */
+  logFile?: string;
 }
 
 /** Result of one Paseo agent dispatch. */
@@ -187,6 +196,13 @@ export interface DispatchResult {
    *  auto-recovers in the daemon — so the caller retries the step instead of
    *  declaring a hard `implement-failed`. Mirrors {@link rateLimited}. */
   connectionError: boolean;
+  /** 0.2.0 feedback A1: absolute path the dispatch wrote its full output to
+   *  (when {@link DispatchOpts.logFile} was set). Absent in unit tests. */
+  logPath?: string;
+  /** 0.2.0 feedback D1: the agent's worktree cwd from the paseo JSON envelope,
+   *  so the real-run stdout can show WHERE work is happening (dry-run already
+   *  prints the plan; real runs didn't). Absent when paseo omits it. */
+  worktreeCwd?: string;
 }
 
 /**

@@ -1,5 +1,5 @@
 import type { Ticket } from "./types.ts";
-import { parseBlockedByRefs } from "./parse.ts";
+import { parseBlockedByRefs, parseCoordinateRefs } from "./parse.ts";
 import { resolveKind, type RoutingConfig, DEFAULT_ROUTING } from "./config.ts";
 import { resolveTitleEdges } from "./graph.ts";
 import { repoInfo } from "./gitgh.ts";
@@ -31,6 +31,7 @@ function mapTicket(raw: RawIssue, cfg: RoutingConfig): Mapped {
       labels,
       state: raw.state === "closed" ? "closed" : "open",
       blockedBy: refs.numbers,
+      coordinateWith: parseCoordinateRefs(raw.body),
       kind: resolveKind(labels, cfg),
     },
     titleRefs: refs.titleRefs,
