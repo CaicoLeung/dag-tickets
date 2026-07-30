@@ -31,7 +31,7 @@ function mapTicket(raw: RawIssue, cfg: RoutingConfig): Mapped {
       labels,
       state: raw.state === "closed" ? "closed" : "open",
       blockedBy: refs.numbers,
-      coordinateWith: parseCoordinateRefs(raw.body),
+      coordinateWith: parseCoordinateRefs(raw.body, labels),
       kind: resolveKind(labels, cfg),
     },
     titleRefs: refs.titleRefs,

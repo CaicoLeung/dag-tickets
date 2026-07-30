@@ -23,39 +23,60 @@ export interface BlockedByRefs {
 
 /**
  * 0.2.0 feedback C1: a soft serialisation edge parsed from a `Coordinate with` /
- *  `Conflicts with` block. Unlike `Blocked by` (a hard dependency), this is a
- *  scheduling hint — two tickets that touch the same code shouldn't run
- *  concurrently. Returns just the `#NN` numbers (titles aren't useful for a
- *  soft edge). Handles inline and section forms, plural and singular, and the
- *  `Avoid conflicting edits with` phrasing the to-tickets skill uses.
+ *  `Conflicts with` block OR a `coordinate:` / `conflict:` label. Unlike
+ *  `Blocked by` (a hard dependency), this is a scheduling hint — two tickets
+ *  that touch the same code shouldn't run concurrently. Returns just the
+ *  `#NN` numbers (titles aren't useful for a soft edge). Handles inline and
+ *  section forms in the body, plural and singular, the `Avoid conflicting
+ *  edits with` phrasing, AND the label form (`coordinate:464`,
+ *  `conflicts:12,15`) the spec called out as "(or label)".
  */
-export function parseCoordinateRefs(body: string | null | undefined): number[] {
-  if (!body) return [];
-  const lines = body.split(/\r?\n/);
+export function parseCoordinateRefs(
+  body: string | null | undefined,
+  labels: string[] = [],
+): number[] {
   const numbers = new Set<number>();
-  let inSection = false;
-  // Section heading: `## Coordinate with` / `## Conflicts with` / `## Coordination`.
-  const sectionRe = /^#{1,6}\s+(coordinate(s)? with|conflicts? with|coordination( notes)?)\s*$/i;
-  // Inline: `**Coordinate with:** #464` / `- Conflicts with: #12, #15`.
-  const inlineRe = /^\s*(?:[-*]\s+)?\*{0,2}\s*(coordinate(s)? with|conflicts? with|avoid conflicting edits with)\*{0,2}\s*:?\s*(.*)$/i;
-  for (const line of lines) {
-    if (sectionRe.test(line)) {
-      inSection = true;
-      continue;
+  // Body refs carry `#NN`; label refs (`coordinate:464`) carry bare NN.
+  const harvestHashed = (text: string): void => {
+    for (const m of text.matchAll(/#(\d+)/g)) {
+      const n = parseInt(m[1]!, 10);
+      if (Number.isFinite(n) && n > 0) numbers.add(n);
     }
-    if (inSection && /^#{1,6}\s/.test(line)) inSection = false;
-    const harvest = (text: string): void => {
-      for (const m of text.matchAll(/#(\d+)/g)) {
-        const n = parseInt(m[1]!, 10);
-        if (Number.isFinite(n) && n > 0) numbers.add(n);
+  };
+  const harvestBare = (text: string): void => {
+    for (const m of text.matchAll(/(\d+)/g)) {
+      const n = parseInt(m[1]!, 10);
+      if (Number.isFinite(n) && n > 0) numbers.add(n);
+    }
+  };
+  // Label form: `coordinate:464`, `coordinate-with:464`, `conflicts:12,15`.
+  // The prefix is anchored + requires a `:` so a label like
+  // `coordinate-with-popover` (no number) can't false-harvest.
+  const labelRe = /^(?:coordinate(?:-with)?|conflicts?)\s*:\s*(.+)$/i;
+  for (const label of labels ?? []) {
+    const m = label.match(labelRe);
+    if (m) harvestBare(m[1]!);
+  }
+  if (body) {
+    const lines = body.split(/\r?\n/);
+    let inSection = false;
+    // Section heading: `## Coordinate with` / `## Conflicts with` / `## Coordination`.
+    const sectionRe = /^#{1,6}\s+(coordinate(s)? with|conflicts? with|coordination( notes)?)\s*$/i;
+    // Inline: `**Coordinate with:** #464` / `- Conflicts with: #12, #15`.
+    const inlineRe = /^\s*(?:[-*]\s+)?\*{0,2}\s*(coordinate(s)? with|conflicts? with|avoid conflicting edits with)\*{0,2}\s*:?\s*(.*)$/i;
+    for (const line of lines) {
+      if (sectionRe.test(line)) {
+        inSection = true;
+        continue;
       }
-    };
-    if (inSection) {
-      harvest(line.replace(/^\s*[-*]\s*/, ""));
-    } else if (inlineRe.test(line)) {
-      // The #NN refs sit after the marker; harvesting the whole line is safe —
-      // the marker phrase itself contains no #NN.
-      harvest(line);
+      if (inSection && /^#{1,6}\s/.test(line)) inSection = false;
+      if (inSection) {
+        harvestHashed(line.replace(/^\s*[-*]\s*/, ""));
+      } else if (inlineRe.test(line)) {
+        // The #NN refs sit after the marker; harvesting the whole line is safe —
+        // the marker phrase itself contains no #NN.
+        harvestHashed(line);
+      }
     }
   }
   return [...numbers].sort((a, b) => a - b);
