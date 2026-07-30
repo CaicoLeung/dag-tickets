@@ -586,7 +586,10 @@ export class PaseoAgent implements AgentPort {
 
   /** Single review attempt. Stable-log polling in dispatch guarantees the full
    *  output, so an unparseable verdict means the agent genuinely didn't emit one. */
-  async review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict> {
+  async review(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ReviewVerdict> {
+    // #34: an aborted dispatch is a cancellation — throw (see implement) so it
+    // unwinds to the scheduler's skipped sentinel rather than a synthetic unknown.
+    throwIfAborted(signal);
     await this.branch.cleanBranch(branch);
     const r = await this.dispatcher.dispatchWithFallback(
       reviewPrompt(t, base),
@@ -598,10 +601,14 @@ export class PaseoAgent implements AgentPort {
         timeoutMs: this.timeoutMs,
         branchMode: "checkout-branch",
         branch,
+        signal,
       },
       this.fallbacks,
       this.onRateLimited("review", this.prefs.review, t, branch),
     );
+    // #34: re-check after the spawn (which respects the forwarded signal) so a
+    // cancelled dispatch throws (→ skipped) instead of returning a synthetic unknown.
+    throwIfAborted(signal);
     if (!r.ok) {
       this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
       return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
@@ -609,7 +616,10 @@ export class PaseoAgent implements AgentPort {
     return parseReviewVerdict(r.output);
   }
 
-  async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
+  async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number, signal?: AbortSignal): Promise<StepResult> {
+    // #34: an aborted dispatch is a cancellation — throw (see implement) so it
+    // unwinds to the scheduler's skipped sentinel rather than a synthetic fail.
+    throwIfAborted(signal);
     await this.branch.cleanBranch(branch);
     const r = await this.dispatcher.dispatchWithFallback(
       fixPrompt(t, verdict.raw, branch),
@@ -621,10 +631,14 @@ export class PaseoAgent implements AgentPort {
         timeoutMs: this.timeoutMs,
         branchMode: "checkout-branch",
         branch,
+        signal,
       },
       this.fallbacks,
       this.onRateLimited("fix", this.prefs.impl, t, branch),
     );
+    // #34: re-check after the spawn (which respects the forwarded signal) so a
+    // cancelled dispatch throws (→ skipped) instead of returning a synthetic fail.
+    throwIfAborted(signal);
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
   }
 

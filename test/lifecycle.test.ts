@@ -43,11 +43,11 @@ class FakeAgent implements AgentPort {
     this.implementBase = base;
     return this.impl;
   }
-  async review(_t: Ticket, _branch: string, base: string): Promise<ReviewVerdict> {
+  async review(_t: Ticket, _branch: string, base: string, _signal?: AbortSignal): Promise<ReviewVerdict> {
     this.reviewBase = base;
     return this.reviews[this.reviewCalls++] ?? CLEAN;
   }
-  async fix(): Promise<StepResult> {
+  async fix(_t: Ticket, _verdict: ReviewVerdict, _branch: string, _round: number, _signal?: AbortSignal): Promise<StepResult> {
     return this.fixes[this.fixCalls++] ?? { ok: true };
   }
   async singleShot(_skill?: string, _t?: Ticket, _branch?: string, _base?: string, _signal?: AbortSignal): Promise<StepResult> {

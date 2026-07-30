@@ -20,8 +20,8 @@ export interface BatchResult {
 export interface LaunchInfo {
   overlapBlocker?: number;
   /** #34: per-launch AbortSignal so the process callback can observe
-   *  cancellation at its own side-effect boundaries (post-blocker-wait,
-   *  reconcile, createPr, mergePr, closeIssue). */
+   *  cancellation at its own side-effect boundaries (reconcile, createPr,
+   *  mergePr). */
   signal?: AbortSignal;
 }
 
@@ -203,6 +203,44 @@ export function applyCascadePlan(
 }
 
 /**
+ * #34: wrap a dispatch's promise so a cascade-abort (this dispatch's own
+ * `controller` signalled) resolves to a `skipped` sentinel instead of the
+ * process result/error. The sentinel makes the aborted dispatch RESOLVE —
+ * without it, `Promise.race` could hang on a dispatch whose blocker already
+ * doomed it. It is NOT a substitute for the `dispatch.delete` no-double-report
+ * guard (the settle path only skips REMOVED entries); the two are complementary.
+ *
+ * Exported so the standalone unit test exercises the EXACT promise chain
+ * `launch()` builds, instead of reconstructing it inline (which could drift
+ * from the deployed rule and mislead a maintainer).
+ *
+ * The check gates on the controller, NOT on the exception type: a genuine
+ * failure that happens to throw its own `DOMException("AbortError")` (any
+ * inner fetch/AbortController) still surfaces as `failed` via the catch when
+ * this dispatch's controller was not cascade-aborted.
+ */
+export function withAbortSentinel(
+  n: number,
+  controller: AbortController,
+  run: () => Promise<TicketStatus>,
+): Promise<{ number: number; status: TicketStatus }> {
+  return Promise.resolve(n)
+    .then(async () => {
+      const status = await run();
+      if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
+      return { number: n, status };
+    })
+    .catch(() => {
+      // process rejected. Only THIS dispatch's cascade-abort (our controller)
+      // maps to skipped — a genuine failure must surface as failed even when
+      // it coincides with a concurrent abort, even if it throws AbortError
+      // from an inner AbortController that isn't ours.
+      if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
+      return { number: n, status: "failed" as TicketStatus };
+    });
+}
+
+/**
  * DAG-aware bounded concurrency pool.
  *
  * Repeatedly: take the frontier (open, unblocked, unclaimed tickets), launch
@@ -268,11 +306,15 @@ export async function runBatch(
   // #34: per-dispatch bookkeeping: each in-flight ticket carries its dispatch
   // promise + AbortController. Bundled so the two never drift at mutation sites
   // (launch, settle, cascade-abort, overlap cleanup). Deleting a record is the
-  // #20 double-report guard: an aborted dependent leaves this map the instant
-  // it's recorded cascade-skipped, so its later natural resolution can never win
-  // `Promise.race`. The AbortController provides belt-and-suspenders protection:
-  // even without the delete, an aborted dispatch resolves to a harmless sentinel
-  // that can't corrupt state.
+  // #20 no-double-report guard, and it is LOAD-BEARING: the settle path's guard
+  // (`if (!dispatch.has(settled.number)) continue`) only skips REMOVED entries,
+  // so without the delete a cascade-aborted dispatch's sentinel would pass that
+  // guard and re-fire `onSettle` + `TICKET_END` (the terminal Sets stay clean
+  // via idempotent `add`, but the side-effect channels double-fire). The
+  // AbortController is NOT a substitute for the delete — its job is to make the
+  // aborted dispatch RESOLVE (instead of hanging forever once its blocker doomed
+  // it) and to a harmless `skipped` status, so the dispatch promise always
+  // settles and the run can't hang on an orphaned promise.
   const dispatch = new Map<
     number,
     { promise: Promise<{ number: number; status: TicketStatus }>; controller: AbortController }
@@ -303,9 +345,12 @@ export async function runBatch(
       inflight: new Set(dispatch.keys()),
     });
     // #34: signal abort on superseded dispatches before applying the plan.
-    // This makes the dispatch promise resolve to a harmless sentinel instead
-    // of staying pending forever — even without the Map.delete() the sentinel
-    // can't cause double-reporting (belt-and-suspenders with the delete).
+    // This makes the dispatch promise resolve to a `skipped` sentinel instead
+    // of staying pending forever — so an aborted dispatch can't hang the run.
+    // The sentinel does NOT replace the `dispatch.delete` no-double-report
+    // guard: the settle path only skips REMOVED entries, so the delete (in
+    // applyCascadePlan, below) is what actually stops the sentinel re-entering
+    // the settle path and double-firing onSettle/TICKET_END.
     for (const a of plan) {
       if (a.kind === "abort") {
         dispatch.get(a.dep)?.controller.abort();
@@ -339,28 +384,8 @@ export async function runBatch(
     // Bundle the signal into LaunchInfo so the process callback can observe
     // cancellation at its own side-effect boundaries.
     const controller = new AbortController();
-    const signalInfo: LaunchInfo = { ...info, signal: controller.signal };
-    const p = Promise.resolve(n)
-      .then(async (nn) => {
-        const status = await opts.process(nn, signalInfo);
-        // #34: a superseded dispatch (controller aborted) resolves to a harmless
-        // skipped sentinel so it can't win a later race and double-report —
-        // belt-and-suspenders with the `dispatch.delete` guard above. The check
-        // gates on the controller, NOT on the exception type, so a genuine
-        // failure that happens to throw its own DOMException("AbortError")
-        // (any inner fetch/AbortController) still surfaces as failed via the
-        // catch below when this dispatch wasn't cascade-aborted.
-        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
-        return { number: n, status };
-      })
-      .catch(() => {
-        // process rejected. Only THIS dispatch's cascade-abort (our controller)
-        // maps to skipped — a genuine failure must surface as failed even when
-        // it coincides with a concurrent abort, even if it throws AbortError
-        // from an inner AbortController that isn't ours.
-        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
-        return { number: n, status: "failed" as TicketStatus };
-      });
+    const launchInfo: LaunchInfo = { ...info, signal: controller.signal };
+    const p = withAbortSentinel(n, controller, () => opts.process(n, launchInfo));
     dispatch.set(n, { promise: p, controller });
   };
 

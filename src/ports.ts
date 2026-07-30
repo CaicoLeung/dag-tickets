@@ -127,11 +127,18 @@ export interface AgentPort {
    *  of the signal (the adapter can't see RunContext) — distinct from
    *  RunContext.signal, the lifecycle's internal source. */
   implement(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ImplResult>;
-  /** Run /code-review on `branch` against `base`. Returns the parsed verdict. */
-  review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict>;
+  /** Run /code-review on `branch` against `base`. Returns the parsed verdict.
+   *  `signal` (#34): forwarded into the spawned `paseo run` so an in-flight
+   *  abort interrupts it; when aborted (at entry or after the spawn) the
+   *  adapter throws AbortError (→ the scheduler's skipped sentinel), like
+   *  `implement`. */
+  review(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ReviewVerdict>;
   /** Run one fix pass against the review verdict, on the existing branch.
-   *  `round` (1-based) disambiguates repeated fix passes in the agent UI. */
-  fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult>;
+   *  `round` (1-based) disambiguates repeated fix passes in the agent UI.
+   *  `signal` (#34): forwarded into the spawned `paseo run` so an in-flight
+   *  abort interrupts it; when aborted the adapter throws AbortError (→ the
+   *  scheduler's skipped sentinel), like `implement`. */
+  fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number, signal?: AbortSignal): Promise<StepResult>;
   /** Single-shot skill (triage/research) in a fresh worktree — no PR.
    *  `signal` (#34): forwarded into the spawned `paseo run` so an in-flight
    *  abort interrupts it; when aborted the adapter throws AbortError (→ the

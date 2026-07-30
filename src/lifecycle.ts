@@ -35,15 +35,17 @@ export interface RunContext {
    *  so reconcile lands on the merged base (no premature PR). Absent in tests /
    *  when overlap is disabled. */
   waitForBlockers?: (blockers: number[]) => Promise<void>;
-  /** #34: per-launch AbortSignal — the SINGLE source every side-effect
-   *  boundary in the lifecycle discovers (post-blocker-wait, reconcile,
-   *  createPr, mergePr, singleShot). Threaded one way: the caller merges it
-   *  onto a per-ticket RunContext copy (the shared ctx is never mutated with
-   *  a per-ticket signal); it is NOT also passed as a separate `processTicket`
-   *  param. The lifecycle forwards `ctx.signal` into {@link AgentPort}
-   *  implement/singleShot params — the AgentPort is a separate seam (it can't
-   *  see RunContext), so that param is the cross-seam transport, not redundant
-   *  threading. */
+  /** #34: per-launch AbortSignal — the SINGLE source the lifecycle's
+   *  abort-guarded side effects discover. `guarded(ctx, fn)` (reconcile,
+   *  createPr) co-locates the check with the call; the merge + singleShot gates
+   *  stay explicit `throwIfAborted` checkpoints (merge precedes a try/catch it
+   *  can't be folded into; singleShot is an entry gate). Threaded one way: the
+   *  caller merges it onto a per-ticket RunContext copy (the shared ctx is never
+   *  mutated with a per-ticket signal); it is NOT also passed as a separate
+   *  `processTicket` param. The lifecycle forwards `ctx.signal` into
+   *  {@link AgentPort} implement/review/fix/singleShot params — the AgentPort is
+   *  a separate seam (it can't see RunContext), so that param is the cross-seam
+   *  transport, not redundant threading. */
   signal?: AbortSignal;
 }
 
@@ -151,7 +153,7 @@ async function runImplementLifecycle(
       ctx,
       "review",
       t.number,
-      () => ctx.agent.review(t, branch, branchBase),
+      () => ctx.agent.review(t, branch, branchBase, ctx.signal),
       (r) => ({ verdict: r.kind, issueCount: r.issueCount }),
     );
 
@@ -164,7 +166,7 @@ async function runImplementLifecycle(
       ctx,
       "fix",
       t.number,
-      () => ctx.agent.fix(t, verdict, branch, rounds),
+      () => ctx.agent.fix(t, verdict, branch, rounds, ctx.signal),
       (r) => ({ round: rounds, ok: r.ok }),
       { round: rounds },
     );
@@ -189,15 +191,16 @@ async function runImplementLifecycle(
   // Overlap can't trigger at concurrency 1, so this can't deadlock: the
   // blocker always holds its own concurrency slot while the dependent waits.
   if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
-  // #34: after the potentially long blocker wait the dispatch may have been
-  // superseded — check before any further side effects (reconcile, createPr).
-  throwIfAborted(ctx.signal);
 
   // #29 (pull-model reconcile): before opening a PR, land an overlapped
   // dependent onto the merged integration base. Safe here — between dispatches,
   // not mid-run. A conflicting/stale rebase fails the dependent (no PR opened).
+  // #34: reconcile + createPr below both run through `guarded`, which checks
+  // the per-launch signal before each side effect — so a dispatch superseded
+  // during the blocker wait above is caught here, not at a separate checkpoint
+  // that could drift away from the call it protects.
   if (overlap && ctx.agent.reconcile) {
-    const rec = await ctx.agent.reconcile(t, overlap.blockerTipSha, ctx.baseBranch);
+    const rec = await guarded(ctx, () => ctx.agent.reconcile!(t, overlap.blockerTipSha, ctx.baseBranch));
     if (!rec.ok) {
       // One reason, used in the event payload, the persisted FailureReason,
       // and the human error message — formerly three separate
@@ -221,14 +224,15 @@ async function runImplementLifecycle(
   }
 
   // 3. PR.
-  // #34: check before side effects — a superseded dispatch must not create a PR.
-  throwIfAborted(ctx.signal);
-  const pr = await ctx.pullRequest.createPr({
+  // #34: `guarded` checks the signal before the side effect (a superseded
+  // dispatch must not create a PR) — co-locating the check with the call so a
+  // new boundary inherits it instead of remembering a separate throw.
+  const pr = await guarded(ctx, () => ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
     head: branch,
     base: ctx.baseBranch,
-  });
+  }));
   ctx.events.emit(EVT.PR_CREATED, t.number, { pr, head: branch, base: ctx.baseBranch });
   // #29: the head is now pushed — mark it so this ticket's own dependents can
   // overlap on it (the cli's canOverlap policy reads this signal).
@@ -318,6 +322,22 @@ async function dryRunPlan(t: Ticket, skill: string, expectPr: boolean, ctx: RunC
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * #34: run an abort-guarded side effect — throw AbortError iff the dispatch's
+ *  per-launch signal is already aborted, then run `fn`. Absorbs the abort-check
+ *  INTO the side-effect boundary so a new PR/reconcile boundary can't forget it
+ *  (the fragility #34 set out to remove: a checkpoint that lives on a separate
+ *  line drifts away from the call it protects). Replaces the former spread of
+ *  standalone `throwIfAborted(ctx.signal)` lines at reconcile/createPr. The
+ *  merge + singleShot gates stay explicit — merge sits before a try/catch
+ *  (folding it in would misclassify an abort as `merge-race`), and singleShot
+ *  is an entry gate that also skips the branch/log setup.
+ */
+async function guarded<T>(ctx: RunContext, fn: () => Promise<T>): Promise<T> {
+  throwIfAborted(ctx.signal);
+  return fn();
+}
 
 /**
  * Run one agent step inside a timed step.start/step.end event pair. Collapses

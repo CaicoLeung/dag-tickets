@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { runBatch, planCascade, applyCascadePlan, type LaunchInfo } from "../src/scheduler.ts";
+import { runBatch, planCascade, applyCascadePlan, withAbortSentinel, type LaunchInfo } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
 import { fanInHeavyGraph, retryableOutcome } from "./helpers.ts";
 import type { FailureReason, Ticket, TicketStatus } from "../src/types.ts";
@@ -929,16 +929,18 @@ describe("runBatch — transient retry integration (issue #21)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// #34 — AbortController sentinel prevents double-report on cascade-abort.
+// #34 — AbortController sentinel makes a cascade-aborted dispatch resolve.
 //
 // Each dispatch is paired with an AbortController. On cascade-abort the
 // controller is signalled BEFORE the plan is applied, so the dispatch promise
-// resolves to a harmless "skipped" sentinel instead of staying pending forever.
-// Even without the inflight.delete() guard, the sentinel can't corrupt state
-// (Set.add of an already-present number is a no-op, and the settle-path guard
-// skips removed entries). Together they form belt-and-suspenders protection
-// against double-reporting — a future edit that forgets the delete won't
-// silently move a cascade-skipped ticket into completed.
+// resolves to a "skipped" sentinel instead of staying pending forever — which
+// would otherwise hang `Promise.race` on a dispatch whose blocker already
+// doomed it. The sentinel does NOT itself prevent double-reporting: the settle
+// path's guard (`if (!dispatch.has(settled.number)) continue`) only skips
+// REMOVED entries, so the `dispatch.delete` inside applyCascadePlan is the
+// load-bearing no-double-report guard. The integration test below asserts
+// onSettle fires exactly once — and it passes precisely because the delete
+// removes the aborted entry before its sentinel can win the race.
 // ---------------------------------------------------------------------------
 
 describe("runBatch — AbortController sentinel (#34)", () => {
@@ -1019,36 +1021,25 @@ describe("runBatch — AbortController sentinel (#34)", () => {
     expect(twoSettles[0]![2]).toBeUndefined();
   });
 
-  test("structural guard: sentinel prevents double-report even when dispatch.delete is skipped", async () => {
-    // Prove the AbortController sentinel ALONE (without the dispatch.delete
-    // guard) prevents a cascade-aborted dispatch from corrupting state. An
-    // aborted controller + a process that still manages to resolve "done"
-    // MUST yield sentinel "skipped", not "done" — the belt-and-suspenders
-    // protection that backs up the inflight.delete invariant.
+  test("withAbortSentinel resolves a controller-aborted dispatch to the skipped sentinel, not the process result", async () => {
+    // Exercises the EXACT promise chain `launch()` builds (via the shared
+    // `withAbortSentinel` helper) so the unit test can't drift from the
+    // deployed rule. An aborted controller + a process that still resolves
+    // "done" MUST yield the "skipped" sentinel — the sentinel makes a
+    // cascade-aborted dispatch resolve instead of hanging `Promise.race`.
+    // (This does NOT by itself prevent double-reporting — the `dispatch.delete`
+    // in applyCascadePlan is the load-bearing guard for that; the integration
+    // test above asserts onSettle fires exactly once.)
     const controller = new AbortController();
     // Simulate cascade-abort: signal the controller before the process resolves.
     controller.abort();
 
-    // The exact promise chain used in runBatch's launch() closure.
     const n = 42;
-    const p = Promise.resolve(n)
-      .then(async (nn) => {
-        // No pre-check: process always runs, then the post-check converts a
-        // superseded dispatch (controller aborted) to the skipped sentinel.
-        const status = await Promise.resolve("done" as TicketStatus);
-        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
-        return { number: n, status };
-      })
-      .catch(() => {
-        // Gate on the controller, not the exception: only THIS dispatch's
-        // cascade-abort maps to skipped; a genuine failure stays failed.
-        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
-        return { number: n, status: "failed" as TicketStatus };
-      });
+    const p = withAbortSentinel(n, controller, () => Promise.resolve("done" as TicketStatus));
 
     const result = await p;
     // Without the sentinel, this would be { number: 42, status: "done" } —
-    // a cascade-aborted ticket wrongly counted as completed.
+    // a cascade-aborted dispatch resolving to its process result.
     expect(result).toEqual({ number: 42, status: "skipped" });
   });
 });
