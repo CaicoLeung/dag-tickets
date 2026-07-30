@@ -59,6 +59,18 @@ export const NULL_SINK: EventSink = Object.freeze({
   emit() {},
 });
 
+/** Spread a source's optional `logPath` onto a result object without a
+ *  hand-written conditional at every call site. Returns `{ logPath }` when the
+ *  source carries one, `{}` otherwise — so a clean result OMITS the key (not
+ *  present-as-undefined). The failing-step log path threads identically through
+ *  `DispatchResult` → `ImplResult`/`ReviewVerdict`/`StepResult` → `TicketOutcome`
+ *  via one named helper instead of the ~7 inline
+ *  `...(r.logPath ? { logPath: r.logPath } : {})` copies the 0.2.0 review
+ *  flagged as Duplicated Code. */
+export function withLog(src: { logPath?: string }): { logPath?: string } {
+  return src.logPath ? { logPath: src.logPath } : {};
+}
+
 export interface CheckResult {
   /** "pass" | "fail" | "none" (no CI configured). */
   state: "pass" | "fail" | "none";
