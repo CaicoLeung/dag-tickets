@@ -1,7 +1,9 @@
+import { expect } from "bun:test";
 import { buildGraph } from "../src/graph.ts";
 import type { Graph } from "../src/graph.ts";
 import type { FailureReason, Ticket } from "../src/types.ts";
 import type { RetryableOutcome } from "../src/retry.ts";
+import { OverlapCoordinator } from "../src/cli.ts";
 
 function ticket(n: number, blockedBy: number[] = []): Ticket {
   return {
@@ -42,4 +44,32 @@ export function fanInHeavyGraph(): Graph {
     ticket(6, [2]),
     ticket(7, [2]),
   ]);
+}
+
+/** Flush the microtask queue so an async lifecycle reaches its next await
+ *  (e.g. `waitForBlockers` registering a waiter) before an assertion reads it.
+ *  Shared by the lifecycle and scheduler overlap suites so both agree on the
+ *  flush primitive — previously each inlined `new Promise(r => setTimeout(r, 0))`
+ *  (#31 review: duplicated microtask-flush idiom). */
+export const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+/** Probe that `coord`'s createPr-gate on blocker `n` is STILL held after one
+ *  microtask flush: a waiter registered now must NOT resolve (i.e. `n` is absent
+ *  from the `awaitOne` short-circuit `settled` set). Collapses the duplicated
+ *  `Promise.race([waitForBlockers, tick])` scaffold both overlap tests inlined
+ *  to assert the #31 race guard (#31 review: duplicated "late-waiter hangs"
+ *  probe). The positive counterpart (gate RELEASED) stays inline at its call
+ *  site — it asserts the opposite and would need a different helper. */
+export async function assertGateStillHeld(
+  coord: OverlapCoordinator,
+  n: number,
+): Promise<void> {
+  let resolved = false;
+  await Promise.race([
+    coord.waitForBlockers([n]).then(() => {
+      resolved = true;
+    }),
+    tick(),
+  ]);
+  expect(resolved).toBe(false);
 }

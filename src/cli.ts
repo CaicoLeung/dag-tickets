@@ -549,12 +549,18 @@ function stateFromOutcome(
  *    overlapping an already-done blocker resolves immediately.
  * Exposed as the slim RunContext hooks (markHeadPushed / waitForBlockers) plus
  * the scheduler's canOverlap policy; main() wires them, this class owns them.
+ * Exported so the #31 race (a non-done settle must not release the gate) can
+ * be tested against the real class instead of a hand-rolled model.
  */
-class OverlapCoordinator {
+export class OverlapCoordinator {
   private readonly pushedHeads = new Set<number>();
   private readonly settled: Set<number>;
   private readonly waiters = new Map<number, Array<() => void>>();
 
+  /** @param seedSettled blockers already settled `done` before this run
+   *  (resume). MUST be done-only: `settled` is the gate's short-circuit set,
+   *  so a failed/skipped blocker here would let a dependent bypass the gate on
+   *  a broken base (#31). */
   constructor(seedSettled: Iterable<number>) {
     this.settled = new Set(seedSettled);
   }
@@ -571,17 +577,24 @@ class OverlapCoordinator {
     this.pushedHeads.add(n);
   };
 
-  /** RunContext hook: gate createPr on every blocker settling. Overlap can't
-   *  trigger at concurrency 1, so a blocker always holds its own slot while a
-   *  dependent waits here — no deadlock. */
+  /** RunContext hook: gate createPr on every blocker settling `done`.
+   *  Overlap can't trigger at concurrency 1, so a blocker always holds its own
+   *  slot while a dependent waits here — no deadlock. Does NOT resolve on
+   *  failed/skipped: the cascade-abort kills the dependent before createPr so
+   *  a dependent can never open a PR against a base missing a failed blocker's
+   *  commits (#31). */
   readonly waitForBlockers = async (blockers: number[]): Promise<void> => {
     await Promise.all(blockers.map((b) => this.awaitOne(b)));
   };
 
-  /** Scheduler onSettle hook: record `n` settled and release any overlap-
-   *  dependent waiting on it. Called before state persist so a resumed run
-   *  sees the blocker as settled too. */
-  noteSettled(n: number): void {
+  /** Scheduler onSettle hook: record `n` as settled-done and release any
+   *  overlap-dependent's waiters. Only `status === "done"` is recorded: a
+   *  failed/skipped blocker must NOT release a dependent's gate — the
+   *  cascade-abort owns that dependent instead (#31). Keeping non-done out of
+   *  `settled` also stops a dependent that registers its waiter after the
+   *  settle from bypassing the gate via the `awaitOne` short-circuit (#31). */
+  noteSettled(n: number, status: TicketStatus): void {
+    if (status !== "done") return;
     this.settled.add(n);
     const w = this.waiters.get(n);
     if (w) {
@@ -945,9 +958,13 @@ export async function main(argv: string[]): Promise<number> {
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
-    // main() — see OverlapCoordinator. Seeded from the resume sets so a
-    // dependent overlapping an already-done blocker resolves immediately.
-    const overlap = new OverlapCoordinator([...seedCompleted, ...seedFailed, ...seedSkipped]);
+    // main() — see OverlapCoordinator. Seeded from the resume `completed` set
+    // ONLY: `settled` means settled-done (the gate short-circuits on it), so a
+    // resumed failed/skipped blocker must NOT land there — its dependent is
+    // cascade-killed before launch instead, and seeding non-done would let a
+    // waiter short-circuit on a broken base (#31 invariant, uniform with
+    // noteSettled's status guard).
+    const overlap = new OverlapCoordinator([...seedCompleted]);
     const ctx: RunContext = {
       agent,
       pullRequest,
@@ -1069,7 +1086,7 @@ export async function main(argv: string[]): Promise<number> {
         // #29: this ticket settled — release any overlap-dependent waiting in
         // its pre-createPr gate (waitForBlockers). Recorded before state persist
         // so a dependent resumed after a kill sees the blocker as settled too.
-        overlap.noteSettled(n);
+        overlap.noteSettled(n, status);
         // A cascade-abort `reason` is persisted on its own field (not overloaded
         // onto `error`) so a resumed run distinguishes a killed dependent from a
         // genuine error or an unknown-kind skip without scraping `error`.

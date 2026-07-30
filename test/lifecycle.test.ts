@@ -13,6 +13,8 @@ import type {
 import type { ReviewVerdict, Ticket } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
+import { OverlapCoordinator } from "../src/cli.ts";
+import { tick, assertGateStillHeld } from "./helpers.ts";
 
 function ticket(n = 1, title = "Do the thing"): Ticket {
   return {
@@ -778,12 +780,82 @@ describe("implement lifecycle — #29 overlap", () => {
       overlap,
     );
     // createPr hasn't run yet (gate unresolved), but the gate was called with the blockers.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     expect(repo.prs).toHaveLength(0);
     expect(waitedFor).toEqual([[1, 2]]);
     resolveGate();
     const out = await running;
     expect(out.status).toBe("done");
     expect(repo.prs).toHaveLength(1);
+  });
+
+  test("overlap: a failed/skipped blocker does NOT release the createPr gate — stuck until cascade-abort (#31)", async () => {
+    // Exercises the REAL OverlapCoordinator (the class the fix lives in) wired
+    // into the lifecycle — not a hand-rolled gate model — so this validates the
+    // `settled`-Set exclusion + noteSettled status guard that ARE the #31 fix.
+    const agent = new FakeAgent();
+    agent.reviews = [CLEAN];
+    agent.reconcile = async () => ({ ok: true });
+    const repo = new FakePullRequest();
+    const t = ticket(2);
+    t.blockedBy = [1];
+    const overlap: OverlapContext = { blockerHead: "origin/loop/1-foo", blockerTipSha: "abc" };
+
+    const coord = new OverlapCoordinator([]); // empty seed — blocker 1 not settled
+
+    const running = processTicket(
+      t,
+      ctx(agent, repo, { waitForBlockers: coord.waitForBlockers }),
+      overlap,
+    );
+
+    await tick(); // lifecycle reaches waitForBlockers → registers a waiter on 1
+    expect(repo.prs).toHaveLength(0);
+
+    // Blocker settles failed/skipped — gate stays LOCKED (#31): noteSettled's
+    // status guard skips both the `settled` add AND the waiter release.
+    coord.noteSettled(1, "failed");
+    await tick();
+    expect(repo.prs).toHaveLength(0); // still no PR — gate didn't release
+    coord.noteSettled(1, "skipped");
+    await tick();
+    expect(repo.prs).toHaveLength(0); // still no PR
+
+    // #31 race guard: a non-done settle must NOT land in `settled`, so a
+    // dependent that registers its waiter AFTER the settle can't bypass the
+    // gate via the awaitOne short-circuit. Blocker 1 settled failed above — a
+    // fresh waiter registered now must still hang, not resolve immediately.
+    await assertGateStillHeld(coord, 1); // 1 ∉ settled → no short-circuit
+
+    // Sanity: "done" releases (proves the gate is status-aware).
+    coord.noteSettled(1, "done");
+    await running;
+    expect(repo.prs).toHaveLength(1);
+  });
+
+  test("overlap: a resumed done blocker seeded into the coordinator short-circuits the gate (resume fast-path, #29/#31)", async () => {
+    // `settled` is the awaitOne short-circuit set: a dependent overlapping an
+    // already-done blocker (resume) must resolve immediately instead of
+    // hanging forever (noteSettled won't re-fire for a prior settle). This
+    // pins that legitimate fast-path AND, by implication, WHY main() seeds
+    // completed-only: the set carries no status, so the #31 invariant (non-done
+    // must not release the gate) is enforced at the construction site — a
+    // failed/skipped blocker seeded here would short-circuit too, which is why
+    // the cli seeds just `completed`. main()'s done-only seed is audited by the
+    // scheduler's resume-cascade tests (a seeded failure cascade-kills its
+    // dependent before it can reach this gate).
+    const coord = new OverlapCoordinator([1]); // 1 resumed as settled-done
+    let resolved = false;
+    await Promise.race([
+      coord.waitForBlockers([1]).then(() => {
+        resolved = true;
+      }),
+      tick(),
+    ]);
+    expect(resolved).toBe(true); // done seed → immediate resolve
+
+    // A blocker NOT in the seed still hangs — the set is a allowlist, not a
+    // blanket pass, so an in-flight blocker keeps the gate locked.
+    await assertGateStillHeld(coord, 2); // 2 ∉ settled → gate held
   });
 });
