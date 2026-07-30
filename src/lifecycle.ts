@@ -40,7 +40,10 @@ export interface RunContext {
    *  createPr, mergePr, singleShot). Threaded one way: the caller merges it
    *  onto a per-ticket RunContext copy (the shared ctx is never mutated with
    *  a per-ticket signal); it is NOT also passed as a separate `processTicket`
-   *  param. */
+   *  param. The lifecycle forwards `ctx.signal` into {@link AgentPort}
+   *  implement/singleShot params — the AgentPort is a separate seam (it can't
+   *  see RunContext), so that param is the cross-seam transport, not redundant
+   *  threading. */
   signal?: AbortSignal;
 }
 
