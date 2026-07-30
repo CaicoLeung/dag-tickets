@@ -42,6 +42,23 @@ export function branchFor(number: number, title: string): string {
   return `loop/${number}-${slug}`;
 }
 
+/** Force-fetch `bare` into its remote-tracking ref; returns whether it landed.
+ *
+ *  Single source for the shared refspec `+${bare}:refs/remotes/origin/${bare}`:
+ *  it writes straight to the remote-tracking ref (independent of the remote's
+ *  configured fetchspecs) and the leading `+` force-updates it on a
+ *  non-fast-forward, so a rebased / force-pushed head still lands instead of
+ *  being rejected as stale. Used by {@link ShellBranch.resolveRemoteTip},
+ *  {@link ShellBranch.ensureBaseRefFresh}, and
+ *  {@link ShellPullRequest.guardedPushHead}. */
+async function fetchRemoteTrackingRef(bare: string, cwd?: string): Promise<boolean> {
+  const r = await run(
+    ["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`],
+    { cwd },
+  );
+  return r.ok;
+}
+
 /**
  * 0.2.0 feedback B2: best-effort fetch of `origin/<base>` so a batch's
  *  merged-check sees merges that landed since the last fetch. Shared by the
@@ -197,18 +214,13 @@ export class ShellBranch implements BranchPort {
 
   /** @see {BranchPort.resolveRemoteTip}.
    *
-   *  Refspec mirrors {@link ensureBaseRefFresh} (the leading `+` force-updates
-   *  the remote-tracking ref so a rebased / force-pushed blocker head still
-   *  lands instead of being rejected). `null` covers both a failed fetch and a
-   *  ref that doesn't exist on the remote — the caller can't tell (and doesn't
-   *  need to) whether the blocker hasn't pushed yet or the fetch broke. */
+   *  Fetches via {@link fetchRemoteTrackingRef}; `null` covers both a failed
+   *  fetch and a ref that doesn't exist on the remote — the caller can't tell
+   *  (and doesn't need to) whether the blocker hasn't pushed yet or the fetch
+   *  broke. */
   async resolveRemoteTip(ref: string): Promise<string | null> {
     const bare = normalizeBase(ref);
-    const fetch = await run(
-      ["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`],
-      { cwd: this.cwd },
-    );
-    if (!fetch.ok) return null;
+    if (!(await fetchRemoteTrackingRef(bare, this.cwd))) return null;
     const rev = await run(["git", "rev-parse", `origin/${bare}`], { cwd: this.cwd });
     if (!rev.ok) return null;
     const sha = rev.stdout.trim();
@@ -227,17 +239,10 @@ export class ShellBranch implements BranchPort {
 
   /** @see {BranchPort.ensureBaseRefFresh}.
    *
-   *  Refspec rationale: `+<base>:refs/remotes/origin/<base>` writes straight to
-   *  the remote-tracking ref (independent of the remote's configured fetchspecs)
-   *  and the leading `+` force-updates it on a non-fast-forward, so a rebased /
-   *  force-pushed base still lands instead of being rejected as stale. */
+   *  Thin wrapper over {@link fetchRemoteTrackingRef} (refspec rationale there). */
   async ensureBaseRefFresh(base: string): Promise<boolean> {
     const bare = normalizeBase(base);
-    const r = await run(
-      ["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`],
-      { cwd: this.cwd },
-    );
-    return r.ok;
+    return fetchRemoteTrackingRef(bare, this.cwd);
   }
 }
 
@@ -335,9 +340,9 @@ export class ShellPullRequest implements PullRequestPort {
    *  sole discriminator and why its absence must also fail fast. */
   private async guardedPushHead(head: string): Promise<void> {
     const bare = normalizeBase(head);
-    // Force-update the remote-tracking ref so a force-pushed / rebased remote
-    // head still lands instead of being read as stale.
-    await run(["git", "fetch", "origin", `+${bare}:refs/remotes/origin/${bare}`], { cwd: this.cwd });
+    // Force-update the tracking ref so a rebased remote head isn't read stale
+    // (refspec rationale on fetchRemoteTrackingRef).
+    await fetchRemoteTrackingRef(bare, this.cwd);
     const tip = await run(
       ["git", "rev-parse", "--verify", "--quiet", `origin/${bare}`],
       { cwd: this.cwd },
@@ -353,8 +358,8 @@ export class ShellPullRequest implements PullRequestPort {
       if (!anc.ok) {
         // Diverged. Decide whether it is our own tracked re-attempt or an
         // unexpected source before force-pushing.
-        const open = await this.headHasOpenPr(head);
-        if (open === "no") {
+        const prSignal = await this.headHasOpenPr(head);
+        if (prSignal === "no") {
           throw new Error(
             `refusing to force-push ${head}: origin/${bare} has diverged from ` +
               `local ${head} and no open PR tracks it, so a force-push would ` +
@@ -362,7 +367,7 @@ export class ShellPullRequest implements PullRequestPort {
               divergenceRemediation(bare, head),
           );
         }
-        if (open === "unknown") {
+        if (prSignal === "unknown") {
           // Open-PR signal unavailable (gh down/flake): can't tell our
           // re-attempt from a foreign push, so fail fast per #32 — never guess.
           throw new Error(
@@ -374,8 +379,8 @@ export class ShellPullRequest implements PullRequestPort {
               `once \`gh\` is healthy. ${divergenceRemediation(bare, head)}`,
           );
         }
-        // open === "yes" → a tracked re-attempt: overwrite our own stale branch
-        //   silently, as the force-push was designed for.
+        // prSignal === "yes" → a tracked re-attempt: overwrite our own stale
+        //   branch silently, as the force-push was designed for.
       }
     }
     // createPr depends on this push succeeding, so a failure must abort —

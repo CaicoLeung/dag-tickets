@@ -327,6 +327,8 @@ describe("mergedReference (B2) — already-merged-on-base heuristic", () => {
     expect(withoutFetch.merged).toBe(true);
     // A number referenced by no commit stays unmerged under either path.
     expect((await mergedReference(999, "main", cwd, { fetch: false })).merged).toBe(false);
+  });
+});
 // ShellPullRequest.createPr (#32): the head branch was force-pushed
 // unconditionally, so a divergent remote `loop/<n>-<slug>` (a human push or
 // unmerged pre-lock work) would be silently clobbered. The guard force-pushes
