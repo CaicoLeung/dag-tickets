@@ -1012,7 +1012,7 @@ export async function main(argv: string[]): Promise<number> {
             ? priorAttempts + 1
             : undefined;
         const outcome = await runWithRetry(
-          () => processTicket(t, ctx, overlap),
+          () => processTicket(t, ctx, overlap, info?.signal),
           {
             maxRetries: a.maxTicketRetries,
             baseDelayMs: retryBaseMs(),
