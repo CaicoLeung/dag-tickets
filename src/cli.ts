@@ -467,6 +467,10 @@ export class OverlapCoordinator {
   private readonly settled: Set<number>;
   private readonly waiters = new Map<number, Array<() => void>>();
 
+  /** @param seedSettled blockers already settled `done` before this run
+   *  (resume). MUST be done-only: `settled` is the gate's short-circuit set,
+   *  so a failed/skipped blocker here would let a dependent bypass the gate on
+   *  a broken base (#31). */
   constructor(seedSettled: Iterable<number>) {
     this.settled = new Set(seedSettled);
   }
@@ -710,9 +714,13 @@ export async function main(argv: string[]): Promise<number> {
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
-    // main() — see OverlapCoordinator. Seeded from the resume sets so a
-    // dependent overlapping an already-done blocker resolves immediately.
-    const overlap = new OverlapCoordinator([...seedCompleted, ...seedFailed, ...seedSkipped]);
+    // main() — see OverlapCoordinator. Seeded from the resume `completed` set
+    // ONLY: `settled` means settled-done (the gate short-circuits on it), so a
+    // resumed failed/skipped blocker must NOT land there — its dependent is
+    // cascade-killed before launch instead, and seeding non-done would let a
+    // waiter short-circuit on a broken base (#31 invariant, uniform with
+    // noteSettled's status guard).
+    const overlap = new OverlapCoordinator([...seedCompleted]);
     const ctx: RunContext = {
       agent,
       pullRequest,

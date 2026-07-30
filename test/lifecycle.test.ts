@@ -735,4 +735,37 @@ describe("implement lifecycle — #29 overlap", () => {
     await running;
     expect(repo.prs).toHaveLength(1);
   });
+
+  test("overlap: a resumed done blocker seeded into the coordinator short-circuits the gate (resume fast-path, #29/#31)", async () => {
+    // `settled` is the awaitOne short-circuit set: a dependent overlapping an
+    // already-done blocker (resume) must resolve immediately instead of
+    // hanging forever (noteSettled won't re-fire for a prior settle). This
+    // pins that legitimate fast-path AND, by implication, WHY main() seeds
+    // completed-only: the set carries no status, so the #31 invariant (non-done
+    // must not release the gate) is enforced at the construction site — a
+    // failed/skipped blocker seeded here would short-circuit too, which is why
+    // the cli seeds just `completed`. main()'s done-only seed is audited by the
+    // scheduler's resume-cascade tests (a seeded failure cascade-kills its
+    // dependent before it can reach this gate).
+    const coord = new OverlapCoordinator([1]); // 1 resumed as settled-done
+    let resolved = false;
+    await Promise.race([
+      coord.waitForBlockers([1]).then(() => {
+        resolved = true;
+      }),
+      tick(),
+    ]);
+    expect(resolved).toBe(true); // done seed → immediate resolve
+
+    // A blocker NOT in the seed still hangs — the set is a allowlist, not a
+    // blanket pass, so an in-flight blocker keeps the gate locked.
+    let hungResolved = false;
+    await Promise.race([
+      coord.waitForBlockers([2]).then(() => {
+        hungResolved = true;
+      }),
+      tick(),
+    ]);
+    expect(hungResolved).toBe(false); // 2 ∉ settled → gate held
+  });
 });
