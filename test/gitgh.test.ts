@@ -329,3 +329,229 @@ describe("mergedReference (B2) — already-merged-on-base heuristic", () => {
     expect((await mergedReference(999, "main", cwd, { fetch: false })).merged).toBe(false);
   });
 });
+// ShellPullRequest.createPr (#32): the head branch was force-pushed
+// unconditionally, so a divergent remote `loop/<n>-<slug>` (a human push or
+// unmerged pre-lock work) would be silently clobbered. The guard force-pushes
+// for a fresh/ancestor head or a divergent head that an OPEN PR still tracks
+// (a retry / resumed run / prior batch — exactly what the `--force` was added
+// for), but fails fast when a divergent head has NO open PR (an unexpected
+// source) OR when the open-PR check itself failed (a flaky/down gh) — the
+// open-PR signal is the only thing distinguishing our own re-attempt from a
+// foreign push, so when it is unavailable the guard refuses rather than guess.
+// A retry re-implements off the base, so its second attempt diverges
+// from the first in the same shape as a foreign push — topology can't tell
+// them apart, but a tracked re-attempt always leaves an open PR on the head.
+// ---------------------------------------------------------------------------
+
+/** Options for the create-path gh shim.
+ *  - prNumber: the PR number `gh pr create` reports.
+ *  - openPrForHead: if set, `gh pr list --head <h>` reports this open PR
+ *    (simulates a tracked re-attempt: a retry/resume/prior run left a PR open).
+ *    Undefined → `gh pr list` reports no open PR (a foreign/unexpected push).
+ *  - prListFails: `gh pr list` exits 1 (simulates a flaky/down gh). */
+interface CreateGhShimOpts {
+  prNumber: number;
+  openPrForHead?: number;
+  prListFails?: boolean;
+}
+
+/** Install an executable `gh` on a temp PATH that answers `gh pr create` with a
+ *  PR URL and `gh pr list --head` per {@link CreateGhShimOpts}. Other
+ *  subcommands fall through to a loud error. Returns a restore() that puts PATH
+ *  back. Mirrors the mergePr shim's absolute-bun-shebang trick so the child
+ *  runs without bun on PATH. */
+async function installCreateGhShim(opts: CreateGhShimOpts): Promise<{ restore: () => void }> {
+  const dir = await mkdtemp(join(tmpdir(), "dag-ghcreate-"));
+  const ghPath = join(dir, "gh");
+  const src =
+    `#!${process.execPath}\n` +
+    `const cfg = ${JSON.stringify(opts)};\n` +
+    `const a = process.argv.slice(2);\n` +
+    `if (a[0] === "pr" && a[1] === "create") {\n` +
+    `  process.stdout.write("https://github.com/owner/repo/pull/" + cfg.prNumber + "\\n");\n` +
+    `  process.exit(0);\n` +
+    `}\n` +
+    `if (a[0] === "pr" && a[1] === "list") {\n` +
+    `  if (cfg.prListFails) { process.stderr.write("transient gh error\\n"); process.exit(1); }\n` +
+    `  const open = cfg.openPrForHead ? [{ number: cfg.openPrForHead }] : [];\n` +
+    `  process.stdout.write(JSON.stringify(open) + "\\n");\n` +
+    `  process.exit(0);\n` +
+    `}\n` +
+    `process.stderr.write("gh-create-shim: unhandled " + JSON.stringify(process.argv) + "\\n");\n` +
+    `process.exit(2);\n`;
+  await Bun.write(ghPath, src);
+  await chmod(ghPath, 0o755);
+  const prev = process.env.PATH ?? "";
+  process.env.PATH = `${dir}:${prev}`;
+  return { restore: () => { process.env.PATH = prev; } };
+}
+
+describe("ShellPullRequest.createPr (#32 divergence guard)", () => {
+  /** Bare origin + a working clone wired to it, with an initial `main` commit
+   *  pushed. Returns the clone path and a `g(args)` git runner scoped to it. */
+  async function harness(): Promise<{
+    work: string;
+    g: (args: string[], cwd?: string) => ReturnType<typeof run>;
+  }> {
+    const tmp = await mkdtemp(join(tmpdir(), "dag-createpr-"));
+    const origin = join(tmp, "origin.git");
+    const work = join(tmp, "work");
+    const env = {
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@t",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@t",
+    };
+    const g = (args: string[], cwd?: string) => run(["git", ...args], { cwd, env });
+    await g(["init", "--bare", origin]);
+    await g(["clone", "--quiet", origin, work]);
+    await writeFile(join(work, "README.md"), "hi\n");
+    await g(["add", "-A"], work);
+    await g(["commit", "--quiet", "-m", "init"], work);
+    await g(["branch", "-M", "main"], work);
+    await g(["push", "--quiet", "origin", "main"], work);
+    return { work, g };
+  }
+
+  test("absent remote head → force-pushes and creates the PR", async () => {
+    // The first push for a ticket: nothing remote to clobber, so the guard
+    // must allow the force-push and reach gh pr create.
+    const { work, g } = await harness();
+    const { restore } = await installCreateGhShim({ prNumber: 777 });
+    try {
+      await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
+      await writeFile(join(work, "a.txt"), "x");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "wip"], work);
+
+      const pr = new ShellPullRequest(work);
+      await expect(
+        pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
+      ).resolves.toBe(777);
+
+      // The remote head now exists.
+      const tip = await g(["rev-parse", "--verify", "--quiet", "origin/loop/32-foo"], work);
+      expect(tip.ok).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  test("remote head is an ancestor (fast-forwardable) → push succeeds", async () => {
+    // A stale remote branch left a commit behind; the local head moved
+    // strictly forward. The ancestor is safe to overwrite, so the guard
+    // allows the push.
+    const { work, g } = await harness();
+    const { restore } = await installCreateGhShim({ prNumber: 778 });
+    try {
+      await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
+      await writeFile(join(work, "a.txt"), "1");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "c1"], work);
+      await g(["push", "--quiet", "origin", "loop/32-foo"], work);
+
+      // A second commit on top → origin/loop/32-foo is now an ancestor.
+      await writeFile(join(work, "a.txt"), "2");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "c2"], work);
+
+      const pr = new ShellPullRequest(work);
+      await expect(
+        pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
+      ).resolves.toBe(778);
+    } finally {
+      restore();
+    }
+  });
+
+  test("diverged remote head → refuses to force-push and preserves history", async () => {
+    // The remote branch diverged from an unexpected source (here: a rewritten
+    // local history). The guard must fail fast instead of clobbering, and the
+    // remote tip must be left untouched.
+    const { work, g } = await harness();
+    const { restore } = await installCreateGhShim({ prNumber: 779 });
+    try {
+      await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
+      await writeFile(join(work, "a.txt"), "1");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "c1"], work);
+      await g(["push", "--quiet", "origin", "loop/32-foo"], work);
+      const remoteBefore = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
+
+      // Diverge: rewrite the local tip so it is NOT a descendant of the remote.
+      await g(["commit", "--quiet", "--amend", "-m", "rewritten"], work);
+
+      const pr = new ShellPullRequest(work);
+      await expect(
+        pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
+        // #32 requires a message-rich error naming the branch + divergence.
+      ).rejects.toThrow(/loop\/32-foo.*diverged/);
+
+      // No clobber: the remote tip is byte-identical.
+      const remoteAfter = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
+      expect(remoteAfter).toBe(remoteBefore);
+    } finally {
+      restore();
+    }
+  });
+
+  test("diverged remote head with an OPEN PR (tracked re-attempt) → force-pushes", async () => {
+    // A retry / resumed run / prior batch left the head pushed AND a PR open for
+    // it. The divergence is our own stale attempt, so the guard must overwrite
+    // it — this is the exact case the `--force` was kept for. (A retry
+    // re-implements off the base, so attempt 2's history diverges from attempt
+    // 1's push in the same shape as a foreign push; the open PR is the signal
+    // that distinguishes them.)
+    const { work, g } = await harness();
+    const { restore } = await installCreateGhShim({ prNumber: 780, openPrForHead: 1001 });
+    try {
+      await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
+      await writeFile(join(work, "a.txt"), "1");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "c1"], work);
+      await g(["push", "--quiet", "origin", "loop/32-foo"], work);
+
+      // Diverge, as a retry's second attempt would.
+      await g(["commit", "--quiet", "--amend", "-m", "rewritten"], work);
+
+      const pr = new ShellPullRequest(work);
+      await expect(
+        pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
+      ).resolves.toBe(780);
+    } finally {
+      restore();
+    }
+  });
+
+  test("diverged remote head + flaky gh pr list → refuses to force-push (fail-fast)", async () => {
+    // gh pr list itself failed (network/flake): the open-PR signal is the only
+    // thing that tells our own re-attempt from a foreign push, so when it is
+    // unavailable the guard must refuse rather than guess. #32's contract is
+    // that divergence stops the run instead of rewriting history — a gh outage
+    // must not downgrade that to a clobber. (Contrast the tracked-re-attempt
+    // case above, where the open PR IS confirmed and the push proceeds.)
+    const { work, g } = await harness();
+    const { restore } = await installCreateGhShim({ prNumber: 781, prListFails: true });
+    try {
+      await g(["checkout", "--quiet", "-b", "loop/32-foo"], work);
+      await writeFile(join(work, "a.txt"), "1");
+      await g(["add", "-A"], work);
+      await g(["commit", "--quiet", "-m", "c1"], work);
+      await g(["push", "--quiet", "origin", "loop/32-foo"], work);
+      const remoteBefore = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
+      await g(["commit", "--quiet", "--amend", "-m", "rewritten"], work);
+
+      const pr = new ShellPullRequest(work);
+      await expect(
+        pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
+        // Names the branch + divergence + the failed open-PR check.
+      ).rejects.toThrow(/diverged/);
+
+      // No clobber: the remote tip is byte-identical.
+      const remoteAfter = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
+      expect(remoteAfter).toBe(remoteBefore);
+    } finally {
+      restore();
+    }
+  });
+});

@@ -112,6 +112,27 @@ import {
     exit(0);
   }
 
+  // gh pr list --head <H> --state open --json number --limit 1
+  // (#32 divergence guard): an open PR tracking the head means this is one of
+  // our own re-attempts (retry / resumed run / prior batch), so the guard
+  // overwrites the stale branch instead of refusing. Returns the first open
+  // (non-merged) PR whose head matches, else [].
+  if (cmd === "pr" && sub === "list") {
+    const i = argv.indexOf("--head");
+    const head = i >= 0 ? argv[i + 1] : "";
+    const state = withDefaults(await readJson(STATE, DEFAULT_STATE));
+    const merged = state.merged || [];
+    let found = null;
+    for (const [pr, h] of Object.entries(state.prHeads || {})) {
+      if (h === head && !merged.includes(parseInt(pr, 10))) {
+        found = { number: parseInt(pr, 10) };
+        break;
+      }
+    }
+    out(JSON.stringify(found ? [found] : []) + "\n");
+    exit(0);
+  }
+
   // gh pr checks <n> --watch --fail-fast --interval 30
   // Outcome, per PR's ticket (looked up via prTickets):
   //   - stuckChecksFirst[<n>] (first call only) → sleep past the parent's
