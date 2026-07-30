@@ -482,7 +482,8 @@ describe("ShellPullRequest.createPr (#32 divergence guard)", () => {
       const pr = new ShellPullRequest(work);
       await expect(
         pr.createPr({ title: "T", body: "B", head: "loop/32-foo", base: "main" }),
-      ).rejects.toThrow(/diverged/);
+        // #32 requires a message-rich error naming the branch + divergence.
+      ).rejects.toThrow(/loop\/32-foo.*diverged/);
 
       // No clobber: the remote tip is byte-identical.
       const remoteAfter = (await g(["rev-parse", "origin/loop/32-foo"], work)).stdout.trim();
