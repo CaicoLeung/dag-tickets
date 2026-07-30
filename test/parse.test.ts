@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { parseBlockedByRefs, parseReviewVerdict } from "../src/parse.ts";
+import { parseBlockedByRefs, parseCoordinateRefs, parseReviewVerdict } from "../src/parse.ts";
 
 const nums = (body: string | null | undefined) => parseBlockedByRefs(body).numbers;
 const titles = (body: string | null | undefined) => parseBlockedByRefs(body).titleRefs;
@@ -182,4 +182,78 @@ test("parseReviewVerdict: tier-2 window excludes the [User] prompt", () => {
   ].join("\n");
   const v = parseReviewVerdict(text);
   expect(v.kind).toBe("unknown");
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback C1 — parseCoordinateRefs: soft serialisation peers from a
+// `Coordinate with` / `Conflicts with` block (inline or section). NOT a
+// dependency — both tickets run, just not concurrently.
+// ---------------------------------------------------------------------------
+describe("parseCoordinateRefs (C1)", () => {
+  test("inline '**Coordinate with:** #464'", () => {
+    expect(parseCoordinateRefs("**Coordinate with:** #464")).toEqual([464]);
+  });
+
+  test("inline plural + multiple refs", () => {
+    expect(parseCoordinateRefs("- Conflicts with: #12, #15 and #18")).toEqual([12, 15, 18]);
+  });
+
+  test("section form with bullets", () => {
+    const body = "## Coordinate with\n- #464 (Popover attach code)\n- avoid landing the same day as #470\n";
+    expect(parseCoordinateRefs(body)).toEqual([464, 470]);
+  });
+
+  test("'Avoid conflicting edits with' phrasing", () => {
+    expect(parseCoordinateRefs("Avoid conflicting edits with #51.")).toEqual([51]);
+  });
+
+  test("out-of-section heading terminates the harvest", () => {
+    const body = "## Coordinate with\n- #5\n## Notes\n- #6 here\n";
+    expect(parseCoordinateRefs(body)).toEqual([5]);
+  });
+
+  test("no marker → empty", () => {
+    expect(parseCoordinateRefs("Blocked by: #12\nRandom #99 mention")).toEqual([]);
+  });
+
+  test("null/empty body → empty", () => {
+    expect(parseCoordinateRefs(null)).toEqual([]);
+    expect(parseCoordinateRefs("")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback C1 (the "or label" half the body-only parser dropped): a
+// `coordinate:464` / `conflicts:12,15` label is also a soft serialisation edge.
+// The spec said "(or label)"; these pin the label harvest.
+// ---------------------------------------------------------------------------
+describe("parseCoordinateRefs — label form (C1)", () => {
+  test("a `coordinate:464` label yields 464 (no body needed)", () => {
+    expect(parseCoordinateRefs(null, ["coordinate:464"])).toEqual([464]);
+    expect(parseCoordinateRefs("", ["coordinate:464"])).toEqual([464]);
+  });
+
+  test("`conflicts:12,15` yields both, sorted", () => {
+    expect(parseCoordinateRefs(null, ["conflicts:12,15"])).toEqual([12, 15]);
+  });
+
+  test("`coordinate-with:464` (hyphenated) is accepted", () => {
+    expect(parseCoordinateRefs(null, ["coordinate-with:464"])).toEqual([464]);
+  });
+
+  test("label + body refs merge + dedupe", () => {
+    expect(parseCoordinateRefs("Coordinate with #464", ["conflicts:470"])).toEqual([464, 470]);
+  });
+
+  test("a label with no number after the prefix harvests nothing", () => {
+    expect(parseCoordinateRefs(null, ["coordinate-with-popover"])).toEqual([]);
+  });
+
+  test("a bare `coordinate` label (no colon) is NOT treated as a soft edge", () => {
+    expect(parseCoordinateRefs(null, ["coordinate"])).toEqual([]);
+  });
+
+  test("label case-insensitive prefix", () => {
+    expect(parseCoordinateRefs(null, ["Coordinate: 51"])).toEqual([51]);
+  });
 });

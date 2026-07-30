@@ -38,6 +38,23 @@ export function buildGraph(tickets: Ticket[]): Graph {
     }
   }
 
+  // 0.2.0 feedback C1: symmetrise `coordinateWith` so a one-directional body
+  // reference ("Coordinate with #464" on #466 only) still yields mutual
+  // exclusion at scheduling time. Only in-batch peers are kept (out-of-batch
+  // numbers are external/closed and can't conflict). The symmetrised set is
+  // written back onto each ticket so the scheduler reads one normalised source.
+  const coord = new Map<number, Set<number>>();
+  for (const t of tickets) coord.set(t.number, new Set(t.coordinateWith ?? []));
+  for (const t of tickets) {
+    for (const peer of t.coordinateWith ?? []) {
+      if (byNumber.has(peer) && peer !== t.number) coord.get(peer)!.add(t.number);
+    }
+  }
+  for (const [n, peers] of coord) {
+    const sorted = [...peers].sort((a, b) => a - b);
+    byNumber.set(n, { ...byNumber.get(n)!, coordinateWith: sorted });
+  }
+
   detectCycles(byNumber);
   return { byNumber, blocks };
 }

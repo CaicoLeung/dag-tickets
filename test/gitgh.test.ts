@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { branchFor, ShellBranch, ShellPullRequest } from "../src/gitgh.ts";
+import { branchFor, ensureMergedBase, mergedReference, ShellBranch, ShellPullRequest } from "../src/gitgh.ts";
 import { run } from "../src/shell.ts";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -227,5 +227,105 @@ describe("ShellPullRequest.mergePr (#38)", () => {
     } finally {
       restore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback B2 — mergedReference: detect work already merged on base via a
+// precise commit-message reference (#N squash-merge title, or a Closes/Fixes/
+// Resolves trailer) so dag-tickets skips re-implementing it.
+// ---------------------------------------------------------------------------
+describe("mergedReference (B2) — already-merged-on-base heuristic", () => {
+  const GENV = {
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@t",
+  };
+  /** Build a bare origin + clone whose `main` has the given commit specs. */
+  async function repoWith(subjects: Array<{ subject: string; body?: string }>): Promise<string> {
+    const origin = await mkdtemp(join(tmpdir(), "dag-mr-origin-"));
+    const work = await mkdtemp(join(tmpdir(), "dag-mr-work-"));
+    const g = (args: string[], cwd?: string) => run(["git", ...args], { cwd, env: GENV });
+    await g(["init", "--bare", "-b", "main", origin]);
+    await g(["init", "-b", "main", work]);
+    await g(["remote", "add", "origin", origin], work);
+    await writeFile(join(work, "a.txt"), "init\n");
+    await g(["add", "-A"], work);
+    await g(["commit", "--quiet", "-m", "init"], work);
+    for (const c of subjects) {
+      await writeFile(join(work, "a.txt"), `${c.subject}\n`);
+      await g(["add", "-A"], work);
+      // commit message = subject (+ optional body)
+      await g(["commit", "--quiet", "-m", c.subject, ...c.body ? ["-m", c.body] : []], work);
+    }
+    await g(["push", "--quiet", "-u", "origin", "main"], work);
+    return work;
+  }
+
+  test("a squash-merge title (#465) is detected", async () => {
+    const cwd = await repoWith([
+      { subject: "feat: cut over DictionaryModels (#465)" },
+      { subject: "docs: unrelated (#4650)" },
+    ]);
+    const r = await mergedReference(465, "main", cwd);
+    expect(r.merged).toBe(true);
+    expect(r.subject).toContain("(#465)");
+  });
+
+  test("a number only present as #4650 does NOT match #465 (no false positive)", async () => {
+    const cwd = await repoWith([{ subject: "refactor: relates to #4650" }]);
+    const r = await mergedReference(465, "main", cwd);
+    expect(r.merged).toBe(false);
+  });
+
+  test("a Closes/Fixes/Resolves trailer in the body is detected", async () => {
+    const cwd = await repoWith([
+      { subject: "merge: land thing", body: "This closes #471." },
+    ]);
+    expect((await mergedReference(471, "main", cwd)).merged).toBe(true);
+    expect((await mergedReference(472, "main", cwd)).merged).toBe(false);
+  });
+
+  test("a number with no merge reference returns merged:false", async () => {
+    const cwd = await repoWith([{ subject: "feat: x (#465)" }]);
+    expect((await mergedReference(999, "main", cwd)).merged).toBe(false);
+  });
+
+  // Architectural fix: the original precise alternation `(^|[^\d])#N(?!\d)` matched
+  // ANY standalone #N in prose — "relates to #465", "see #465" — and falsely
+  // skipped work that hadn't actually merged. The feedback explicitly lists
+  // "relates to #465" as a case that must NOT match. Only (#N) (the squash-merge
+  // title trailer) or a Closes/Fixes/Resolves trailer counts.
+  test("a bare #N in prose is NOT a merge (no false positive on 'relates to #N')", async () => {
+    const cwd = await repoWith([
+      { subject: "docs: see relates to #465 for context" },
+      { subject: "chore: a note about #465 and friends" },
+    ]);
+    expect((await mergedReference(465, "main", cwd)).merged).toBe(false);
+  });
+
+  test("(#N) with surrounding prose parens is NOT a match (no '(see #N …)' false positive)", async () => {
+    const cwd = await repoWith([
+      { subject: "refactor: cleanup (see #465 and #466 for details)" },
+    ]);
+    expect((await mergedReference(465, "main", cwd)).merged).toBe(false);
+    expect((await mergedReference(466, "main", cwd)).merged).toBe(false);
+  });
+
+  test("ensureMergedBase + { fetch: false } skips the per-ticket fetch (batch path)", async () => {
+    // The batch path calls ensureMergedBase once then scans N tickets with
+    // { fetch: false }. Prove the { fetch: false } path still reads the same
+    // origin/base as the default (fetch: true) path — they agree on the verdict.
+    const cwd = await repoWith([
+      { subject: "feat: cut over X (#500)" },
+    ]);
+    await ensureMergedBase("main", cwd);
+    const withFetch = await mergedReference(500, "main", cwd, { fetch: true });
+    const withoutFetch = await mergedReference(500, "main", cwd, { fetch: false });
+    expect(withFetch.merged).toBe(true);
+    expect(withoutFetch.merged).toBe(true);
+    // A number referenced by no commit stays unmerged under either path.
+    expect((await mergedReference(999, "main", cwd, { fetch: false })).merged).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 import { buildGraph, CycleError } from "./graph.ts";
 import { runBatch } from "./scheduler.ts";
 import { processTicket, type OverlapContext, type RunContext } from "./lifecycle.ts";
-import { loadPrefs, PaseoAgent, type ProviderPrefs } from "./paseo.ts";
+import { loadPrefs, PaseoAgent, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary, isDagWorktreeSegment, modelOverrideWarning } from "./paseo.ts";
 import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
@@ -9,11 +9,14 @@ import {
   searchByLabel,
   fetchIssues,
 } from "./discover.ts";
-import { branchFor, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import { branchFor, ensureMergedBase, mergedReference, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
-import type { FailureReason, SettleReason, Ticket, TicketStatus } from "./types.ts";
+import type { FailureReason, SettleReason, Ticket, TicketKind, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
-import { EVT, JsonlEventLog } from "./events.ts";
+import { EVT, JsonlEventLog, logsPath } from "./events.ts";
+import { resolveUnder } from "./paths.ts";
+import { run } from "./shell.ts";
+import { readdir, readFile as readFileAsync } from "node:fs/promises";
 import { acquireLock, LockAcquireError, LockHeldError, type LockHandle } from "./lock.ts";
 import pkg from "../package.json";
 
@@ -102,6 +105,17 @@ interface ParsedArgs {
   researchLabel?: string;
   categoryLabels: string[];
   skipLabels: string[];
+  /** 0.2.0 feedback A2: throwaway dispatch to each provider before run.start,
+   *  aborting fast on a 401 / broken model instead of a silent cascade. */
+  preflight: boolean;
+  /** 0.2.0 feedback B2: escape hatch for the already-merged-on-base skip. */
+  noMergedCheck: boolean;
+  /** 0.2.0 feedback D2: list prior run-ids + outcomes and exit. */
+  lsRuns: boolean;
+  /** 0.2.0 feedback D3: `gc` subcommand — remove stale dag-* worktrees. */
+  gc: boolean;
+  /** --force for gc: remove even worktrees with changes. */
+  gcForce: boolean;
   help: boolean;
   version: boolean;
 }
@@ -118,6 +132,9 @@ USAGE
   dag-tickets --label ready-for-agent
   dag-tickets --parent 42           # sub-issues of parent #42
   dag-tickets 12 15 23              # explicit issue numbers
+  dag-tickets gc [--force]          # remove stale dag-* worktrees (0.2.0 D3)
+  dag-tickets ls-runs               # list prior run-ids + outcomes (0.2.0 D2)
+  dag-tickets --ls-runs             # (alias for the ls-runs subcommand)
 
 OPTIONS
   --parent <n>            Process sub-issues of parent issue <n>.
@@ -128,7 +145,10 @@ OPTIONS
   --max-ticket-retries <n> Whole-ticket retries after a transient failure
                          (CI flake / rate-limit / merge race) with exponential
                          backoff. 0 disables. Default 2.
-  --auto-merge            Merge when review clean + CI green (default).
+  --auto-merge            Merge when review clean + CI green. OFF by default
+                         (0.2.0 feedback C2: safer for a first run — no
+                         squash lands on main without human eyes); pass this to
+                         opt in.
   --no-auto-merge         Stop before merge; leave PRs for you to merge.
   --merge-strategy <s>    squash | merge | rebase (default squash).
   --require-checks        A PR with no CI does NOT satisfy the merge gate.
@@ -151,6 +171,12 @@ OPTIONS
   --cwd <path>            Operate on a different checkout.
   --run-id <id>           Name this run (for the state file).
   --resume <id>           Resume a previous run; skip its merged/failed tickets.
+  --preflight             Throwaway dispatch to each provider before run.start;
+                         abort fast on a 401 / broken model instead of a silent
+                         cascade across every ticket.
+  --no-merged-check       Skip the already-merged-on-base heuristic (0.2.0 B2).
+                         By default a ticket whose work already landed on base
+                         (a commit references #n) is skipped, not re-implemented.
   --dry-run               Print the per-ticket plan and dispatch nothing.
   -h, --help              Show this help.
   -V, --version           Show the version and exit.
@@ -175,6 +201,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
     fallbackProviders: [],
     categoryLabels: [],
     skipLabels: [],
+    preflight: false,
+    noMergedCheck: false,
+    lsRuns: false,
+    gc: false,
+    gcForce: false,
     help: false,
     version: false,
   };
@@ -252,6 +283,18 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.runId = next(); break;
       case "--resume":
         a.resume = next(); break;
+      case "--preflight":
+        a.preflight = true; break;
+      case "--no-merged-check":
+        a.noMergedCheck = true; break;
+      case "--ls-runs":
+        a.lsRuns = true; break;
+      case "ls-runs":
+        a.lsRuns = true; break;
+      case "gc":
+        a.gc = true; break;
+      case "--force":
+        a.gcForce = true; break;
       default:
         if (arg.startsWith("--") && arg.includes("=")) {
           // Re-handle --flag=value by splicing; simplest: split and re-feed.
@@ -434,6 +477,8 @@ function stateFromOutcome(
     reason?: FailureReason;
     error?: string;
     skipReason?: SettleReason;
+    /** 0.2.0 feedback A1: failing step's captured output log path. */
+    logPath?: string;
   },
 ): TicketState {
   return {
@@ -445,6 +490,7 @@ function stateFromOutcome(
     reason: o?.reason,
     error: o?.error,
     skipReason: o?.skipReason,
+    logPath: o?.logPath,
   };
 }
 
@@ -527,6 +573,10 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
+  // 0.2.0 feedback D2/D3: side subcommands that don't drive a batch.
+  if (a.lsRuns) return listRuns(a.cwd);
+  if (a.gc) return gc(a.cwd, a.gcForce);
+
   const log = makeLogger(a.dryRun);
   const cfg = buildRouting(a);
 
@@ -543,6 +593,12 @@ export async function main(argv: string[]): Promise<number> {
   const prefs: ProviderPrefs = await loadPrefs();
   if (a.provider) prefs.impl = a.provider;
   if (a.reviewProvider) prefs.review = a.reviewProvider;
+  // 0.2.0 feedback A3 (warn half): when dag-tickets overrides the model the
+  // user configured in ~/.codex/config.toml, say so once, up front. Computed
+  // AFTER the --provider override so a CLI override warns too. No-op when the
+  // prefs already honour the codex config (or there's no codex config).
+  const overrideWarn = modelOverrideWarning(prefs);
+  if (overrideWarn) log("warn", overrideWarn);
 
   // Discover.
   let tickets: Ticket[];
@@ -557,17 +613,84 @@ export async function main(argv: string[]): Promise<number> {
   const closedSkipped = tickets.length - open.length;
   if (closedSkipped > 0) log("warn", `skipping ${closedSkipped} already-closed ticket(s)`);
 
-  const actionable = open.filter((t) => t.kind !== "unknown" && t.kind !== "skip");
+  // 0.2.0 feedback B1: a ticket named explicitly by number expresses intent —
+  // don't silently drop it for a missing routing label. Promote unknown →
+  // implement (with a warn) so `dag-tickets 465` runs #465 instead of skipping.
+  const explicit = a.numbers.length > 0;
   const unrouted = open.filter((t) => t.kind === "unknown");
   const intentionalSkips = open.filter((t) => t.kind === "skip");
+  let actionable = routeActionable(open, explicit);
   for (const t of unrouted) {
-    log("warn", `no routing label (need one of ${[...cfg.implementLabels, ...cfg.triageLabels, ...cfg.researchLabels].join("/")} or a category role like ${cfg.categoryLabels.join("/")}); skipping`, t.number);
+    if (explicit) {
+      log("warn", `no routing label — treating as /implement (named explicitly by number)`, t.number);
+    } else {
+      log("warn", `no routing label (need one of ${[...cfg.implementLabels, ...cfg.triageLabels, ...cfg.researchLabels].join("/")} or a category role like ${cfg.categoryLabels.join("/")}); skipping`, t.number);
+    }
   }
   for (const t of intentionalSkips) {
     log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
   }
   if (actionable.length === 0) {
     log("info", "no actionable tickets found.");
+    return 0;
+  }
+
+  // 0.2.0 feedback A2: optional provider preflight. One throwaway dispatch per
+  // distinct provider the run would use; abort BEFORE run.start (and before
+  // acquiring the lock) on a 401 / broken model instead of a silent cascade.
+  // Dry-run dispatches nothing, so preflight is skipped there too.
+  if (a.preflight && !a.dryRun) {
+    const kinds = new Set(actionable.map((t) => t.kind));
+    const preflightProviders = [
+      prefs.impl,
+      prefs.review,
+      ...(kinds.has("research") ? [prefs.research] : []),
+      ...(kinds.has("triage") ? [prefs.triage] : []),
+      ...a.fallbackProviders,
+    ];
+    log("info", `preflight: checking ${new Set(preflightProviders.filter(Boolean)).size} provider(s)`);
+    const results = await preflight(preflightProviders, (p) => preflightProvider(p, a.cwd));
+    if (!preflightOk(results)) {
+      process.stderr.write(
+        `Preflight failed — aborting before run.start:\n  ${preflightSummary(results)}\nFix the provider/auth (e.g. codex login / API key) and re-run.\n`,
+      );
+      return 2;
+    }
+    log("ok", `preflight ok: ${preflightSummary(results)}`);
+  }
+
+  // 0.2.0 feedback B2: drop actionable tickets whose work already landed on
+  // base (a merged commit precisely references #n) so the run doesn't
+  // re-dispatch merged work into the void. Applies to every dispatchable kind
+  // — a merged `Closes #n` means the issue is resolved whether it was headed
+  // for /implement or a single-shot /triage. Read-only; --no-merged-check skips.
+  // Fetch origin/<base> ONCE up-front (not per-ticket) so a batch of N tickets
+  // doesn't fire N parallel git fetches of the same ref — they'd serialize on
+  // the git lock and waste a round-trip per ticket. The per-ticket scan then
+  // runs with { fetch: false }.
+  if (!a.noMergedCheck) {
+    await ensureMergedBase(baseBranch, a.cwd);
+    const merged: number[] = [];
+    await Promise.all(
+      actionable.map(async (t) => {
+          const m = await mergedReference(t.number, baseBranch, a.cwd, { fetch: false });
+          if (m.merged) {
+            merged.push(t.number);
+            log(
+              "warn",
+              `work already merged on ${baseBranch}${m.subject ? ` ("${m.subject.slice(0, 80)}")` : ""}; skipping — close #${t.number} if the issue is stale`,
+              t.number,
+            );
+          }
+        }),
+    );
+    if (merged.length) {
+      const mergedSet = new Set(merged);
+      actionable = actionable.filter((t) => !mergedSet.has(t.number));
+    }
+  }
+  if (actionable.length === 0) {
+    log("info", "no actionable tickets found (after merged-work check).");
     return 0;
   }
 
@@ -583,7 +706,7 @@ export async function main(argv: string[]): Promise<number> {
     throw e;
   }
 
-  log("info", `planned ${actionable.length} ticket(s); concurrency ${a.concurrency}; base ${baseBranch}; ${a.dryRun ? "DRY RUN" : a.noAutoMerge ? "manual merge" : "auto-merge " + a.mergeStrategy}${a.maxTicketRetries > 0 ? `; transient-retry ×${a.maxTicketRetries}` : ""}`);
+  log("info", `planned ${actionable.length} ticket(s); concurrency ${a.concurrency}; base ${baseBranch}; ${a.dryRun ? "DRY RUN" : a.noAutoMerge || !a.autoMerge ? "manual merge" : "auto-merge " + a.mergeStrategy}${a.maxTicketRetries > 0 ? `; transient-retry ×${a.maxTicketRetries}` : ""}`);
 
   const runId = a.runId ?? a.resume ?? defaultRunId(a);
   let state: RunState;
@@ -617,6 +740,11 @@ export async function main(argv: string[]): Promise<number> {
   // of silently dropping the post-mortem channel.
   const events = new JsonlEventLog(runId, a.cwd, log);
   await events.ensure();
+
+  // 0.2.0 feedback A1: per-step agent output logs live alongside events.jsonl.
+  // Resolved the same way JsonlEventLog resolves its full path (cwd-prefixed
+  // when --cwd is set, relative otherwise) so logs land beside state.json.
+  const stepLogDir = resolveUnder(logsPath(runId), a.cwd);
 
   // Acquire the repo-wide run lock so a concurrent dag-tickets on this
   // checkout can't fight over the shared dag-<n> worktrees/branches. --dry-run
@@ -679,7 +807,7 @@ export async function main(argv: string[]): Promise<number> {
       target: describeTarget(a),
       ticketCount: actionable.length,
       concurrency: a.concurrency,
-      autoMerge: a.noAutoMerge ? false : true,
+      autoMerge: a.noAutoMerge ? false : a.autoMerge,
       baseBranch,
       dryRun: a.dryRun,
       resume: !!a.resume,
@@ -697,7 +825,7 @@ export async function main(argv: string[]): Promise<number> {
     // collapses the backoff. Prod leaves it unset → the flag/default stands.
     const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
-    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events, undefined, stepLogDir);
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
@@ -710,7 +838,7 @@ export async function main(argv: string[]): Promise<number> {
       baseBranch,
       maxFixRounds: a.maxFixRounds,
       mergeStrategy: a.mergeStrategy,
-      autoMerge: a.noAutoMerge ? false : a.autoMerge ? true : true,
+      autoMerge: a.noAutoMerge ? false : a.autoMerge,
       requireChecks: a.requireChecks,
       dryRun: a.dryRun,
       log,
@@ -865,4 +993,133 @@ function describeTarget(a: ParsedArgs): string {
   if (a.label) return `label-${a.label}`;
   if (a.numbers.length) return `issues-${a.numbers.join(",")}`;
   return "frontier";
+}
+
+/**
+ * 0.2.0 feedback B1: the actionable set with the explicit-number promotion
+ *  applied. Exported (pure) so the promote-vs-skip policy is unit-testable
+ *  without driving all of main(): an unknown-kind ticket is dropped on a
+ *  label/frontier run but promoted to /implement when the user named it by
+ *  number. `skip`-kind tickets are always intentional skips (never promoted).
+ */
+export function routeActionable(open: Ticket[], explicit: boolean): Ticket[] {
+  const routed = open.filter((t) => t.kind !== "unknown" && t.kind !== "skip");
+  if (!explicit) return routed;
+  const promoted = open
+    .filter((t) => t.kind === "unknown")
+    .map((t) => ({ ...t, kind: "implement" as TicketKind }));
+  return routed.concat(promoted);
+}
+
+/** Where a run's state lives, relative to a checkout. */
+function scratchDir(cwd?: string): string {
+  return resolveUnder(".scratch/dag-tickets", cwd);
+}
+
+/**
+ * 0.2.0 feedback D2: `dag-tickets --ls-runs` — list prior run-ids + outcome
+ *  counts read from `.scratch/dag-tickets/<run>/state.json`. Pure read; never
+ *  mutates. Skips dirs whose state.json is missing/truncated (a run killed
+ *  before its first settle — cf. 0.3.0 D1).
+ */
+export async function listRuns(cwd?: string): Promise<number> {
+  const root = scratchDir(cwd);
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    process.stdout.write(`No runs found at ${root}\n`);
+    return 0;
+  }
+  // Carry the raw startedAt alongside the formatted line so the sort is stable
+  // on the actual timestamp — not on the formatted tab-row (the 0.2.0 review
+  // flagged `rows.sort().reverse()` as fragile: it only worked because default
+  // run-ids happen to be timestamp-suffixed; an arbitrary --run-id mis-ordered).
+  interface RunRow { startedAt: string; line: string; }
+  const rows: RunRow[] = [];
+  for (const runId of entries) {
+    const file = `${root}/${runId}/state.json`;
+    let j: RunState;
+    try {
+      j = JSON.parse(await readFileAsync(file, "utf8")) as RunState;
+    } catch {
+      continue; // no/ unreadable state — a run that never settled
+    }
+    const tickets = Object.values(j.tickets ?? {});
+    const count = (s: TicketStatus) => tickets.filter((t) => t.status === s).length;
+    rows.push({
+      startedAt: j.startedAt ?? "",
+      line: [
+        runId,
+        j.startedAt?.slice(0, 19) ?? "?",
+        j.target ?? "?",
+        `done=${count("done")}`,
+        `failed=${count("failed")}`,
+        `skipped=${count("skipped")}`,
+        `running=${count("running")}`,
+      ].join("\t"),
+    });
+  }
+  if (rows.length === 0) {
+    process.stdout.write(`No runs found at ${root}\n`);
+    return 0;
+  }
+  process.stdout.write(`run-id\tstarted\ttarget\toutcomes\n`);
+  // Newest first, by the real timestamp (empty/missing startedAt sorts last).
+  rows.sort((a, b) => (a.startedAt < b.startedAt ? 1 : a.startedAt > b.startedAt ? -1 : 0));
+  process.stdout.write(rows.map((r) => r.line).join("\n") + "\n");
+  return 0;
+}
+
+/**
+ * 0.2.0 feedback D3: `dag-tickets gc` — remove stale `dag-<n>` worktrees a
+ *  failed run left behind. Lists linked worktrees, removes any whose final
+ *  path segment is `dag-<n>` (or `dag-<n>-…`), printing each. `--force` passes
+ *  `git worktree remove --force` so a worktree with uncommitted changes is
+ *  still removed. Never removes the main checkout. Returns 0 on success.
+ */
+export async function gc(cwd?: string, force = false): Promise<number> {
+  const r = await run(["git", "worktree", "list", "--porcelain"], { cwd });
+  if (!r.ok) {
+    process.stderr.write(`gc: git worktree list failed: ${r.stderr.trim()}
+`);
+    return 2;
+  }
+  // gc reclaims every dag-tickets-owned worktree layout: TICKET worktrees
+  // (dag-<n> / dag-<n>-… — the contract paseo.isDagWorktreeSegment owns, reused
+  // here instead of re-derived) AND the dag-preflight-<provider> worktrees the
+  // A2 preflight check creates. gc is the safety net that reclaims either after
+  // a crash / kill / failed preflight; dag-foo / the main checkout / unrelated
+  // worktrees never match.
+  const isGcTarget = (dir: string): boolean =>
+    isDagWorktreeSegment(dir) || /^dag-preflight(?:-|$)/.test(dir.split("/").pop() ?? "");
+  const targets: string[] = [];
+  let path = "";
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      if (path && isGcTarget(path)) targets.push(path);
+      path = line.slice("worktree ".length).trim();
+    }
+  }
+  if (path && isGcTarget(path)) targets.push(path);
+  if (targets.length === 0) {
+    process.stdout.write("gc: no stale dag-* worktrees found.\n");
+    return 0;
+  }
+  const flag = force ? "--force" : "";
+  let removed = 0;
+  for (const p of targets) {
+    const rr = await run(
+      ["git", "worktree", "remove", ...(flag ? [flag] : []), p],
+      { cwd },
+    );
+    if (rr.ok) {
+      removed++;
+      process.stdout.write(`removed ${p}\n`);
+    } else {
+      process.stderr.write(`gc: could not remove ${p}: ${rr.stderr.trim()} (try --force)\n`);
+    }
+  }
+  process.stdout.write(`gc: removed ${removed}/${targets.length} worktree(s).\n`);
+  return 0;
 }

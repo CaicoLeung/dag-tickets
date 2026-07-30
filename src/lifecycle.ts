@@ -1,6 +1,7 @@
 import type { FailureReason, ReviewVerdict, Ticket } from "./types.ts";
 import { routingRuleFor } from "./config.ts";
 import type { AgentPort, EventSink, ImplFailReason, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
+import { withLog } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 import { EVT } from "./events.ts";
 
@@ -63,6 +64,11 @@ export interface TicketOutcome {
    *  `error` below carries the human detail. */
   reason?: FailureReason;
   error?: string;
+  /** 0.2.0 feedback A1: path to the captured output log for the step that
+   *  failed this ticket (set on a `failed` settle when the failing step was an
+   *  agent dispatch). Threads through to state.json so an operator can jump
+   *  straight to the agent's stdout/stderr. */
+  logPath?: string;
 }
 
 /** Run one ticket's full lifecycle. Resolves to a terminal outcome. */
@@ -116,7 +122,7 @@ async function runImplementLifecycle(
     "implement",
     t.number,
     () => ctx.agent.implement(t, branch, branchBase),
-    (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason }),
+    (r) => ({ ok: r.ok, commits: r.commits, reason: r.reason, ...withLog(r) }),
   );
   if (!impl.ok) {
     // One exhaustive lookup replaces two parallel ternary cascades (the human
@@ -125,7 +131,7 @@ async function runImplementLifecycle(
     // decided once; the transient/terminal split is encoded here (rate-limited
     // / stale-base / timeout are transient; empty / failed are terminal).
     const f = IMPL_FAIL[impl.reason ?? "failed"];
-    return fail(t, ctx, { reason: f.reason, error: `implement ${f.error}` }, branch);
+    return fail(t, ctx, { reason: f.reason, error: `implement ${f.error}` }, branch, undefined, impl.logPath);
   }
   ctx.log("ok", `implement complete (${impl.commits} commit${impl.commits === 1 ? "" : "s"}); running review`, t.number);
 
@@ -137,7 +143,7 @@ async function runImplementLifecycle(
       "review",
       t.number,
       () => ctx.agent.review(t, branch, branchBase),
-      (r) => ({ verdict: r.kind, issueCount: r.issueCount }),
+      (r) => ({ verdict: r.kind, issueCount: r.issueCount, ...withLog(r) }),
     );
 
   let rounds = 0;
@@ -150,10 +156,10 @@ async function runImplementLifecycle(
       "fix",
       t.number,
       () => ctx.agent.fix(t, verdict, branch, rounds),
-      (r) => ({ round: rounds, ok: r.ok }),
+      (r) => ({ round: rounds, ok: r.ok, ...withLog(r) }),
       { round: rounds },
     );
-    if (!fix.ok) return fail(t, ctx, { reason: "fix-failed", error: `fix round ${rounds} failed` }, branch);
+    if (!fix.ok) return fail(t, ctx, { reason: "fix-failed", error: `fix round ${rounds} failed` }, branch, undefined, fix.logPath);
     verdict = await runReview();
   }
 
@@ -164,7 +170,7 @@ async function runImplementLifecycle(
     // clean` message. Both are terminal for the ticket, but the post-mortem
     // reason now tells a human which kind of attention is needed (issue #21).
     const reason: FailureReason = verdict.kind === "issues" ? "review-issues" : "review-unknown";
-    return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}` }, branch);
+    return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}` }, branch, undefined, verdict.logPath);
   }
   ctx.log("ok", "review clean; opening PR", t.number);
 
@@ -257,9 +263,9 @@ async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise
     skill,
     t.number,
     () => ctx.agent.singleShot(skill, t, branch, ctx.baseBranch),
-    (res) => ({ ok: res.ok, timedOut: res.timedOut }),
+    (res) => ({ ok: res.ok, timedOut: res.timedOut, ...withLog(res) }),
   );
-  if (!r.ok) return fail(t, ctx, { reason: "single-shot-failed", error: `${skill} agent failed${r.timedOut ? " (timeout)" : ""}` }, branch);
+  if (!r.ok) return fail(t, ctx, { reason: "single-shot-failed", error: `${skill} agent failed${r.timedOut ? " (timeout)" : ""}` }, branch, undefined, r.logPath);
   ctx.log("ok", `${skill} complete`, t.number);
   return { status: "done", branch };
 }
@@ -283,6 +289,8 @@ async function dryRunPlan(t: Ticket, skill: string, expectPr: boolean, ctx: RunC
     lines.push(`  merge:    ${ctx.autoMerge ? ctx.mergeStrategy + " + delete-branch + close issue" : "manual (auto-merge off)"}`);
   }
   lines.push(`  blocked-by: ${t.blockedBy.length ? t.blockedBy.map((b) => "#" + b).join(", ") : "—"}`);
+  const coord = t.coordinateWith ?? [];
+  if (coord.length) lines.push(`  coordinate-with: ${coord.map((b) => "#" + b).join(", ")} (serialized — won't run concurrently)`);
   ctx.log("dim", lines.join("\n"), t.number);
   return { status: "done", branch, rounds: 0 };
 }
@@ -357,7 +365,10 @@ function fail(
   failure: Failure,
   branch?: string,
   pr?: number,
+  /** 0.2.0 feedback A1: path to the failing step's captured output log. */
+  logPath?: string,
 ): TicketOutcome {
   ctx.log("error", failure.error, t.number);
-  return { status: "failed", branch, pr, reason: failure.reason, error: failure.error };
+  if (logPath) ctx.log("dim", `log: ${logPath}`, t.number);
+  return { status: "failed", branch, pr, reason: failure.reason, error: failure.error, ...withLog({ logPath }) };
 }

@@ -921,3 +921,58 @@ describe("runBatch — transient retry integration (issue #21)", () => {
     expect(one.some((e) => e.type === EVT.TICKET_CASCADE)).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 0.2.0 feedback C1 — Coordinate-with soft serialisation: two tickets that
+// declare a coordinate edge never run concurrently, even at concurrency > 1.
+// ---------------------------------------------------------------------------
+describe("runBatch — coordinate-with soft serialisation (C1)", () => {
+  const ticketWith = (n: number, coord: number[] = []): Ticket => ({
+    ...ticket(n),
+    coordinateWith: coord,
+  });
+
+  test("coordinate peers never overlap (concurrency 2)", async () => {
+    // 1 and 2 conflict; 3 is independent. concurrency 2.
+    const g = buildGraph([ticketWith(1, [2]), ticketWith(2, [1]), ticket(3)]);
+    // Track which OTHER tickets were in flight each time one started.
+    const active = new Set<number>();
+    const startedWith: Record<number, number[]> = {};
+    const process = async (n: number): Promise<TicketStatus> => {
+      startedWith[n] = [...active];
+      active.add(n);
+      await Promise.resolve(); // yield so a concurrent launch can overlap
+      active.delete(n);
+      return "done";
+    };
+    await runBatch(g, { concurrency: 2, process });
+    // #1 and #2 must never have been in flight together.
+    expect(startedWith[1]).not.toContain(2);
+    expect(startedWith[2]).not.toContain(1);
+    // Both ran (the edge serialises, doesn't block).
+    expect(startedWith[1]).toBeDefined();
+    expect(startedWith[2]).toBeDefined();
+  });
+
+  test("a one-directional body ref is symmetrised by buildGraph", async () => {
+    // Only #2 declares "Coordinate with #1"; buildGraph mirrors it onto #1.
+    const g = buildGraph([ticketWith(1, []), ticketWith(2, [1])]);
+    expect(g.byNumber.get(1)?.coordinateWith).toContain(2);
+    expect(g.byNumber.get(2)?.coordinateWith).toContain(1);
+  });
+
+  test("no coordinate edge → peers may overlap as before", async () => {
+    const g = buildGraph([ticket(1), ticket(2)]);
+    let peak = 0;
+    let cur = 0;
+    const process = async (): Promise<TicketStatus> => {
+      cur++;
+      peak = Math.max(peak, cur);
+      await Promise.resolve();
+      cur--;
+      return "done";
+    };
+    await runBatch(g, { concurrency: 2, process });
+    expect(peak).toBe(2); // independent tickets overlap — no soft edge
+  });
+});

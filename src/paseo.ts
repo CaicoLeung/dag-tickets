@@ -1,4 +1,7 @@
 import { run } from "./shell.ts";
+import { readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import type { ReviewVerdict, Ticket } from "./types.ts";
 import type {
   AgentPort,
@@ -13,7 +16,7 @@ import type {
   ReconcileResult,
   StepResult,
 } from "./ports.ts";
-import { normalizeBase, remoteRef } from "./ports.ts";
+import { normalizeBase, remoteRef, withLog } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 import { EVT } from "./events.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -39,6 +42,35 @@ const FALLBACK_PREFS: ProviderPrefs = {
   triage: "claude/opus",
 };
 
+/**
+ * Read the top-level `model = "…"` line from the user's `~/.codex/config.toml`.
+ *  Only matches BEFORE the first `[table]` header so a `model =` inside a
+ *  `[mcp_servers.x]` block can't win. Returns undefined when the file is
+ *  absent / unreadable / has no top-level model. Pure string scan — no TOML
+ *  dependency (codex's config is small + flat at the level we care about).
+ *
+ *  0.2.0 feedback A3: the hardcoded `codex/gpt-5.4` default ignored a user's
+ *  real codex model. This lets the codex config drive the impl default when no
+ *  paseo prefs file (and no --provider) is set, so dag-tickets stops silently
+ *  running a model the user didn't configure.
+ */
+export function readCodexModel(home: string): string | undefined {
+  let toml: string;
+  try {
+    // readFileSync keeps this sync + node-portable; the codex config is small.
+    toml = readFileSync(`${home}/.codex/config.toml`, "utf8");
+  } catch {
+    return undefined;
+  }
+  for (const line of toml.split(/\r?\n/)) {
+    // Stop at the first table header — `model` is only load-bearing at top level.
+    if (/^\s*\[/.test(line)) break;
+    const m = line.match(/^\s*model\s*=\s*"([^"]+)"/);
+    if (m) return m[1]!;
+  }
+  return undefined;
+}
+
 export async function loadPrefs(): Promise<ProviderPrefs> {
   const home = process.env.HOME ?? "";
   if (!home) return { ...FALLBACK_PREFS };
@@ -57,7 +89,50 @@ export async function loadPrefs(): Promise<ProviderPrefs> {
   } catch {
     /* unreadable prefs → fall back */
   }
+  // 0.2.0 feedback A3: no paseo prefs file → honour the user's codex config
+  // (model = "…") instead of the hardcoded `gpt-5.4` default. Keeps review /
+  // research / triage on their category defaults.
+  const codexModel = readCodexModel(home);
+  if (codexModel) {
+    return {
+      impl: `codex/${codexModel}`,
+      review: FALLBACK_PREFS.review,
+      research: `codex/${codexModel}`,
+      triage: FALLBACK_PREFS.triage,
+    };
+  }
   return { ...FALLBACK_PREFS };
+}
+
+/**
+ * 0.2.0 feedback A3 (the warn half the original PR dropped): when dag-tickets
+ *  overrides the model the user configured in `~/.codex/config.toml`, say so.
+ *  Returns a human warning string when a codex-bearing provider the run will use
+ *  (impl / research) diverges from `codex/<codexModel>`, or `undefined` when
+ *  there's nothing to override (no codex config, or the prefs already honour
+ *  it). review/triage use category defaults (typically a non-codex provider), so
+ *  they aren't checked — only the skills whose default is the codex provider.
+ *
+ *  Pure + exported so the policy is unit-testable without driving main(); the
+ *  cli computes it AFTER applying `--provider` so a CLI override warns too.
+ */
+export function modelOverrideWarning(
+  prefs: ProviderPrefs,
+  home: string = process.env.HOME ?? "",
+): string | undefined {
+  const codexModel = readCodexModel(home);
+  if (!codexModel) return undefined; // nothing configured to override
+  const configured = `codex/${codexModel}`;
+  const diverges = (p: string): boolean => p.startsWith("codex/") && p !== configured;
+  const skills: string[] = [];
+  if (diverges(prefs.impl)) skills.push(`implement=${prefs.impl}`);
+  if (diverges(prefs.research)) skills.push(`research=${prefs.research}`);
+  if (skills.length === 0) return undefined;
+  return (
+    `overriding codex config model ${configured} with: ${skills.join(", ")} ` +
+    `(align ~/.paseo/orchestration-preferences.json or pass --provider to match, ` +
+    `or ignore if intentional)`
+  );
 }
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
@@ -179,11 +254,17 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs) });
   let status = r.ok ? "completed" : "failed";
   let output = r.stdout;
+  // 0.2.0 feedback D1: the agent's worktree cwd (from the JSON envelope) so the
+  // real-run stdout can show where work is happening. Declared outside the try
+  // (where the envelope is parsed) so the return below can read it.
+  let worktreeCwd: string | undefined;
   if (r.ok) {
     try {
-      const j = JSON.parse(r.stdout) as { agentId?: string; status?: string };
+      const j = JSON.parse(r.stdout) as { agentId?: string; status?: string; cwd?: string };
       if (typeof j.status === "string") status = j.status;
       const agentId = j.agentId;
+      const worktreeCwdVal = typeof j.cwd === "string" ? j.cwd : undefined;
+      worktreeCwd = worktreeCwdVal;
       if (agentId) {
         // The paseo log store can lag behind agent completion: reading once
         // right after `paseo run` returns sometimes captures a partial
@@ -220,13 +301,60 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   // terminal `implement-failed` (issue #39). rateLimited stays stdout-only to
   // avoid widening its (working) detection surface here.
   const connectionError = isConnectionError(output) || isConnectionError(r.stderr);
+  // 0.2.0 feedback A1: persist the dispatch's full output (agent transcript +
+  // relay stderr + exit code) so a failed step is debuggable from the run dir.
+  // Best-effort + never throws: a write failure must not break the dispatch —
+  // the human stderr log + events.jsonl still carry the outcome. `output` here
+  // is the agent transcript on success (after stable-log polling) or the raw
+  // status envelope on failure, which is exactly what an operator needs.
+  const logPath = writeDispatchLog(opts, r, output);
   return {
     ok: r.ok && (status === "completed" || status === "idle"),
     output,
     timedOut: r.timedOut,
     rateLimited,
     connectionError,
+    ...(logPath ? { logPath } : {}),
+    ...(worktreeCwd ? { worktreeCwd } : {}),
   };
+}
+
+/**
+ * 0.2.0 feedback A1: best-effort write of one dispatch's full output to
+ *  `opts.logFile`. Returns the path written (so the caller can thread it onto
+ *  the {@link DispatchResult}), or `undefined` when no logFile was requested
+ *  (unit tests / no run dir) or the write failed. Never throws — a logging
+ *  failure must not break the agent dispatch.
+ *
+ *  Exported so the log format (agent transcript + relay stderr + exit code) is
+ *  unit-testable without spawning a real `paseo run`.
+ */
+export function writeDispatchLog(
+  opts: DispatchOpts,
+  r: { code: number; stderr: string; timedOut: boolean },
+  output: string,
+): string | undefined {
+  if (!opts.logFile) return undefined;
+  try {
+    mkdirSync(dirname(opts.logFile), { recursive: true });
+    const body = [
+      `# paseo run — ${opts.title}`,
+      `# provider: ${opts.provider}`,
+      `# worktree-slug: ${opts.slug}`,
+      `# exit: ${r.code}${r.timedOut ? " (timed-out)" : ""}`,
+      "",
+      "## agent output",
+      output || "(empty)",
+      "",
+      "## stderr",
+      r.stderr || "(empty)",
+      "",
+    ].join("\n");
+    writeFileSync(opts.logFile, body, "utf8");
+    return opts.logFile;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -368,6 +496,100 @@ ${triageBoundary}
 Run /${skill} for this issue. When finished, post any required comment/output on the issue via \`gh\` per the skill's contract, then report a one-paragraph summary.`;
 }
 
+/**
+ * 0.2.0 feedback A2: one throwaway dispatch to confirm a provider is reachable
+ *  + authed before the run starts. A 401 / broken model fails fast (one short
+ *  dispatch) instead of cascading silently across every ticket. Lightweight: no
+ *  stable-log polling (we only care whether the dispatch completed), a short
+ *  wall budget, and a `dag-preflight-<provider>` slug so a leftover preflight
+ *  agent is recognisable. Never throws — the outcome is reported, not raised.
+ */
+export async function preflightProvider(
+  provider: string,
+  cwd?: string,
+  timeoutMs = 60_000,
+): Promise<{ ok: boolean; error?: string }> {
+  const slug = `dag-preflight-${provider.replace(/[^a-z0-9]+/gi, "-").slice(0, 30)}`;
+  const r = await run(
+    [
+      "paseo",
+      "run",
+      "--json",
+      "--provider",
+      provider,
+      "--title",
+      "dag-tickets preflight",
+      "--worktree-slug",
+      slug,
+      "--new-workspace",
+      "worktree",
+      "--wait-timeout",
+      msToDuration(timeoutMs),
+      "ping",
+    ],
+    { cwd, timeoutMs: timeoutMs + 60_000 },
+  );
+  if (r.timedOut) return { ok: false, error: "preflight timed out" };
+  if (!r.ok) {
+    // Surface the relay's own diagnostic (stderr holds the 401 / model error);
+    // fall back to stdout / a bare exit code so the message is never empty.
+    const detail = (r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`).split(/\r?\n/)[0];
+    return { ok: false, error: detail };
+  }
+  // A completed dispatch with a non-completed status (e.g. `error`) is still a
+  // reachable-but-broken provider — treat anything but completed/idle as broken.
+  try {
+    const j = JSON.parse(r.stdout) as { status?: string };
+    const status = j.status;
+    if (status && status !== "completed" && status !== "idle") {
+      return { ok: false, error: `agent status: ${status}` };
+    }
+  } catch {
+    /* non-JSON stdout (older paseo) — the ok exit is enough */
+  }
+  return { ok: true };
+}
+
+/** One provider's preflight outcome. */
+export interface PreflightResult {
+  provider: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * 0.2.0 feedback A2: run `check` against every distinct provider the run would
+ *  use, returning the per-provider outcome. Pure orchestration over an injected
+ *  `check` so the ordering + dedupe + short-circuit are unit-testable without a
+ *  real `paseo run`. Distinct providers are checked once each (a fallback that
+ *  duplicates the primary isn't pinged twice). Sequential, not parallel: a
+ *  provider that's down is the common case the flag exists to catch, and a
+ *  parallel fan-out would stampede the same rate-limited provider.
+ */
+export async function preflight(
+  providers: string[],
+  check: (provider: string) => Promise<{ ok: boolean; error?: string }>,
+): Promise<PreflightResult[]> {
+  const distinct = [...new Set(providers.filter(Boolean))];
+  const out: PreflightResult[] = [];
+  for (const p of distinct) out.push({ provider: p, ...(await check(p)) });
+  return out;
+}
+
+/** True iff every preflight result passed. Convenience for the cli's abort gate. */
+export function preflightOk(results: PreflightResult[]): boolean {
+  return results.every((r) => r.ok);
+}
+
+/** Human-readable preflight summary for the top-level log. */
+export function preflightSummary(results: PreflightResult[]): string {
+  return results
+    .map((r) =>
+      r.ok ? `${r.provider}: ok` : `${r.provider}: FAIL${r.error ? ` (${r.error})` : ""}`,
+    )
+    .join(", ");
+}
+
 const SLUG = (n: number) => `dag-${n}`;
 
 /**
@@ -379,6 +601,24 @@ const SLUG = (n: number) => `dag-${n}`;
  * match `dag-12-1` / `dag-11-review-1`. Co-located with {@link SLUG} so the
  * `dag-<n>` shape has a single source (it was previously re-derived here and
  * in the slug itself).
+ */
+/** Does a worktree path's final segment belong to ANY ticket (the `dag-<n>`
+ *  layout)? The single source of the `dag-<n>` shape: a ticket's agent lives in
+ *  a dir whose final segment is `dag-<n>` (implement/fix) or `dag-<n>-…`
+ *  (`-review`, or a `-<counter>` reuse suffix). Exported so `gc` reuses this
+ *  instead of re-deriving `/^dag-\d+(-|$)/` (the Duplicated-Code smell the
+ *  0.2.0 review flagged). The per-ticket {@link ownsWorktreeSegment} below adds
+ *  the `=== SLUG(n)` exactness on top of this general predicate. */
+export const isDagWorktreeSegment = (dir: string): boolean => {
+  const seg = dir.split("/").pop() ?? "";
+  return /^dag-\d+(-|$)/.test(seg);
+};
+
+/**
+ * Does a worktree path's final segment belong to ticket `n` specifically?
+ * Tighter than {@link isDagWorktreeSegment}: requiring the segment to equal
+ * {@link SLUG} or continue with `-` disambiguates siblings — `dag-1` /
+ * `dag-1-review` never match `dag-12-1` / `dag-11-review-1`.
  */
 const ownsWorktreeSegment = (dir: string, n: number): boolean => {
   const seg = dir.split("/").pop() ?? "";
@@ -459,10 +699,24 @@ export class PaseoAgent implements AgentPort {
      *  module-level {@link stopRunningAgent} bound to this agent's cwd. */
     private readonly stopAgent: (ticketNumber: number) => Promise<void> = (n) =>
       stopRunningAgent(this.cwd, n),
+    /** 0.2.0 feedback A1: directory to persist each dispatch's full output
+     *  (`<n>-<step>.log`). Absent in unit tests → no logs written, dispatch
+     *  still works. The cli sets it to the run's `.scratch/.../logs/` dir. */
+    private readonly stepLogDir?: string,
   ) {}
 
   /**
-   * #40: best-effort stop of the ticket's running agent. Swallowed so a stop
+   * 0.2.0 feedback A1: absolute path for one dispatch's output log, or
+   *  `undefined` when no run dir is wired (unit tests). Fix rounds get a
+   *  `-r<round>` suffix so repeated rounds don't clobber each other.
+   */
+  private logFileFor(n: number, step: string, round?: number): string | undefined {
+    if (!this.stepLogDir) return undefined;
+    const suffix = round ? `-r${round}` : "";
+    return `${this.stepLogDir.replace(/\/$/, "")}/${n}-${step}${suffix}.log`;
+  }
+
+  /** #40: best-effort stop of the ticket's running agent. Swallowed so a stop
    *  failure (paseo unreachable, lost race, a throwing injected fake) never
    *  blocks the caller — the rate-limit fallback / exit cleanup still proceeds.
    *  Mirrors the stop swallow in {@link abort}.
@@ -549,6 +803,7 @@ export class PaseoAgent implements AgentPort {
         branchMode: "branch-off",
         newBranch: branch,
         base: baseRef,
+        logFile: this.logFileFor(t.number, "implement"),
       },
       this.fallbacks,
       async (next) => {
@@ -560,17 +815,19 @@ export class PaseoAgent implements AgentPort {
       },
     );
     if (!r.ok) {
-      return {
-        ok: false,
-        commits: 0,
-        reason: implFailReason(r),
-      };
+      return { ok: false, commits: 0, reason: implFailReason(r), ...withLog(r) };
     }
+    // 0.2.0 feedback D1: print the worktree path as soon as the dispatch
+    // succeeded (envelope parsed) — before the commit count — so an operator
+    // can match `paseo worktree list` / `ls` even when the implement later
+    // fails for another reason (e.g. empty). Review/fix reuse this worktree,
+    // so a ticket prints its path exactly once (at implement), not per step.
+    if (r.worktreeCwd) this.log("dim", `worktree: ${r.worktreeCwd}`, t.number);
     // A rate-limited or empty agent still "completes" with no diff — count
     // against the fetched origin/<base> so a stale local main can't mask it.
     const commits = await this.branch.commitCount(baseRef, branch);
-    if (commits === 0) return { ok: false, commits: 0, reason: "empty" };
-    return { ok: true, commits };
+    if (commits === 0) return { ok: false, commits: 0, reason: "empty", ...withLog(r) };
+    return { ok: true, commits, ...withLog(r) };
   }
 
   /** Single review attempt. Stable-log polling in dispatch guarantees the full
@@ -587,15 +844,17 @@ export class PaseoAgent implements AgentPort {
         timeoutMs: this.timeoutMs,
         branchMode: "checkout-branch",
         branch,
+        logFile: this.logFileFor(t.number, "review"),
       },
       this.fallbacks,
       this.onRateLimited("review", this.prefs.review, t, branch),
     );
     if (!r.ok) {
       this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
-      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800) };
+      return { kind: "unknown", issueCount: 0, raw: r.output.slice(-800), ...withLog(r) };
     }
-    return parseReviewVerdict(r.output);
+    const v = parseReviewVerdict(r.output);
+    return { ...v, ...withLog(r) };
   }
 
   async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
@@ -610,11 +869,12 @@ export class PaseoAgent implements AgentPort {
         timeoutMs: this.timeoutMs,
         branchMode: "checkout-branch",
         branch,
+        logFile: this.logFileFor(t.number, "fix", round),
       },
       this.fallbacks,
       this.onRateLimited("fix", this.prefs.impl, t, branch),
     );
-    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string): Promise<StepResult> {
@@ -633,8 +893,13 @@ export class PaseoAgent implements AgentPort {
       branchMode: "branch-off",
       newBranch: branch,
       base: baseRef,
+      logFile: this.logFileFor(t.number, skill),
     });
-    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
+    // 0.2.0 feedback D1: single-shot tickets (triage/research) create their own
+    // worktree too — print its path so an operator can find it post-run, the
+    // same way implement-kind tickets do.
+    if (r.worktreeCwd) this.log("dim", `worktree: ${r.worktreeCwd}`, t.number);
+    return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
 
   providerLabel(skill: "implement" | "review" | "triage" | "research"): string {

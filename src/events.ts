@@ -28,10 +28,18 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { EventSink, Logger } from "./ports.ts";
+import { resolveUnder } from "./paths.ts";
 
 /** Where a run's event stream lives. Sibling of `state.json`. */
 export function eventsPath(runId: string): string {
   return `.scratch/dag-tickets/${runId}/events.jsonl`;
+}
+
+/** 0.2.0 feedback A1: where a run's per-step agent output logs live. Sibling
+ *  directory of `events.jsonl` / `state.json` (`<runId>/logs/`). Each dispatch
+ *  writes `<n>-<step>.log` here. */
+export function logsPath(runId: string): string {
+  return `.scratch/dag-tickets/${runId}/logs`;
 }
 
 /**
@@ -98,8 +106,7 @@ export class JsonlEventLog implements EventSink {
     cwd?: string,
     private readonly log?: Logger,
   ) {
-    const rel = eventsPath(runId);
-    this.full = cwd ? `${cwd.replace(/\/$/, "")}/${rel}` : rel;
+    this.full = resolveUnder(eventsPath(runId), cwd);
   }
 
   /**
