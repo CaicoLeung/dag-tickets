@@ -43,26 +43,58 @@ export function branchFor(number: number, title: string): string {
 }
 
 /**
+ * 0.2.0 feedback B2: best-effort fetch of `origin/<base>` so a batch's
+ *  merged-check sees merges that landed since the last fetch. Shared by the
+ *  per-ticket {@link mergedReference} scan (default) and callable once up-front
+ *  by a batch caller that fans out many scans in parallel — N parallel
+ *  `git fetch origin <base>` of the same ref race on the git lock and waste a
+ *  round-trit per ticket, so cli.ts calls this once then passes
+ *  `{ fetch: false }` to each per-ticket scan. Non-fatal: a failed fetch
+ *  leaves whatever `origin/<base>` currently holds for the scan to read.
+ */
+export async function ensureMergedBase(base: string, cwd?: string): Promise<void> {
+  const bare = normalizeBase(base);
+  await run(["git", "fetch", "origin", bare], { cwd });
+}
+
+/** Options for {@link mergedReference}. */
+export interface MergedReferenceOpts {
+  /** When true (default), refresh `origin/<base>` before scanning. A batch
+   *  caller that already ran {@link ensureMergedBase} once passes false to
+   *  avoid N redundant parallel fetches of the same ref. */
+  fetch?: boolean;
+}
+
+/**
  * 0.2.0 feedback B2: has the work for issue `n` already landed on `base`? Scans
  *  merged commit subjects on `origin/<base>` for a precise reference to `#n` —
- *  the GitHub squash-merge title form `Title (#465)` or a `Closes/Fixes/Resolves
- *  #465` trailer — so dag-tickets doesn't re-implement already-merged work into
- *  the void. `n` is a parsed integer, safe to interpolate into the grep.
+ *  the GitHub squash-merge title form `Title (#465)` (parens around the number)
+ *  or a `Closes/Fixes/Resolves #465` trailer — so dag-tickets doesn't
+ *  re-implement already-merged work into the void. `n` is a parsed integer,
+ *  safe to interpolate into the grep.
  *
  *  Conservative on purpose: a coincidental `#465` inside `#4650` or prose like
- *  "relates to #465" is rejected by the precise alternation, so a real merge is
- *  the only thing that triggers a skip. Best-effort: a failed fetch / git log
- *  returns `{ merged: false }` (the run proceeds) rather than blocking.
+ *  "relates to #465" is rejected — only the parenthesised title trailer or a
+ *  real closing-verb trailer counts, so a real merge is the only thing that
+ *  triggers a skip. Best-effort: a failed scan returns `{ merged: false }`
+ *  (the run proceeds) rather than blocking.
+ *
+ *  `opts.fetch` (default true) refreshes `origin/<base>` first; a batch caller
+ *  that fanned out scans across many tickets should run
+ *  {@link ensureMergedBase} once and pass `{ fetch: false }` here so the same
+ *  ref isn't fetched N times in parallel.
  */
 export async function mergedReference(
   n: number,
   base: string,
   cwd?: string,
+  opts: MergedReferenceOpts = {},
 ): Promise<{ merged: boolean; sha?: string; subject?: string }> {
   const bare = normalizeBase(base);
   // Fetch so origin/<base> reflects merges that landed since the last fetch; a
   // failed fetch is non-fatal (we scan whatever origin/<base> currently holds).
-  await run(["git", "fetch", "origin", bare], { cwd });
+  // Skipped when a batch caller already ran ensureMergedBase once up-front.
+  if (opts.fetch !== false) await ensureMergedBase(base, cwd);
   // git --grep scans all history (full message: subject + body) fast; limit
   // to the most recent 50 matches so a very old coincidental reference can't
   // mask a recent precise one. %B carries the whole message so a Closes/Fixes
@@ -72,10 +104,16 @@ export async function mergedReference(
     { cwd },
   );
   if (!r.ok) return { merged: false };
-  // Precise: `(#465)` (the squash-merge title trailer) OR a Closes/Fixes/Resolves
-  // trailer, with the number not followed by another digit (so #4650 can't match).
+  // Precise: `(#465)` (the squash-merge title trailer — parens immediately
+  // around the number) OR a Closes/Fixes/Resolves trailer (verb directly
+  // followed by #n), with the number not followed by another digit (so #4650
+  // can't match). A bare #465 in prose ("relates to #465", "see #465") is
+  // intentionally NOT matched — those are not merge references and matching
+  // them would falsely skip work that hasn't landed. The first alternation
+  // requires literal parens around just the number; the second requires the
+  // GitHub trailer verb adjacent to it.
   const precise = new RegExp(
-    `(^|[^\\d])#${n}(?!\\d)|\\b(?:closes|fixes|resolves)\\s+#${n}(?!\\d)`,
+    `\\(#${n}\\)(?!\\d)|(?:closes|fixes|resolves)\\s+#${n}(?!\\d)`,
     "i",
   );
   for (const line of r.stdout.split(/\r?\n/)) {

@@ -385,6 +385,10 @@ test("gc (D3): removes stale dag-* linked worktrees", async () => {
   await g(["commit", "-m", "init"]);
   // a linked worktree whose dir is dag-12 (the stale layout a fail leaves behind)
   await g(["worktree", "add", "--detach", join(mainRepo, "dag-12")]);
+  // a dag-preflight-* worktree left behind by the A2 preflight check — gc must
+  // reclaim it too, otherwise preflight leaks one worktree per run. Two
+  // features (A2 creates, D3 cleans) must compose.
+  await g(["worktree", "add", "--detach", join(mainRepo, "dag-preflight-codex-gpt-5-4")]);
   // a non-dag worktree that must NOT be touched
   await g(["worktree", "add", "--detach", join(mainRepo, "other-wt")]);
 
@@ -392,5 +396,6 @@ test("gc (D3): removes stale dag-* linked worktrees", async () => {
   expect(code).toBe(0);
   const list = await g(["worktree", "list", "--porcelain"]);
   expect(list.stdout).not.toContain("dag-12");
+  expect(list.stdout).not.toContain("dag-preflight-codex-gpt-5-4");
   expect(list.stdout).toContain("other-wt"); // untouched
 });

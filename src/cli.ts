@@ -9,7 +9,7 @@ import {
   searchByLabel,
   fetchIssues,
 } from "./discover.ts";
-import { branchFor, mergedReference, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import { branchFor, ensureMergedBase, mergedReference, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
 import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
 import type { FailureReason, SettleReason, Ticket, TicketKind, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
@@ -652,13 +652,18 @@ export async function main(argv: string[]): Promise<number> {
   // 0.2.0 feedback B2: drop implement-kind tickets whose work already landed on
   // base (a merged commit precisely references #n) so the run doesn't
   // re-implement merged work into the void. Read-only; --no-merged-check skips.
+  // Fetch origin/<base> ONCE up-front (not per-ticket) so a batch of N tickets
+  // doesn't fire N parallel git fetches of the same ref — they'd serialize on
+  // the git lock and waste a round-trip per ticket. The per-ticket scan then
+  // runs with { fetch: false }.
   if (!a.noMergedCheck) {
+    await ensureMergedBase(baseBranch, a.cwd);
     const merged: number[] = [];
     await Promise.all(
       actionable
         .filter((t) => t.kind === "implement")
         .map(async (t) => {
-          const m = await mergedReference(t.number, baseBranch, a.cwd);
+          const m = await mergedReference(t.number, baseBranch, a.cwd, { fetch: false });
           if (m.merged) {
             merged.push(t.number);
             log(
@@ -1066,10 +1071,17 @@ export async function gc(cwd?: string, force = false): Promise<number> {
 `);
     return 2;
   }
-  // Same dag-<n> layout contract the paseo adapter ownsWorktreeSegment() uses.
+  // Same dag-* layout contract the paseo adapter ownsWorktreeSegment() uses
+  // for TICKET worktrees (dag-<n> / dag-<n>-…), broadened to also cover the
+  // dag-preflight-<provider> worktrees the A2 preflight check creates. Both
+  // are dag-tickets-owned layouts; gc is the safety net that reclaims either
+  // after a crash / kill / failed preflight. `dag-` then either digits or the
+  // literal `preflight`, then a separator or end — so dag-12, dag-12-review,
+  // dag-preflight-codex-gpt-5-4 all match, but dag-foo / the main checkout /
+  // unrelated worktrees never do.
   const isDag = (dir: string): boolean => {
     const seg = dir.split("/").pop() ?? "";
-    return /^dag-\d+(-|$)/.test(seg);
+    return /^dag-(?:\d+|preflight)(?:-|$)/.test(seg);
   };
   const targets: string[] = [];
   let path = "";

@@ -1,5 +1,5 @@
 import { test, expect, describe } from "bun:test";
-import { branchFor, mergedReference, ShellBranch, ShellPullRequest } from "../src/gitgh.ts";
+import { branchFor, ensureMergedBase, mergedReference, ShellBranch, ShellPullRequest } from "../src/gitgh.ts";
 import { run } from "../src/shell.ts";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -290,5 +290,42 @@ describe("mergedReference (B2) — already-merged-on-base heuristic", () => {
   test("a number with no merge reference returns merged:false", async () => {
     const cwd = await repoWith([{ subject: "feat: x (#465)" }]);
     expect((await mergedReference(999, "main", cwd)).merged).toBe(false);
+  });
+
+  // Architectural fix: the original precise alternation `(^|[^\d])#N(?!\d)` matched
+  // ANY standalone #N in prose — "relates to #465", "see #465" — and falsely
+  // skipped work that hadn't actually merged. The feedback explicitly lists
+  // "relates to #465" as a case that must NOT match. Only (#N) (the squash-merge
+  // title trailer) or a Closes/Fixes/Resolves trailer counts.
+  test("a bare #N in prose is NOT a merge (no false positive on 'relates to #N')", async () => {
+    const cwd = await repoWith([
+      { subject: "docs: see relates to #465 for context" },
+      { subject: "chore: a note about #465 and friends" },
+    ]);
+    expect((await mergedReference(465, "main", cwd)).merged).toBe(false);
+  });
+
+  test("(#N) with surrounding prose parens is NOT a match (no '(see #N …)' false positive)", async () => {
+    const cwd = await repoWith([
+      { subject: "refactor: cleanup (see #465 and #466 for details)" },
+    ]);
+    expect((await mergedReference(465, "main", cwd)).merged).toBe(false);
+    expect((await mergedReference(466, "main", cwd)).merged).toBe(false);
+  });
+
+  test("ensureMergedBase + { fetch: false } skips the per-ticket fetch (batch path)", async () => {
+    // The batch path calls ensureMergedBase once then scans N tickets with
+    // { fetch: false }. Prove the { fetch: false } path still reads the same
+    // origin/base as the default (fetch: true) path — they agree on the verdict.
+    const cwd = await repoWith([
+      { subject: "feat: cut over X (#500)" },
+    ]);
+    await ensureMergedBase("main", cwd);
+    const withFetch = await mergedReference(500, "main", cwd, { fetch: true });
+    const withoutFetch = await mergedReference(500, "main", cwd, { fetch: false });
+    expect(withFetch.merged).toBe(true);
+    expect(withoutFetch.merged).toBe(true);
+    // A number referenced by no commit stays unmerged under either path.
+    expect((await mergedReference(999, "main", cwd, { fetch: false })).merged).toBe(false);
   });
 });
