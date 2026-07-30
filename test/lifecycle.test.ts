@@ -205,6 +205,77 @@ describe("implement lifecycle — fix-loop bounds", () => {
   });
 });
 
+describe("implement lifecycle — fix-loop regression guard (0.3.0 B1)", () => {
+  test("a fix round that INCREASES the issue count aborts early with fix-regression", async () => {
+    // The exact 0.3.0 #41 pattern: review 2 → fix r1 → review 3 (worse) →
+    // fix r2 → review 5 (worse). Without the guard, r3 would be futile and the
+    // loop amplifies bugs. With it, the first regression (2→3) aborts at r1.
+    const agent = new FakeAgent();
+    agent.reviews = [issues(2), issues(3), issues(5)];
+    agent.fixes = [{ ok: true }, { ok: true }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("fix-regression");
+    // aborted at r1 (the first regression 2→3), NOT r2 — no wasted round.
+    expect(agent.fixCalls).toBe(1);
+    expect(agent.reviewCalls).toBe(2); // initial + post-r1
+    expect(repo.prs).toHaveLength(0);
+    // the trend is in the error message so a human sees how it diverged.
+    expect(out.error).toContain("r1:2 → r2:3");
+  });
+
+  test("a non-monotonic regression (3→2→5) aborts at the round that increased", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [issues(3), issues(2), issues(5)];
+    agent.fixes = [{ ok: true }, { ok: true }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("fix-regression");
+    // r1 improved (3→2), r2 regressed (2→5) → abort at r2.
+    expect(agent.fixCalls).toBe(2);
+    expect(out.error).toContain("r1:3 → r2:2 → r3:5");
+  });
+
+  test("a fix that holds the SAME count keeps looping (no premature abort)", async () => {
+    // The improvement gate logs no-progress but does NOT abort — maxFixRounds
+    // still terminates a stuck-but-not-worse loop, and a later round could break
+    // through. This pins that only a STRICT increase triggers the guard.
+    const agent = new FakeAgent();
+    agent.reviews = [issues(2), issues(2), issues(2)];
+    agent.fixes = [{ ok: true }, { ok: true }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("review-issues"); // NOT fix-regression
+    expect(agent.fixCalls).toBe(2); // both rounds used
+  });
+
+  test("converging fix (3→1) continues to the PR path, not aborted", async () => {
+    const agent = new FakeAgent();
+    agent.reviews = [issues(3), issues(1), CLEAN];
+    agent.fixes = [{ ok: true }, { ok: true }];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo));
+    expect(out.status).toBe("done");
+    expect(out.rounds).toBe(2);
+    expect(repo.merged).toEqual([1001]);
+  });
+
+  test("maxFixRounds=0: a single issues review fails review-issues, no fix-regression", async () => {
+    // No fix round runs at all → the regression guard can't fire; the verdict
+    // is review-issues exactly as before.
+    const agent = new FakeAgent();
+    agent.reviews = [issues(5)];
+    const repo = new FakePullRequest();
+    const out = await processTicket(ticket(), ctx(agent, repo, { maxFixRounds: 0 }));
+    expect(out.status).toBe("failed");
+    expect(out.reason).toBe("review-issues");
+    expect(agent.fixCalls).toBe(0);
+  });
+});
+
 describe("implement lifecycle — CI gate & merge", () => {
   test("failing CI: failed, PR retained, NOT merged, NOT closed", async () => {
     const agent = new FakeAgent();

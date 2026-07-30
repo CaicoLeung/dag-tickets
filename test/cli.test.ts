@@ -290,6 +290,66 @@ test("RunExit.register adds all 4 listeners and detach removes them", () => {
   expect(after).toEqual([0, 0, 0, 0]); // detach restored baseline
 });
 
+// 0.3.0 feedback D3 — RunExit emits a terminal run.interrupted event before the
+// flush so an interrupted run leaves a bounded trace (a terminal marker after
+// the last step.*), not an unbounded "in flight" tail.
+test("RunExit SIGINT runs stop→emitInterrupt→flush→release when emitInterrupt is wired", async () => {
+  const calls: string[] = [];
+  const exits: number[] = [];
+  const deps = {
+    stop: async () => {
+      calls.push("stop");
+    },
+    emitInterrupt: () => {
+      calls.push("emitInterrupt");
+    },
+    flush: async () => {
+      calls.push("flush");
+    },
+    release: async () => {
+      calls.push("release");
+    },
+    log: SILENT_LOG,
+    exit: (code: number) => {
+      exits.push(code);
+    },
+  };
+  new RunExit(deps).onSignal("SIGINT");
+  await settled();
+  // emitInterrupt fires AFTER stop (agents gone) and BEFORE flush (lands in trace).
+  expect(calls).toEqual(["stop", "emitInterrupt", "flush", "release"]);
+  expect(exits).toEqual([130]);
+});
+
+test("RunExit emitInterrupt throwing is swallowed — exit still fires", async () => {
+  // A failing event emit must not block the flush/release/exit that follows.
+  const calls: string[] = [];
+  const exits: number[] = [];
+  const deps = {
+    stop: async () => {
+      calls.push("stop");
+    },
+    emitInterrupt: () => {
+      calls.push("emitInterrupt");
+      throw new Error("emit boom");
+    },
+    flush: async () => {
+      calls.push("flush");
+    },
+    release: async () => {
+      calls.push("release");
+    },
+    log: SILENT_LOG,
+    exit: (code: number) => {
+      exits.push(code);
+    },
+  };
+  new RunExit(deps).onUncaught();
+  await settled();
+  expect(calls).toEqual(["stop", "emitInterrupt", "flush", "release"]); // all attempted
+  expect(exits).toEqual([1]); // exit still happened
+});
+
 // 0.2.0 feedback B1 — explicit CLI numbers bypass the routing label gate.
 import type { Ticket } from "../src/types.ts";
 const t = (n: number, kind: Ticket["kind"]): Ticket => ({

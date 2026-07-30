@@ -137,6 +137,60 @@ export function modelOverrideWarning(
 
 const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
 
+/**
+ * Recognised thinking levels (0.3.0 feedback A1). These are the `:thinking`
+ * suffixes a user may append to a provider spec (`pi/zai/glm-5.2:max`) AND the
+ * values `paseo run --thinking <id>` accepts. Pinned here (not discovered at
+ * runtime) so a typo in a provider string fails loudly at preflight instead of
+ * silently running at the default thinking level — the exact silent-intent
+ * violation the feedback reported. Add a level here when paseo grows one.
+ */
+export const THINKING_LEVELS: ReadonlySet<string> = Object.freeze(
+  new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+);
+
+/**
+ * Parse a provider spec of the form `provider/model[:thinking]` into its
+ * dispatch-ready pieces (0.3.0 feedback A1).
+ *
+ * Paseo's `--provider` accepts `provider` or `provider/model` but does NOT parse
+ * a `:thinking` suffix off it — so `pi/zai/glm-5.2:max` ran at the provider's
+ * *default* thinking, silently discarding the user's `:max`. This helper is the
+ * single source that splits the suffix back out so `dispatch()` can forward it
+ * as `--thinking <id>`.
+ *
+ * Splitting rules (deliberately conservative — a false positive here silently
+ * downgrades reasoning):
+ *  - The thinking suffix is the token after the LAST `:`.
+ *  - It is extracted ONLY when it is a recognised {@link THINKING_LEVELS} value.
+ *    An unrecognised suffix is left on the provider string (paseo / preflight
+ *    will reject an unknown model) rather than risk mis-parsing a provider name
+ *    that happens to contain a colon.
+ *  - A provider spec without `:` is returned verbatim (no thinking).
+ *
+ * Examples:
+ *   `codex/gpt-5.4`            -> { provider: "codex/gpt-5.4" }
+ *   `pi/zai/glm-5.2:max`       -> { provider: "pi/zai/glm-5.2", thinking: "max" }
+ *   `claude/opus:high`         -> { provider: "claude/opus",  thinking: "high" }
+ *   `codex/gpt-5.4:balanced`   -> { provider: "codex/gpt-5.4:balanced" } (unrecognised)
+ *
+ * Pure + exported so the parse rule is unit-tested directly, independent of
+ * dispatch / preflight / the agent adapter that all consume it.
+ */
+export function parseProviderSpec(spec: string): {
+  provider: string;
+  thinking?: string;
+} {
+  const colon = spec.lastIndexOf(":");
+  if (colon <= 0) return { provider: spec }; // no colon, or leading colon — not a thinking suffix
+  const suffix = spec.slice(colon + 1);
+  // Reject empty suffix / suffixes with a slash (a port-ish or path-ish token,
+  // never a thinking id) so `host:8080`-style strings stay intact.
+  if (!suffix || suffix.includes("/")) return { provider: spec };
+  if (!THINKING_LEVELS.has(suffix)) return { provider: spec }; // unrecognised — leave intact
+  return { provider: spec.slice(0, colon), thinking: suffix };
+}
+
 /** Grace margin so `paseo run`'s own `--wait-timeout` fires before run()'s
  *  hard kill: proportional to `waitMs`, floored at 1s and capped at 60s. Capped
  *  at 60s so a real long run (default 60min) keeps the unchanged prod margin;
@@ -213,6 +267,89 @@ export function implFailReason(r: {
 }
 
 /**
+ * Run-wide shared provider-rate-limit health (0.3.0 feedback C1).
+ *
+ * One instance per run, shared across every ticket's PaseoAgent dispatch.
+ * When one agent detects a 429 on a provider, it marks that provider "hot" for
+ * a cooldown window; every other agent about to dispatch on the SAME provider
+ * waits until the window lapses instead of stampeding it in lockstep — the
+ * correlation that, in the 0.3.0 field run, saw all three concurrent agents hit
+ * glm simultaneously and then all switch to deepseek simultaneously, depleting
+ * both. Cooperative backpressure, not authoritative circuit-breaking: a wait
+ * is capped so a provider that stays hot can't stall the batch indefinitely,
+ * and a dispatch still proceeds (and re-marks) once the window lapses.
+ *
+ * `now` / `sleep` / `random` are injectable so the backoff curve is deterministic
+ * under test (mirrors retry.ts). Pure state (no I/O) so it unit-tests without a
+ * clock. Exported from here (not its own module) because it's consumed only by
+ * {@link PaseoAgent} and the cli that wires a single shared instance.
+ */
+export class ProviderHealth {
+  private readonly hotUntil = new Map<string, number>();
+  /**
+   * @param now        injectable clock (test determinism)
+   * @param sleep      injectable sleeper (test collapses to ~ms)
+   * @param random     injectable RNG for fallback jitter (test determinism)
+   * @param cooldownMs how long a provider stays "hot" after a 429 is observed.
+   *                  60s mirrors a typical short provider rate-limit window;
+   *  					long enough that peers in the same wave back off, short enough that a
+   *  					batch keeps moving once it clears.
+   * @param maxWaitMs  cap on a single waitIfHot so a persistently-hot provider
+   *                  can't stall a ticket's slot for the whole cooldown.
+   * @param jitterMs   ceiling on the fallback-switch jitter (full jitter below it).
+   * @param log        optional human channel — one warn per actual backoff wait.
+   */
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise<void>((r) => setTimeout(r, ms)),
+    private readonly random: () => number = Math.random,
+    private readonly cooldownMs = 60_000,
+    private readonly maxWaitMs = 90_000,
+    private readonly jitterMs = 5_000,
+    private readonly log?: Logger,
+  ) {}
+
+  /** Record that `provider` just returned a 429; peers should back off. Idempotent
+   *  + extends the window if called again before it lapses (a fresh 429 resets
+   *  the cooldown so a flapping provider stays hot). */
+  markRateLimited(provider: string): void {
+    this.hotUntil.set(provider, this.now() + this.cooldownMs);
+  }
+
+  /** Wait until `provider`'s cooldown window lapses before dispatching on it.
+   *  No-op when the provider isn't hot. Capped at {@link maxWaitMs} so a hot
+   *  provider can't stall the batch forever — after the cap the dispatch
+   *  proceeds and will re-mark on a fresh 429. */
+  async waitIfHot(provider: string): Promise<void> {
+    const deadline = this.hotUntil.get(provider);
+    if (deadline === undefined) return;
+    const remaining = deadline - this.now();
+    if (remaining <= 0) {
+      this.hotUntil.delete(provider);
+      return;
+    }
+    const wait = Math.min(remaining, this.maxWaitMs);
+    this.log?.("warn", `provider ${provider} recently rate-limited; backing off ${Math.round(wait / 1000)}s before dispatch`);
+    await this.sleep(wait);
+  }
+
+  /** 0.3.0 feedback C1: a jittered delay before a fallback switch so concurrent
+   *  agents don't deplete the fallback provider in lockstep (the second half of
+   *  the correlation). Full jitter: `random() * jitterMs`, so the spread is
+   *  [0, jitterMs] and peers desynchronise. */
+  async fallbackJitter(): Promise<void> {
+    const jitter = Math.round(this.random() * this.jitterMs);
+    if (jitter > 0) await this.sleep(jitter);
+  }
+
+  /** Is `provider` currently inside its cooldown window? Observability / test hook. */
+  isHot(provider: string): boolean {
+    const deadline = this.hotUntil.get(provider);
+    return deadline !== undefined && deadline > this.now();
+  }
+}
+
+/**
  * Run one Paseo agent in a fresh worktree. `paseo run --json --new-workspace
  * worktree` creates the worktree + agent and blocks until the agent finishes.
  *
@@ -225,12 +362,23 @@ export function implFailReason(r: {
  */
 export async function dispatch(prompt: string, opts: DispatchOpts): Promise<DispatchResult> {
   const waitMs = opts.timeoutMs ?? DEFAULT_RUN_MS;
+  // 0.3.0 feedback A1: parse the `:thinking` suffix off the provider spec HERE —
+  // the single paseo-runner — so EVERY dispatch (the primary AND each fallback
+  // in runWithFallback, which re-dispatches with `{...opts, provider: fb}`)
+  // resolves its OWN thinking from its OWN provider string. An explicit
+  // `opts.thinking` (the --thinking CLI override) wins over the parsed suffix,
+  // applying one level across every provider; absent both, paseo's provider
+  // default applies (unchanged behaviour). Paseo does not parse the suffix off
+  // `--provider`, so stripping it here is what stops a `:max` spec from silently
+  // running at medium.
+  const { provider: providerSpec, thinking: parsedThinking } = parseProviderSpec(opts.provider);
+  const thinking = opts.thinking ?? parsedThinking;
   const args = [
     "paseo",
     "run",
     "--json",
     "--provider",
-    opts.provider,
+    providerSpec,
     "--title",
     opts.title,
     "--worktree-slug",
@@ -241,6 +389,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
     msToDuration(waitMs),
   ];
   if (opts.mode) args.push("--mode", opts.mode);
+  if (thinking) args.push("--thinking", thinking);
   if (opts.branchMode === "branch-off") {
     args.push("--worktree-mode", "branch-off");
     if (opts.newBranch) args.push("--new-branch", opts.newBranch);
@@ -375,13 +524,21 @@ export async function runWithFallback(
   opts: DispatchOpts,
   fallbacks: string[],
   onSwitch?: (nextProvider: string) => Promise<void>,
+  /** 0.3.0 feedback C1: fires with the provider that just returned a 429,
+   *  BEFORE the switch (or before giving up if it's the last fallback). The
+   *  PaseoAgent wires this to {@link ProviderHealth.markRateLimited} so peers
+   *  about to dispatch on the SAME provider back off instead of stampeding it
+   *  in lockstep. Optional + additive so existing callers/tests are unchanged. */
+  onRateLimited?: (provider: string) => void,
 ): Promise<DispatchResult> {
   let result = await dispatchFn(prompt, opts);
+  if (result.rateLimited) onRateLimited?.(opts.provider);
   for (const fb of fallbacks) {
     if (!result.rateLimited) break;
     if (fb === opts.provider) continue;
     if (onSwitch) await onSwitch(fb);
     result = await dispatchFn(prompt, { ...opts, provider: fb });
+    if (result.rateLimited) onRateLimited?.(fb);
   }
   if (result.rateLimited) result.ok = false;
   return result;
@@ -401,7 +558,8 @@ export const realDispatcher: Dispatcher = Object.freeze({
     opts: DispatchOpts,
     fallbacks: string[],
     onSwitch?: (nextProvider: string) => Promise<void>,
-  ): Promise<DispatchResult> => runWithFallback(dispatch, prompt, opts, fallbacks, onSwitch),
+    onRateLimited?: (provider: string) => void,
+  ): Promise<DispatchResult> => runWithFallback(dispatch, prompt, opts, fallbacks, onSwitch, onRateLimited),
 });
 
 // ---------------------------------------------------------------------------
@@ -509,26 +667,30 @@ export async function preflightProvider(
   cwd?: string,
   timeoutMs = 60_000,
 ): Promise<{ ok: boolean; error?: string }> {
+  // 0.3.0 feedback A1 / D5: parse the `:thinking` suffix off the provider spec
+  // so preflight exercises the SAME (provider, thinking) the real dispatches
+  // use. A spec whose `:max` would have been silently dropped now fails fast at
+  // preflight (or, once forwarded, runs at max) instead of cascading for 68min.
+  const { provider: providerSpec, thinking } = parseProviderSpec(provider);
   const slug = `dag-preflight-${provider.replace(/[^a-z0-9]+/gi, "-").slice(0, 30)}`;
-  const r = await run(
-    [
-      "paseo",
-      "run",
-      "--json",
-      "--provider",
-      provider,
-      "--title",
-      "dag-tickets preflight",
-      "--worktree-slug",
-      slug,
-      "--new-workspace",
-      "worktree",
-      "--wait-timeout",
-      msToDuration(timeoutMs),
-      "ping",
-    ],
-    { cwd, timeoutMs: timeoutMs + 60_000 },
-  );
+  const args = [
+    "paseo",
+    "run",
+    "--json",
+    "--provider",
+    providerSpec,
+    "--title",
+    "dag-tickets preflight",
+    "--worktree-slug",
+    slug,
+    "--new-workspace",
+    "worktree",
+    "--wait-timeout",
+    msToDuration(timeoutMs),
+  ];
+  if (thinking) args.push("--thinking", thinking);
+  args.push("ping");
+  const r = await run(args, { cwd, timeoutMs: timeoutMs + 60_000 });
   if (r.timedOut) return { ok: false, error: "preflight timed out" };
   if (!r.ok) {
     // Surface the relay's own diagnostic (stderr holds the 401 / model error);
@@ -626,44 +788,87 @@ const ownsWorktreeSegment = (dir: string, n: number): boolean => {
 };
 
 /**
- * Stop every running Paseo agent whose worktree belongs to ticket `ticketNumber`
- * (#20). Best-effort and never throws: a lookup that finds nothing (the
- * dispatch already finished — lost race) is a no-op; the caller still cleans
- * the branch. Worktree ownership is decided by {@link ownsWorktreeSegment}, the
- * single source of the `dag-<n>` layout.
+ * List every Paseo agent whose worktree belongs to ticket `ticketNumber`, in
+ * ANY state (running / idle / error). The shared lookup behind both
+ * {@link stopRunningAgent} (which filters to running) and
+ * {@link archiveTicketAgents} (which takes all). Best-effort and never throws:
+ * `paseo` may be absent in unit-test envs, unreachable, or emit malformed
+ * output; `run()` itself throws on a missing executable (ENOENT), so the whole
+ * body is guarded. Returns `[]` on any failure → the caller proceeds with
+ * nothing to act on. Worktree ownership is decided by {@link ownsWorktreeSegment},
+ * the single source of the `dag-<n>` layout.
  */
-export async function stopRunningAgent(
+async function listOwnedAgents(
   cwd: string | undefined,
   ticketNumber: number,
-): Promise<void> {
-  // Best-effort and never throws (its documented contract — relied on by
-  // abort() and by the rate-limit fallback #40). `paseo` may be absent in
-  // unit-test envs, unreachable, or emit malformed output; `run()` itself
-  // throws on a missing executable (ENOENT), so the whole body is guarded.
-  // Any of those → nothing to stop; the caller still proceeds.
+): Promise<Array<{ id?: string; status?: string; cwd?: string }>> {
   try {
     const r = await run(["paseo", "ls", "--json"], { cwd });
-    if (!r.ok) return;
+    if (!r.ok) return [];
     let agents: Array<{ id?: string; status?: string; cwd?: string }> = [];
     try {
       const j = JSON.parse(r.stdout) as unknown;
       agents = Array.isArray(j) ? (j as typeof agents) : ((j as { agents?: typeof agents }).agents ?? []);
     } catch {
-      return; // malformed `paseo ls` output — nothing to stop
+      return []; // malformed `paseo ls` output — nothing to act on
     }
-    const running = agents.filter(
-      (a) => a.status === "running" && typeof a.cwd === "string" && ownsWorktreeSegment(a.cwd, ticketNumber),
+    return agents.filter(
+      (a) => typeof a.cwd === "string" && ownsWorktreeSegment(a.cwd, ticketNumber),
     );
-    for (const a of running) {
-      if (!a.id) continue;
-      try {
-        await run(["paseo", "stop", a.id], { cwd });
-      } catch {
-        /* one bad stop doesn't skip the rest — matches stopInFlight's contract */
-      }
-    }
   } catch {
-    /* paseo missing / spawn error → nothing to stop */
+    return []; // paseo missing / spawn error → nothing to act on
+  }
+}
+
+/**
+ * Stop every running Paseo agent whose worktree belongs to ticket `ticketNumber`
+ * (#20). Best-effort and never throws: a lookup that finds nothing (the
+ * dispatch already finished — lost race) is a no-op; the caller still cleans
+ * the branch. Delegates the listing to {@link listOwnedAgents} so the worktree-
+ * ownership rule has one home shared with {@link archiveTicketAgents}.
+ */
+export async function stopRunningAgent(
+  cwd: string | undefined,
+  ticketNumber: number,
+): Promise<void> {
+  const owned = await listOwnedAgents(cwd, ticketNumber);
+  for (const a of owned) {
+    if (a.status !== "running" || !a.id) continue;
+    try {
+      await run(["paseo", "stop", a.id], { cwd });
+    } catch {
+      /* one bad stop doesn't skip the rest — matches stopInFlight's contract */
+    }
+  }
+}
+
+/**
+ * Archive every Paseo agent whose worktree belongs to ticket `ticketNumber`,
+ * in ANY state (0.3.0 feedback E1). Each rate-limit fallback + each ticket
+ * retry spawns a fresh Paseo agent; without archiving, a single run left 15+
+ * orphan (stopped-but-not-archived) agents + duplicate workspaces per branch.
+ * The git worktree is reclaimed by `cleanBranch`; this reclaims the Paseo agent
+ * RECORD so `paseo ls` stays clean across runs. The agent transcript is already
+ * captured per-step in the run's logs/ dir (0.2.0 A1), so archiving loses no
+ * post-mortem evidence.
+ *
+ * Best-effort and never throws (mirrors {@link stopRunningAgent}): a missing
+ * `paseo`, a malformed `ls`, or one bad `archive` never blocks the caller — the
+ * settle / exit that calls this must proceed regardless. `--force` so a still-
+ * running agent (a lost stop race) is interrupted-then-archived, not skipped.
+ */
+export async function archiveTicketAgents(
+  cwd: string | undefined,
+  ticketNumber: number,
+): Promise<void> {
+  const owned = await listOwnedAgents(cwd, ticketNumber);
+  for (const a of owned) {
+    if (!a.id) continue;
+    try {
+      await run(["paseo", "archive", a.id, "--force"], { cwd });
+    } catch {
+      /* one bad archive doesn't skip the rest — best-effort */
+    }
   }
 }
 
@@ -703,6 +908,20 @@ export class PaseoAgent implements AgentPort {
      *  (`<n>-<step>.log`). Absent in unit tests → no logs written, dispatch
      *  still works. The cli sets it to the run's `.scratch/.../logs/` dir. */
     private readonly stepLogDir?: string,
+    /** 0.3.0 feedback A1: a `--thinking <id>` CLI override applied to EVERY
+     *  dispatch regardless of provider. Wins over a `:thinking` suffix baked
+     *  into a provider string (dispatch honours opts.thinking before parsing).
+     *  Absent → each provider's own `:thinking` suffix (or paseo's default)
+     *  applies, so impl/review/fallback can each carry their own level. */
+    private readonly thinkingOverride?: string,
+    /** 0.3.0 feedback C1: run-wide shared provider-rate-limit health. When one
+     *  ticket's dispatch detects a 429 on a provider, peers about to dispatch on
+     *  the SAME provider back off (waitIfHot) instead of stampeding it in
+     *  lockstep, and fallback switches are jittered so they don't deplete the
+     *  fallback together. Absent in unit tests → no backpressure (unchanged
+     *  behaviour); the cli wires ONE shared instance so every ticket consults
+     *  the same cooldown state. */
+    private readonly health?: ProviderHealth,
   ) {}
 
   /**
@@ -754,6 +973,13 @@ export class PaseoAgent implements AgentPort {
     });
     await this.tryStop(t);
     await this.branch.cleanBranch(branch);
+    // 0.3.0 feedback C1: jitter before the fallback dispatch so concurrent agents
+    // switching at the same instant don't deplete the fallback in lockstep (the
+    // second half of the rate-limit correlation). Per-provider HOT marking is
+    // owned by the onRateLimited callback (precise: marks the provider that
+    // actually 429'd, including each exhausted fallback); jitter is owned here.
+    // Both no-op when no shared health is wired (unit tests).
+    await this.health?.fallbackJitter();
   }
 
   /**
@@ -792,6 +1018,8 @@ export class PaseoAgent implements AgentPort {
       this.log("warn", `could not fetch ${remoteRef(base)} (offline?); failing implement to avoid a stale branch-off`, t.number);
       return { ok: false, commits: 0, reason: "stale-base" };
     }
+    // 0.3.0 feedback C1: back off if a peer just rate-limited this provider.
+    await this.health?.waitIfHot(this.prefs.impl);
     const r = await this.dispatcher.dispatchWithFallback(
       implementPrompt(t, branch),
       {
@@ -804,6 +1032,7 @@ export class PaseoAgent implements AgentPort {
         newBranch: branch,
         base: baseRef,
         logFile: this.logFileFor(t.number, "implement"),
+        thinking: this.thinkingOverride,
       },
       this.fallbacks,
       async (next) => {
@@ -813,6 +1042,7 @@ export class PaseoAgent implements AgentPort {
         await this.switchAway("implement", this.prefs.impl, next, t, branch);
         await this.branch.deleteBranch(branch);
       },
+      this.markHot,
     );
     if (!r.ok) {
       return { ok: false, commits: 0, reason: implFailReason(r), ...withLog(r) };
@@ -830,10 +1060,25 @@ export class PaseoAgent implements AgentPort {
     return { ok: true, commits, ...withLog(r) };
   }
 
+  /**
+   * 0.3.0 feedback C1: bound callback that marks a provider hot when its
+   *  dispatch returned a 429. Passed as runWithFallback's `onRateLimited` so
+   *  the SHARED {@link ProviderHealth} learns about a rate-limit the instant a
+   *  peer observes it — peers about to dispatch on the same provider then back
+   *  off (waitIfHot) instead of stampeding it in lockstep. Arrow-bound (not a
+   *  method) so it can be passed as a bare callback without losing `this`. A
+   *  no-op when no health is wired (unit tests).
+   */
+  private readonly markHot = (provider: string): void => {
+    this.health?.markRateLimited(provider);
+  };
+
   /** Single review attempt. Stable-log polling in dispatch guarantees the full
    *  output, so an unparseable verdict means the agent genuinely didn't emit one. */
   async review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict> {
     await this.branch.cleanBranch(branch);
+    // 0.3.0 feedback C1: back off if a peer just rate-limited this provider.
+    await this.health?.waitIfHot(this.prefs.review);
     const r = await this.dispatcher.dispatchWithFallback(
       reviewPrompt(t, base),
       {
@@ -845,9 +1090,11 @@ export class PaseoAgent implements AgentPort {
         branchMode: "checkout-branch",
         branch,
         logFile: this.logFileFor(t.number, "review"),
+        thinking: this.thinkingOverride,
       },
       this.fallbacks,
       this.onRateLimited("review", this.prefs.review, t, branch),
+      this.markHot,
     );
     if (!r.ok) {
       this.log("warn", `review agent failed${r.timedOut ? " (timeout)" : ""}`, t.number);
@@ -859,6 +1106,8 @@ export class PaseoAgent implements AgentPort {
 
   async fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult> {
     await this.branch.cleanBranch(branch);
+    // 0.3.0 feedback C1: back off if a peer just rate-limited this provider.
+    await this.health?.waitIfHot(this.prefs.impl);
     const r = await this.dispatcher.dispatchWithFallback(
       fixPrompt(t, verdict.raw, branch),
       {
@@ -870,9 +1119,11 @@ export class PaseoAgent implements AgentPort {
         branchMode: "checkout-branch",
         branch,
         logFile: this.logFileFor(t.number, "fix", round),
+        thinking: this.thinkingOverride,
       },
       this.fallbacks,
       this.onRateLimited("fix", this.prefs.impl, t, branch),
+      this.markHot,
     );
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited, ...withLog(r) };
   }
@@ -894,6 +1145,7 @@ export class PaseoAgent implements AgentPort {
       newBranch: branch,
       base: baseRef,
       logFile: this.logFileFor(t.number, skill),
+      thinking: this.thinkingOverride,
     });
     // 0.2.0 feedback D1: single-shot tickets (triage/research) create their own
     // worktree too — print its path so an operator can find it post-run, the

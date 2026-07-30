@@ -194,6 +194,14 @@ export interface DispatchOpts {
    *  debuggable without `cd`-ing into the worktree. Best-effort: unset in unit
    *  tests / when no run dir is wired → dispatch skips writing. */
   logFile?: string;
+  /** 0.3.0 feedback A1: thinking option id forwarded to `paseo run --thinking`.
+   *  This is the **override** form (the `--thinking` CLI flag): when set it wins
+   *  over any `:thinking` suffix baked into the provider string and applies one
+   *  level across every provider (primary + fallbacks). The per-provider suffix
+   *  is parsed inside `dispatch()` itself, so callers normally leave this unset
+   *  and just pass `provider/model:thinking`. Absent both → paseo's provider
+   *  default applies (unchanged behaviour). */
+  thinking?: string;
 }
 
 /** Result of one Paseo agent dispatch. */
@@ -234,6 +242,8 @@ export interface Dispatcher {
     opts: DispatchOpts,
     fallbacks: string[],
     onSwitch?: (nextProvider: string) => Promise<void>,
+    /** 0.3.0 feedback C1: per-provider rate-limit signal for shared health. */
+    onRateLimited?: (provider: string) => void,
   ): Promise<DispatchResult>;
 }
 

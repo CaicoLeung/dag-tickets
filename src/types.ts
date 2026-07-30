@@ -95,6 +95,7 @@ export type FailureReason =
   // terminal (retrying the whole ticket won't change the outcome):
   | "review-issues" // review still has actionable findings after maxFixRounds
   | "review-unknown" // review verdict stayed unknown (no ISSUES/CLEAN emitted)
+  | "fix-regression" // 0.3.0 feedback B1: a fix round produced MORE issues than the prior review — the loop amplifies bugs, so it aborts early instead of diverging
   | "implement-empty" // agent completed but produced no commits
   | "implement-failed" // agent run failed (non-transient)
   | "fix-failed" // a fix round failed

@@ -27,6 +27,7 @@ describe("isTransient", () => {
     const terminal: FailureReason[] = [
       "review-issues",
       "review-unknown",
+      "fix-regression",
       "implement-empty",
       "implement-failed",
       "fix-failed",

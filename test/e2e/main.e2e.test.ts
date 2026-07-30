@@ -995,9 +995,25 @@ describe("e2e: SIGINT releases the lock + flushes the event trace (#40)", () => 
       const types = events!.map((e) => e.type);
       expect(types).toContain(EVT.RUN_START);
       expect(types).not.toContain(EVT.RUN_END);
+      // 0.3.0 feedback D3: a terminal run.interrupted marker is now emitted
+      // before the flush, so the trace is BOUNDED — a consumer sees the run
+      // was interrupted, not an unbounded "in flight" tail. It is the LAST
+      // event (after every step.*) so ordering proves nothing was dropped.
+      expect(types).toContain(EVT.RUN_INTERRUPTED);
+      expect(types[types.length - 1]).toBe(EVT.RUN_INTERRUPTED);
       // seq is monotonic in emit order — the flush preserved ordering.
       const seqs = events!.map((e) => e.seq);
       expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+
+      // 0.3.0 feedback D1: state.json is seeded at run.start (every actionable
+      // ticket pending) and persisted BEFORE run.start, so a run killed
+      // mid-first-ticket leaves a resumable state file. The prior behaviour
+      // only wrote state on the first settle → a killed-first-ticket run had
+      // no state.json → --resume failed. Here the single ticket is in flight
+      // when the signal lands, yet its state.json exists.
+      const state = await readState(env);
+      expect(state).not.toBeNull();
+      expect(state!.tickets[1]).toBeDefined(); // seeded pending, then updated
     } finally {
       await teardown(env);
     }

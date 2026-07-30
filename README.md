@@ -21,6 +21,8 @@ You already work ticket-by-ticket in Paseo: `/implement`, then a fresh session f
 
 Provider defaults come from `~/.paseo/orchestration-preferences.json` (categories `impl`/`audit`/`research`/`planning`). If absent, dag-tickets falls back to `codex/gpt-5.4` for implement/fix and `claude/opus` for review — review deliberately uses a *different* provider so the reviewer catches the implementer's blind spots.
 
+Any provider string accepts a `:thinking` suffix (e.g. `pi/zai/glm-5.2:max`) that dag-tickets parses and forwards to `paseo run --thinking <id>` — paseo itself does **not** parse the suffix off `--provider`, so without this a `:max` spec would silently run at the provider's default thinking level. Use `--thinking <id>` to force one level across every dispatch.
+
 ## Install
 
 Prebuilt binaries (no Bun or Node required at runtime) for macOS (Apple Silicon
@@ -80,8 +82,9 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 | `--merge-strategy <s>` | `squash` | `squash` \| `merge` \| `rebase` |
 | `--require-checks` | off | a PR with no CI does **not** satisfy the merge gate |
 | `--ci-watch-timeout-minutes <n>` | `30` | ceiling on `gh pr checks --watch`; a stuck check otherwise polls forever and starves a slot. The timeout becomes a transient `ci-failed` (retried with backoff). `0` = no bound |
-| `--provider <p>` | prefs/`codex/gpt-5.4` | override the implement/fix provider |
-| `--review-provider <p>` | prefs/`claude/opus` | override the review provider |
+| `--provider <p>` | prefs/`codex/gpt-5.4` | override the implement/fix provider. Accepts a `:thinking` suffix (e.g. `pi/zai/glm-5.2:max`) forwarded to `paseo run --thinking` |
+| `--review-provider <p>` | prefs/`claude/opus` | override the review provider (same `:thinking` suffix honoured) |
+| `--thinking <id>` | — | thinking level (`off\|minimal\|low\|medium\|high\|xhigh\|max`) forwarded to **every** dispatch. Overrides any `:thinking` suffix baked into a provider string; without it the suffix is honoured per-provider |
 | `--impl-label` / `--triage-label` / `--research-label` | mattpocock defaults | override routing labels |
 | `--cwd <path>` | `.` | operate on a different checkout |
 | `--run-id <id>` | derived | name this run (state file path) |
@@ -96,14 +99,16 @@ dag-tickets --resume <run-id>       # pick up a killed run where it left off
 2. **Build the DAG.** `Blocked by` edges are read from each issue body — both `#NN` references and **title references** (e.g. `Blocked by: T2 — Ticket-type labels + routing dispatch`), which are matched to batch tickets by normalised title. A cycle aborts the run.
 3. **Walk the frontier.** Tickets with all blockers done launch up to `--concurrency` at a time. Each runs in its own fresh Paseo worktree. When one finishes, its dependents become eligible.
 4. **Per implement ticket:** `paseo run` `/implement` (branch-off from the default branch) → fresh `paseo run` `/code-review` against `origin/<default>` → if the verdict is `ISSUES`, a bounded fix-loop (fix agent → re-review) up to `--max-fix-rounds` → `gh pr create` → `gh pr checks --watch` → `gh pr merge` + close the issue.
-5. **The review verdict** is the contract between agent and driver. The review prompt asks the agent to end with `REVIEW_VERDICT: CLEAN` or `REVIEW_VERDICT: ISSUES <n>`. An unparseable verdict is retried once, then escalated — the driver **never auto-merges on an unknown verdict**.
-6. **Transient failures retry, terminal ones cascade.** A ticket that fails for a transient reason (CI flake, momentary rate-limit, merge race, an offline base-ref fetch, a relay connection/stream error like `ECONNRESET`) is retried with exponential backoff up to `--max-ticket-retries` before being declared terminal and cascading to its dependents. Each failure is tagged with a machine-readable `reason` (recorded in `state.json` and `events.jsonl`) so the post-mortem no longer conflates *"issues remain after N rounds"* with *"verdict unknown"*. Terminal causes (`review-issues`, `implement-empty`, …) are never retried — they cascade immediately, exactly as before.
+5. **The review verdict** is the contract between agent and driver. The review prompt asks the agent to end with `REVIEW_VERDICT: CLEAN` or `REVIEW_VERDICT: ISSUES <n>`. An unparseable verdict is retried once, then escalated — the driver **never auto-merges on an unknown verdict**. The fix-loop is regression-guarded: if a fix round produces *more* issues than the prior review, the loop aborts immediately (`fix-regression`) instead of diverging, and the per-round count trail (`r1:2 → r2:5`) is logged + recorded on the failure.
+6. **Transient failures retry, terminal ones cascade.** A ticket that fails for a transient reason (CI flake, momentary rate-limit, merge race, an offline base-ref fetch, a relay connection/stream error like `ECONNRESET`) is retried with exponential backoff up to `--max-ticket-retries` before being declared terminal and cascading to its dependents. Each failure is tagged with a machine-readable `reason` (recorded in `state.json` and `events.jsonl`) so the post-mortem no longer conflates *"issues remain after N rounds"* with *"verdict unknown"*. Terminal causes (`review-issues`, `implement-empty`, `fix-regression`, …) are never retried — they cascade immediately, exactly as before.
 
 ## Safety
 
 - **Auto-merge is gated on a clean review AND green CI.** A failing check leaves the PR open for you. `--require-checks` additionally blocks merge when a repo has no CI.
 - **A failed or skipped ticket cascades** to its not-yet-started dependents (marked the same status, not retried), so a doomed branch can't hang the run. Dependents already in flight are left to settle.
-- **Resume is idempotent.** State lives at `.scratch/dag-tickets/<run-id>/state.json`. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
+- **Resume is idempotent.** State lives at `.scratch/dag-tickets/<run-id>/state.json`. It's seeded at `run.start` (every actionable ticket `pending`) and persisted before the first dispatch, so even a run killed mid-first-ticket leaves a resumable file. Re-running `--resume <id>` skips merged tickets, restarts in-flight ones, and keeps failed ones failed.
+- **Interrupted runs leave a bounded trace.** `SIGINT`/`SIGTERM`/a crash stops in-flight agents, emits a terminal `run.interrupted` event, flushes `events.jsonl`, and releases the run lock — a consumer sees the run was interrupted, not an unbounded "in flight" tail.
+- **Rate-limit backpressure is cooperative.** When one ticket's dispatch hits a 429, the provider is marked hot for a cooldown; peers about to dispatch on the *same* provider back off instead of stampeding it in lockstep, and fallback switches are jittered so concurrent agents don't deplete the fallback together.
 - **One run per checkout.** The driver takes a repo-wide lock at `.scratch/dag-tickets/run.lock` before dispatching, so two `dag-tickets` runs can't fight over the shared `dag-<n>` worktrees/branches — the second run aborts with a clear message. A lock left behind by a killed run (the holder pid is dead) is recovered automatically on the next start. The lock is released on normal exit **and** on `SIGINT`/`SIGTERM`. `--dry-run` is lock-free (it dispatches nothing, so it never blocks a real run).
 - The driver never edits issue bodies; it only opens PRs, merges, and closes with a linking comment.
 
