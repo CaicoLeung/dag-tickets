@@ -1,7 +1,7 @@
 import { test, expect, describe } from "bun:test";
 import { runBatch, planCascade, applyCascadePlan, type LaunchInfo } from "../src/scheduler.ts";
 import { buildGraph } from "../src/graph.ts";
-import { fanInHeavyGraph, retryableOutcome } from "./helpers.ts";
+import { fanInHeavyGraph, retryableOutcome, tick, assertGateStillHeld } from "./helpers.ts";
 import type { FailureReason, Ticket, TicketStatus } from "../src/types.ts";
 import type { CascadeAction } from "../src/scheduler.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
@@ -295,7 +295,7 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     });
 
     // Flush: the scheduler launches 1 + 2, and 2 parks at the gate.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     fail1 = true;
     release.get(1)!(); // 1 settles failed → noteSettled(1, "failed") must be a no-op
     const out = await run;
@@ -304,18 +304,11 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     // Promise.all → waitForBlockers → dispatch resume) is all microtasks, so a
     // single macrotask flush would surface it. Under the fix the gate held, so
     // 2 never resumed into createPr.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     expect(createPrReached).toBe(false); // #31: gate held → no PR on a broken base
     // Defense-in-depth: 1 must not have landed in `settled` — a fresh waiter on
     // the failed blocker must still hang (no awaitOne short-circuit).
-    let reopened = false;
-    await Promise.race([
-      coord.waitForBlockers([1]).then(() => {
-        reopened = true;
-      }),
-      new Promise((r) => setTimeout(r, 0)),
-    ]);
-    expect(reopened).toBe(false);
+    await assertGateStillHeld(coord, 1);
     expect(out.failed).toEqual([1]);
     expect(out.skipped).toEqual([2]); // cascade-aborted, NOT completed
     expect(out.completed).toEqual([]);

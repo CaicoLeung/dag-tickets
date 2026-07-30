@@ -14,10 +14,7 @@ import type { ReviewVerdict, Ticket } from "../src/types.ts";
 import { EVT, RecordingSink } from "../src/events.ts";
 import { NULL_SINK } from "../src/ports.ts";
 import { OverlapCoordinator } from "../src/cli.ts";
-
-/** Flush the microtask queue so an async lifecycle reaches its next await
- *  (e.g. waitForBlockers registering a waiter) before an assertion reads it. */
-const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+import { tick, assertGateStillHeld } from "./helpers.ts";
 
 function ticket(n = 1, title = "Do the thing"): Ticket {
   return {
@@ -721,14 +718,7 @@ describe("implement lifecycle — #29 overlap", () => {
     // dependent that registers its waiter AFTER the settle can't bypass the
     // gate via the awaitOne short-circuit. Blocker 1 settled failed above — a
     // fresh waiter registered now must still hang, not resolve immediately.
-    let lateResolved = false;
-    await Promise.race([
-      coord.waitForBlockers([1]).then(() => {
-        lateResolved = true;
-      }),
-      tick(),
-    ]);
-    expect(lateResolved).toBe(false); // 1 ∉ settled → no short-circuit
+    await assertGateStillHeld(coord, 1); // 1 ∉ settled → no short-circuit
 
     // Sanity: "done" releases (proves the gate is status-aware).
     coord.noteSettled(1, "done");
@@ -759,13 +749,6 @@ describe("implement lifecycle — #29 overlap", () => {
 
     // A blocker NOT in the seed still hangs — the set is a allowlist, not a
     // blanket pass, so an in-flight blocker keeps the gate locked.
-    let hungResolved = false;
-    await Promise.race([
-      coord.waitForBlockers([2]).then(() => {
-        hungResolved = true;
-      }),
-      tick(),
-    ]);
-    expect(hungResolved).toBe(false); // 2 ∉ settled → gate held
+    await assertGateStillHeld(coord, 2); // 2 ∉ settled → gate held
   });
 });
