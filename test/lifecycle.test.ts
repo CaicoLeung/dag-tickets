@@ -673,7 +673,7 @@ describe("implement lifecycle — #29 overlap", () => {
       overlap,
     );
     // createPr hasn't run yet (gate unresolved), but the gate was called with the blockers.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     expect(repo.prs).toHaveLength(0);
     expect(waitedFor).toEqual([[1, 2]]);
     resolveGate();

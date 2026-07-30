@@ -141,7 +141,7 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
     const run = runBatch(g, { concurrency: 2, process, canOverlap: () => true });
     // Flush microtasks: the scheduler launches 1, recomputes frontier (1 now in
     // flight → 2 overlap-ready), and launches 2 — all before 1 settles.
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     expect(launched).toEqual([1, 2]); // 2 launched AFTER 1, BEFORE 1 settled
     release1();
     const out = await run;
@@ -159,7 +159,7 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
       return "done";
     };
     const run = runBatch(g, { concurrency: 2, process }); // no canOverlap → strict
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     expect(launched).toEqual([1]); // 2 NOT launched while 1 in flight
     release1();
     const out = await run;
@@ -193,7 +193,7 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
         gates.get(n)?.(); // release the dependent's gate so its promise settles
       },
     });
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     // Both launched; 2 overlap-in-flight. Fail 1 → 2 must be aborted.
     fail1 = true;
     gates.get(1)!();
@@ -218,14 +218,14 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
       return "done";
     };
     const run = runBatch(g, { concurrency: 3, process, canOverlap: () => true });
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     // 2 and 3 launched; 4 must NOT have launched (fan-in, two in-flight blockers).
     expect(launched.map((l) => l.n)).toContain(2);
     expect(launched.map((l) => l.n)).toContain(3);
     expect(launched.map((l) => l.n)).not.toContain(4);
     // Complete 2 → only 3 remains in flight → 4 overlap-launches on 3.
     gates.get(2)!();
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     const four = launched.find((l) => l.n === 4);
     expect(four).toBeDefined();
     expect(four!.overlap).toBe(true); // overlapped on the single remaining blocker
@@ -245,7 +245,7 @@ describe("runBatch — #29 frontier relaxation (overlap)", () => {
       return "done";
     };
     const run = runBatch(g, { concurrency: 2, process, canOverlap: () => true });
-    await new Promise((r) => setTimeout(r, 0));
+    await tick();
     // 1 launched normally (no overlap info); 2 launched overlapping 1.
     expect(infos.find((i) => i.n === 1)?.info).toEqual({});
     expect(infos.find((i) => i.n === 2)?.info).toEqual({ overlapBlocker: 1 });
