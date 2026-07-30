@@ -49,6 +49,12 @@ export function logsPath(runId: string): string {
 export const EVT = {
   RUN_START: "run.start",
   RUN_END: "run.end",
+  /** 0.3.0 feedback D3: emitted by the signal/crash exit path (RunExit) before
+   *  the final flush, so a consumer of events.jsonl sees a bounded trace on
+   *  interrupt instead of an unbounded "in flight" tail. Distinct from RUN_END
+   *  (which marks clean completion) so a reader can tell an interrupted run
+   *  from a finished one. */
+  RUN_INTERRUPTED: "run.interrupted",
   TICKET_START: "ticket.start",
   TICKET_END: "ticket.end",
   TICKET_CASCADE: "ticket.cascade",

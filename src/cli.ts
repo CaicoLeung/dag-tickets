@@ -1,7 +1,7 @@
 import { buildGraph, CycleError } from "./graph.ts";
-import { runBatch } from "./scheduler.ts";
+import { runBatch, type SettleDetail } from "./scheduler.ts";
 import { processTicket, type OverlapContext, type RunContext } from "./lifecycle.ts";
-import { loadPrefs, PaseoAgent, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary, isDagWorktreeSegment, modelOverrideWarning } from "./paseo.ts";
+import { loadPrefs, PaseoAgent, parseProviderSpec, ProviderHealth, archiveTicketAgents, isDagWorktreeSegment, isThinkingLevel, modelOverrideWarning, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary } from "./paseo.ts";
 import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
@@ -10,6 +10,7 @@ import {
   fetchIssues,
 } from "./discover.ts";
 import { branchFor, ensureMergedBase, mergedReference, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import type { ThinkingLevel } from "./ports.ts";
 import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
 import type { FailureReason, SettleReason, Ticket, TicketKind, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
@@ -97,6 +98,12 @@ interface ParsedArgs {
   provider?: string;
   fallbackProviders: string[];
   reviewProvider?: string;
+  /** 0.3.0 feedback A1: thinking level forwarded to every dispatch as
+   *  `paseo run --thinking <id>`, overriding any `:thinking` suffix baked
+   *  into a provider string. Typed ({@link ThinkingLevel}) + validated at parse
+   *  time so an unknown id fails loudly (A1's whole point) instead of being
+   *  forwarded to paseo and rejected late. */
+  thinking?: ThinkingLevel;
   cwd?: string;
   runId?: string;
   resume?: string;
@@ -158,6 +165,12 @@ OPTIONS
                          with backoff). 0 = no bound (indefinite watch).
   --provider <p>          Override the implement/fix provider.
   --review-provider <p>   Override the review provider.
+  --thinking <id>         Thinking level forwarded to every dispatch as
+                         \`paseo run --thinking <id>\` (off|minimal|low|medium|
+                         high|xhigh|max). Overrides any \`:thinking\` suffix on a
+                         provider string (e.g. \`pi/zai/glm-5.2:max\`); without it
+                         the suffix is honoured per-provider. Without either,
+                         paseo's provider default applies.
   --fallback-provider <p> Provider tried when the primary is rate-limited (repeat / comma-sep).
   --impl-label <l>        Override the implement-routing label.
   --triage-label <l>      Override the triage-routing label.
@@ -265,6 +278,21 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.provider = next(); break;
       case "--review-provider":
         a.reviewProvider = next(); break;
+      case "--thinking": {
+        // 0.3.0 feedback A1: validate at the edge. An unknown id here would be
+        // forwarded to `paseo run --thinking <bogus>` and rejected late (or, if
+        // paseo ever tolerated it, silently downgrade reasoning) — exactly the
+        // silent-intent class A1 exists to kill. Fail loud, like `--provider`
+        // auth fails loud at preflight.
+        const v = next();
+        if (!v || !isThinkingLevel(v)) {
+          throw new Error(
+            `--thinking must be one of off|minimal|low|medium|high|xhigh|max; got "${v ?? "(missing)"}"`,
+          );
+        }
+        a.thinking = v;
+        break;
+      }
       case "--fallback-provider":
         a.fallbackProviders.push(...(next()?.split(",").map((s) => s.trim()).filter(Boolean) ?? [])); break;
       case "--impl-label":
@@ -339,6 +367,12 @@ export async function stopInFlightAgents(
 interface RunExitDeps {
   /** #40: stop every agent this run still has in flight. */
   stop(): Promise<void>;
+  /** 0.3.0 feedback D3: emit a terminal `run.interrupted` event BEFORE the
+   *  flush so an interrupted run leaves a bounded trace (a terminal marker
+   *  after the last step.*), not an unbounded "in flight" tail. Best-effort
+   *  and never throws — it must not block the flush/release that follows.
+   *  Optional: dry-run / no-event-log runs omit it; absent → just flush. */
+  emitInterrupt?(): Promise<void> | void;
   /** Flush the staged event trace so a non-graceful exit leaves an ordered prefix. */
   flush(): Promise<void>;
   /** Release the run lock (idempotent). */
@@ -378,10 +412,20 @@ export class RunExit {
     // Best-effort throughout: a failure in any step must not block the exit
     // that follows — the .catch swallows, the .finally still exits. Order is
     // load-bearing: stop the agent BEFORE releasing the lock (a released lock
-    // lets the next run spawn on the same worktree) and flush BEFORE release so
-    // the trace lands even if release throws.
+    // lets the next run spawn on the same worktree) and emit the terminal
+    // interrupt event BEFORE flush so it lands in the flushed trace.
+    // emitInterrupt gets its OWN try/catch (not the chain's outer one) so a
+    // throw there can't skip the flush that follows — the event emit is the
+    // least-essential step and must never starve the trace flush.
     const cleanExit = async (code: number): Promise<void> => {
       await deps.stop();
+      if (deps.emitInterrupt) {
+        try {
+          await deps.emitInterrupt();
+        } catch {
+          /* best-effort: must not skip the flush below */
+        }
+      }
       await deps.flush();
       await deps.release();
     };
@@ -649,7 +693,12 @@ export async function main(argv: string[]): Promise<number> {
       ...a.fallbackProviders,
     ];
     log("info", `preflight: checking ${new Set(preflightProviders.filter(Boolean)).size} provider(s)`);
-    const results = await preflight(preflightProviders, (p) => preflightProvider(p, a.cwd));
+    // 0.3.0 feedback A1 (review follow-up): forward the --thinking override so
+    // preflight exercises the SAME (provider, thinking) the real dispatches use.
+    // Previously preflight parsed the provider-string suffix but ignored the
+    // override, so a `--thinking max` run preflighted at the default while every
+    // real dispatch ran at max — hiding the regression A1 exists to surface.
+    const results = await preflight(preflightProviders, (p) => preflightProvider(p, a.cwd, undefined, a.thinking));
     if (!preflightOk(results)) {
       process.stderr.write(
         `Preflight failed — aborting before run.start:\n  ${preflightSummary(results)}\nFix the provider/auth (e.g. codex login / API key) and re-run.\n`,
@@ -707,6 +756,24 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   log("info", `planned ${actionable.length} ticket(s); concurrency ${a.concurrency}; base ${baseBranch}; ${a.dryRun ? "DRY RUN" : a.noAutoMerge || !a.autoMerge ? "manual merge" : "auto-merge " + a.mergeStrategy}${a.maxTicketRetries > 0 ? `; transient-retry ×${a.maxTicketRetries}` : ""}`);
+  // 0.3.0 feedback A1: surface the effective thinking level(s) once at run start
+  // so a `:max` suffix (or a --thinking override) is VISIBLE, not silent. One
+  // line; a regression that drops the forwarding would be obvious here.
+  if (a.thinking) {
+    log("info", `thinking override: ${a.thinking} (applies to every dispatch)`);
+  } else {
+    const levels: string[] = [];
+    const add = (label: string, spec: string | undefined): void => {
+      if (!spec) return;
+      const { thinking: t } = parseProviderSpec(spec);
+      if (t) levels.push(`${label}=${t}`);
+    };
+    add("impl", a.provider ?? prefs.impl);
+    add("review", a.reviewProvider ?? prefs.review);
+    if (actionable.some((t) => t.kind === "research")) add("research", prefs.research);
+    if (actionable.some((t) => t.kind === "triage")) add("triage", prefs.triage);
+    if (levels.length) log("info", `thinking: ${levels.join(", ")} (forwarded to paseo)`);
+  }
 
   const runId = a.runId ?? a.resume ?? defaultRunId(a);
   let state: RunState;
@@ -726,6 +793,16 @@ export async function main(argv: string[]): Promise<number> {
       updatedAt: new Date().toISOString(),
       tickets: {},
     };
+    // 0.3.0 feedback D1: seed EVERY actionable ticket as `pending` and persist
+    // once BEFORE run.start (and before acquiring the lock) so a run killed
+    // mid-first-ticket leaves a resumable state.json — the prior behaviour only
+    // wrote state on the first settle, so an early kill had no state file and
+    // `--resume` failed. Each ticket transitions to running/done/failed as it
+    // progresses; this is the initial snapshot, not a claim of work done.
+    for (const t of actionable) {
+      state.tickets[t.number] = { status: "pending" };
+    }
+    if (!a.dryRun) await saveState(state, a.cwd);
   }
 
   const seedCompleted = ticketsWithStatus(state, "done");
@@ -760,7 +837,20 @@ export async function main(argv: string[]): Promise<number> {
   // guard + swallow live in the exported stopInFlightAgents() (unit-tested)
   // so a missing agent / optional stopInFlight is a clean no-op, not a
   // swallowed TypeError. Never throws; never blocks the next step.
-  const stopInFlight = () => stopInFlightAgents(agentRef, inflightTickets);
+  const stopInFlight = async (): Promise<void> => {
+    await stopInFlightAgents(agentRef, inflightTickets);
+    // 0.3.0 feedback E1: archive the in-flight agents too, not just stop them —
+    // a stopped-but-not-archived agent is exactly the orphan the leak leaves.
+    // Best-effort; never throws (archiveTicketAgents's contract). Runs on both
+    // the graceful try/finally and the signal/crash path (via RunExit.stop).
+    for (const n of [...inflightTickets]) {
+      try {
+        await archiveTicketAgents(a.cwd, n);
+      } catch {
+        /* best-effort: never block the exit */
+      }
+    }
+  };
   // #40: the exit-path coordinator (stop + flush + release across signal +
   // crash exits). Built + registered once the lock is held; detached in the
   // finally so a later, unrelated signal keeps Node's default behaviour. Null
@@ -790,6 +880,16 @@ export async function main(argv: string[]): Promise<number> {
     const handle = lockHandle;
     guard = new RunExit({
       stop: stopInFlight,
+      // 0.3.0 feedback D3: stamp a terminal run.interrupted event before the
+      // flush so the trace is bounded on Ctrl-C / crash. Sealed with the
+      // in-flight count + signal kind so a reader knows how much was abandoned.
+      // Closure-captures `inflightTickets` by ref (live Set) — reads the count
+      // at fire time, not at construction, so late launches still count.
+      emitInterrupt: () =>
+        events.emit(EVT.RUN_INTERRUPTED, undefined, {
+          inFlight: [...inflightTickets].length,
+          ...(inflightTickets.size ? { tickets: [...inflightTickets] } : {}),
+        }),
       flush: () => events.flush(),
       release: () => handle.release(),
       log,
@@ -803,6 +903,22 @@ export async function main(argv: string[]): Promise<number> {
   // on every exit path.
   let exitCode = 0;
   try {
+    // 0.3.0 feedback E1: reconcile stale Paseo agents from a PREVIOUS crashed
+    // run before this one starts. At run.start no agent of THIS run exists yet,
+    // so every `dag-<n>` agent for a target ticket is a stale orphan (the run
+    // lock guarantees no concurrent dag-tickets on this checkout). Best-effort +
+    // never throws; a failure here must not block the run. Skipped on dry-run
+    // (nothing dispatched → nothing to clean) and on resume (a prior run's
+    // agents are that run's concern, not this resumed one's).
+    if (!a.dryRun && !a.resume) {
+      for (const t of actionable) {
+        try {
+          await archiveTicketAgents(a.cwd, t.number);
+        } catch {
+          /* best-effort: never block run.start */
+        }
+      }
+    }
     events.emit(EVT.RUN_START, undefined, {
       target: describeTarget(a),
       ticketCount: actionable.length,
@@ -825,7 +941,7 @@ export async function main(argv: string[]): Promise<number> {
     // collapses the backoff. Prod leaves it unset → the flag/default stands.
     const ciWatchMs = ciWatchMsFromOpts(a.ciWatchTimeoutMinutes);
     const pullRequest = new ShellPullRequest(a.cwd, ciWatchMs);
-    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events, undefined, stepLogDir);
+    const agent = new PaseoAgent(branch, prefs, a.fallbackProviders, log, a.cwd, agentTimeoutMs(), undefined, events, undefined, stepLogDir, a.thinking, new ProviderHealth());
     agentRef = agent;
     // #29: overlap bookkeeping (head-pushed admits, blocker-settle gates
     // createPr) lives in one coordinator instead of scattered sets/closures in
@@ -929,7 +1045,14 @@ export async function main(argv: string[]): Promise<number> {
         state.tickets[n] = stateFromOutcome(outcome.status, outcome);
         if (!a.dryRun) await saveState(state, a.cwd);
         inflightTickets.delete(n); // settled normally → agent dispatch is done
-        return outcome.status;
+        // 0.3.0 feedback B1 (review follow-up): return the reason + human error
+        // (which carries the fix-loop count trail) so the scheduler stamps them
+        // onto TICKET_END — the machine-readable trace was missing the divergence
+        // shape the feedback asked to surface. A bare status would omit them.
+        const settle: SettleDetail = { status: outcome.status };
+        if (outcome.reason) settle.reason = outcome.reason;
+        if (outcome.error) settle.error = outcome.error;
+        return settle;
       },
       // #20: when a running dependent's blocker settles failed/skipped, kill the
       // dependent's agent dispatch + clean its worktree instead of letting it
@@ -952,6 +1075,18 @@ export async function main(argv: string[]): Promise<number> {
         // genuine error or an unknown-kind skip without scraping `error`.
         state.tickets[n] = stateFromOutcome(status, { ...state.tickets[n], ...(reason ? { skipReason: reason } : {}) });
         if (!a.dryRun) await saveState(state, a.cwd);
+        // 0.3.0 feedback E1: archive every Paseo agent whose worktree belongs to
+        // this ticket (the final agent + every retry/fallback orphan). The git
+        // worktree is reclaimed by cleanBranch; this reclaims the Paseo agent
+        // RECORD so `paseo ls` stays clean. Best-effort, never throws; the
+        // transcript is already captured in the run's logs/ dir.
+        if (!a.dryRun) {
+          try {
+            await archiveTicketAgents(a.cwd, n);
+          } catch {
+            /* best-effort: a settle must not fail on a cleanup error */
+          }
+        }
       },
     });
 
@@ -1057,6 +1192,7 @@ export async function listRuns(cwd?: string): Promise<number> {
         `failed=${count("failed")}`,
         `skipped=${count("skipped")}`,
         `running=${count("running")}`,
+        `pending=${count("pending")}`,
       ].join("\t"),
     });
   }

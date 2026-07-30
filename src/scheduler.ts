@@ -1,6 +1,6 @@
 import type { Graph } from "./graph.ts";
 import { frontier, cascadeDependents, overlapBlockerFor } from "./graph.ts";
-import type { SettleReason, Ticket, TicketStatus } from "./types.ts";
+import type { SettleReason, Ticket, TicketStatus, FailureReason } from "./types.ts";
 import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -19,6 +19,35 @@ export interface BatchResult {
  *  normal (all-blockers-completed) launch. */
 export interface LaunchInfo {
   overlapBlocker?: number;
+}
+
+/** Optional post-mortem detail a `process` callback can return alongside (or
+ *  wrapped around) a {@link TicketStatus}, so the terminal `TICKET_END` event
+ *  carries WHY a ticket settled — not just that it did. 0.3.0 feedback B1
+ *  (review follow-up): the per-round count trail (`r1:2 → r2:5`) and the
+ *  retry-classifiable {@link FailureReason} landed in the failure message and
+ *  `state.json`, but NOT in `events.jsonl`, so the machine-readable trace was
+ *  missing the exact divergence shape the feedback asked to surface. Returning
+ *  this object (instead of a bare status) threads `reason` + `error` onto the
+ *  settle; the raw-status form stays valid for callers with nothing to add.
+ *  Mirrors the cascade path, which already stamps `reason` on its `TICKET_END`. */
+export interface SettleDetail {
+  status: TicketStatus;
+  /** Retry-classifiable failure reason. Present iff `status === "failed"`. */
+  reason?: FailureReason;
+  /** Human detail — for a fix-loop divergence this carries the count trail. */
+  error?: string;
+}
+
+/** A settle as runBatch carries it internally: the {@link SettleDetail} fields
+ *  plus the ticket number, normalised out of whichever form `process` returned.
+ *  Local to the settle loop (not exported) — callers speak {@link SettleDetail}
+ *  or a bare status; this is the scheduler's own bookkeeping shape. */
+interface SettledResult {
+  number: number;
+  status: TicketStatus;
+  reason?: FailureReason;
+  error?: string;
 }
 
 /** Terminal status a cascade propagates from a settled blocker. */
@@ -204,12 +233,13 @@ export async function runBatch(
   graph: Graph,
   opts: {
     concurrency: number;
-    /** Process one ticket -> terminal status. `info` (#29) describes how this
-     *  launch became ready: `overlapBlocker` is set iff the ticket launched via
-     *  frontier relaxation (a blocker still in flight), so the caller can branch
-     *  off the blocker's head + capture its tip for reconcile. Ignored by
-     *  callers that don't model overlap. */
-    process: (number: number, info?: LaunchInfo) => Promise<TicketStatus>;
+    /** Process one ticket -> terminal status (or a {@link SettleDetail} that
+     *  also carries `reason`/`error` for the `TICKET_END` payload). `info` (#29)
+     *  describes how this launch became ready: `overlapBlocker` is set iff the
+     *  ticket launched via frontier relaxation (a blocker still in flight), so
+     *  the caller can branch off the blocker's head + capture its tip for
+     *  reconcile. Ignored by callers that don't model overlap. */
+    process: (number: number, info?: LaunchInfo) => Promise<TicketStatus | SettleDetail>;
     /**
      * Abort an in-flight ticket: stop its agent dispatch and clean its
      * worktree. Called only for a running dependent of a settled
@@ -256,7 +286,7 @@ export async function runBatch(
   // resolution can never win `Promise.race` and re-enter the settle path. (No
   // `aborted` flag is needed — the delete IS the protection; see the abort
   // branch in applyCascade.)
-  const inflight = new Map<number, Promise<{ number: number; status: TicketStatus }>>();
+  const inflight = new Map<number, Promise<SettledResult>>();
   // Resolve once: the event channel is optional on opts (most scheduler tests
   // omit it) but guaranteed from here on — no per-site `?.` below.
   const events = opts.events ?? NULL_SINK;
@@ -305,8 +335,17 @@ export async function runBatch(
     events.emit(EVT.TICKET_START, n);
     const p = Promise.resolve(n)
       .then((nn) => opts.process(nn, info))
-      .then((status) => ({ number: n, status }))
-      .catch(() => ({ number: n, status: "failed" as TicketStatus }));
+      .then((result): SettledResult => {
+        // Accept a bare status OR a SettleDetail carrying reason/error. The
+        // detail is what lets TICKET_END say WHY a ticket settled (0.3.0 B1
+        // review follow-up); a bare status keeps focused scheduler tests green.
+        const detail = typeof result === "string" ? { status: result } : result;
+        const out: SettledResult = { number: n, status: detail.status };
+        if (detail.reason) out.reason = detail.reason;
+        if (detail.error) out.error = detail.error;
+        return out;
+      })
+      .catch((): SettledResult => ({ number: n, status: "failed" as TicketStatus }));
     inflight.set(n, p);
   };
 
@@ -379,6 +418,12 @@ export async function runBatch(
     const endData: Record<string, unknown> = { status: settled.status };
     const started = startedAt.get(settled.number);
     if (started !== undefined) endData.durationMs = Date.now() - started;
+    // 0.3.0 feedback B1 (review follow-up): carry the retry-classifiable reason
+    // + the human error (which holds the fix-loop count trail) onto the terminal
+    // event, so events.jsonl shows the divergence shape the feedback asked to
+    // surface — matching the cascade path, which already stamps `reason`.
+    if (settled.reason) endData.reason = settled.reason;
+    if (settled.error) endData.error = settled.error;
     events.emit(EVT.TICKET_END, settled.number, endData);
     startedAt.delete(settled.number);
     // Persist cascaded dependents after the root cause, so a killed run records

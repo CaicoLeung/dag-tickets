@@ -16,6 +16,25 @@ test("unknown argument still throws regardless of version flag", () => {
   expect(() => parseArgs(["--bogus"])).toThrow(/unknown argument/);
 });
 
+// 0.3.0 review follow-up (Spec #2 edge): --thinking is typed + validated at the
+// edge so an unknown id fails loudly (A1's whole point) instead of being
+// forwarded to `paseo run --thinking <bogus>` and rejected late or silently
+// downgrading reasoning.
+test("--thinking accepts a recognised level", () => {
+  for (const lvl of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+    expect(parseArgs(["--thinking", lvl]).thinking).toBe(lvl);
+  }
+});
+
+test("--thinking rejects an unknown id loudly", () => {
+  expect(() => parseArgs(["--thinking", "bogus"])).toThrow(/--thinking must be one of/);
+  expect(() => parseArgs(["--thinking", "maxim"])).toThrow(/--thinking must be one of/); // typo, not max
+});
+
+test("--thinking defaults to undefined (paseo's provider default applies)", () => {
+  expect(parseArgs([]).thinking).toBeUndefined();
+});
+
 test("--fallback-provider accepts a single provider", () => {
   expect(parseArgs(["--fallback-provider", "claude/sonnet"]).fallbackProviders).toEqual([
     "claude/sonnet",
@@ -288,6 +307,66 @@ test("RunExit.register adds all 4 listeners and detach removes them", () => {
   }
   const after = evs.map((e, i) => process.listenerCount(e) - before[i]!);
   expect(after).toEqual([0, 0, 0, 0]); // detach restored baseline
+});
+
+// 0.3.0 feedback D3 — RunExit emits a terminal run.interrupted event before the
+// flush so an interrupted run leaves a bounded trace (a terminal marker after
+// the last step.*), not an unbounded "in flight" tail.
+test("RunExit SIGINT runs stop→emitInterrupt→flush→release when emitInterrupt is wired", async () => {
+  const calls: string[] = [];
+  const exits: number[] = [];
+  const deps = {
+    stop: async () => {
+      calls.push("stop");
+    },
+    emitInterrupt: () => {
+      calls.push("emitInterrupt");
+    },
+    flush: async () => {
+      calls.push("flush");
+    },
+    release: async () => {
+      calls.push("release");
+    },
+    log: SILENT_LOG,
+    exit: (code: number) => {
+      exits.push(code);
+    },
+  };
+  new RunExit(deps).onSignal("SIGINT");
+  await settled();
+  // emitInterrupt fires AFTER stop (agents gone) and BEFORE flush (lands in trace).
+  expect(calls).toEqual(["stop", "emitInterrupt", "flush", "release"]);
+  expect(exits).toEqual([130]);
+});
+
+test("RunExit emitInterrupt throwing is swallowed — exit still fires", async () => {
+  // A failing event emit must not block the flush/release/exit that follows.
+  const calls: string[] = [];
+  const exits: number[] = [];
+  const deps = {
+    stop: async () => {
+      calls.push("stop");
+    },
+    emitInterrupt: () => {
+      calls.push("emitInterrupt");
+      throw new Error("emit boom");
+    },
+    flush: async () => {
+      calls.push("flush");
+    },
+    release: async () => {
+      calls.push("release");
+    },
+    log: SILENT_LOG,
+    exit: (code: number) => {
+      exits.push(code);
+    },
+  };
+  new RunExit(deps).onUncaught();
+  await settled();
+  expect(calls).toEqual(["stop", "emitInterrupt", "flush", "release"]); // all attempted
+  expect(exits).toEqual([1]); // exit still happened
 });
 
 // 0.2.0 feedback B1 — explicit CLI numbers bypass the routing label gate.

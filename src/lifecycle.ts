@@ -147,10 +147,21 @@ async function runImplementLifecycle(
     );
 
   let rounds = 0;
+  // 0.3.0 feedback B1/B2: the issue-count trail across reviews. Two jobs:
+  //  (a) regression guard — if a fix round produces MORE issues than the prior
+  //      review, the loop is diverging (the dominant 0.3.0 failure mode: 2→3→5).
+  //      Abort immediately instead of spending another round amplifying the
+  //      damage. Terminal — the fix agent can't converge here.
+  //  (b) per-round visibility — the failure message + progress logs name the
+  //      counts so a human sees HOW it diverged, not just "not clean".
+  const trail: number[] = [];
+  const trend = (): string => trail.map((c, i) => `r${i + 1}:${c}`).join(" → ");
   let verdict = await runReview();
+  if (verdict.kind === "issues") trail.push(verdict.issueCount);
   while (verdict.kind === "issues" && rounds < ctx.maxFixRounds) {
     rounds++;
-    ctx.log("info", `review found ${verdict.issueCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
+    const prevCount = verdict.issueCount;
+    ctx.log("info", `review found ${prevCount} issue(s); fix round ${rounds}/${ctx.maxFixRounds}`, t.number);
     const fix = await emitTimedStep(
       ctx,
       "fix",
@@ -161,6 +172,28 @@ async function runImplementLifecycle(
     );
     if (!fix.ok) return fail(t, ctx, { reason: "fix-failed", error: `fix round ${rounds} failed` }, branch, undefined, fix.logPath);
     verdict = await runReview();
+    if (verdict.kind !== "issues") break; // clean or unknown → let the post-loop branch decide
+    trail.push(verdict.issueCount);
+    // B1 regression guard: more issues than we handed the fixer → diverging.
+    if (verdict.issueCount > prevCount) {
+      ctx.log("error", `fix round ${rounds} regressed (${prevCount} → ${verdict.issueCount} issues); aborting fix-loop`, t.number);
+      return fail(
+        t,
+        ctx,
+        { reason: "fix-regression", error: `fix-loop diverged (${trend()})` },
+        branch,
+        undefined,
+        verdict.logPath,
+      );
+    }
+    // B2 improvement gate signal: same count = no progress (diminishing
+    // returns); fewer = converging. Logged so the trend is visible per round;
+    // the maxFixRounds bound still terminates a stuck-but-not-worse loop.
+    if (verdict.issueCount === prevCount) {
+      ctx.log("warn", `fix round ${rounds} made no progress (${prevCount} issues remain)`, t.number);
+    } else {
+      ctx.log("info", `fix round ${rounds} reduced to ${verdict.issueCount} issue(s)`, t.number);
+    }
   }
 
   if (verdict.kind !== "clean") {
@@ -169,8 +202,11 @@ async function runImplementLifecycle(
     // emitted a REVIEW_VERDICT line) — both used to share one `review not
     // clean` message. Both are terminal for the ticket, but the post-mortem
     // reason now tells a human which kind of attention is needed (issue #21).
+    // 0.3.0 B2: the per-round count trail is appended so a failed ticket's
+    // error line shows the convergence shape (e.g. r1:2 → r2:5) at a glance.
     const reason: FailureReason = verdict.kind === "issues" ? "review-issues" : "review-unknown";
-    return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}` }, branch, undefined, verdict.logPath);
+    const trailSuffix = trail.length ? ` [${trend()}]` : "";
+    return fail(t, ctx, { reason, error: `review not clean after ${rounds} round(s): ${verdict.kind}${trailSuffix}` }, branch, undefined, verdict.logPath);
   }
   ctx.log("ok", "review clean; opening PR", t.number);
 

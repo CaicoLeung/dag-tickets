@@ -521,6 +521,39 @@ describe("runBatch — structured event log", () => {
     }
   });
 
+  test("a SettleDetail from process stamps reason + error onto ticket.end (B1 follow-up)", async () => {
+    // 0.3.0 review follow-up (Spec #3): a process callback that returns WHY a
+    // ticket failed (the fix-loop count trail in `error` + the retry-classifiable
+    // `reason`) must land on TICKET_END, not just state.json — so events.jsonl
+    // shows the divergence shape. Mirrors the cascade path, which already stamps
+    // `reason`. A bare status still omits them (additive).
+    const g = buildGraph([ticket(1)]);
+    const sink = new RecordingSink();
+    await runBatch(g, {
+      concurrency: 1,
+      events: sink,
+      process: async () => ({
+        status: "failed",
+        reason: "fix-regression",
+        error: "fix-loop diverged (r1:2 → r2:5)",
+      }),
+    });
+    const end = sink.of(1).find((e) => e.type === EVT.TICKET_END)!;
+    expect(end.data?.status).toBe("failed");
+    expect(end.data?.reason).toBe("fix-regression");
+    expect(end.data?.error).toBe("fix-loop diverged (r1:2 → r2:5)");
+  });
+
+  test("a bare status still emits ticket.end WITHOUT reason/error (back-compat)", async () => {
+    const g = buildGraph([ticket(1)]);
+    const sink = new RecordingSink();
+    await runBatch(g, { concurrency: 1, events: sink, process: async () => "done" });
+    const end = sink.of(1).find((e) => e.type === EVT.TICKET_END)!;
+    expect(end.data?.status).toBe("done");
+    expect(end.data?.reason).toBeUndefined();
+    expect(end.data?.error).toBeUndefined();
+  });
+
   test("a failed ticket cascades ticket.cascade(failed, from=[root]) to dependents", async () => {
     // 1 fails -> 2 (dep on 1) and 3 (dep on 2) cascade. Each must emit
     // ticket.cascade (never ticket.start/ticket.end) with from linking to its
