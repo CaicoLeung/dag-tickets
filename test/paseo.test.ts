@@ -10,6 +10,7 @@ import {
   isRateLimited,
   modelOverrideWarning,
   parseProviderSpec,
+  paseoRunArgs,
   PaseoAgent,
   preflight,
   preflightOk,
@@ -1304,6 +1305,36 @@ describe("parseProviderSpec (A1) — :thinking suffix", () => {
 
 // A1 dispatch forwarding: dispatch() strips the suffix and emits --thinking.
 // Proved with a fake paseo on PATH that records argv.
+//
+// 0.3.0 review follow-up: paseoRunArgs is the shared arg builder extracted so
+// dispatch + preflightProvider can't diverge on the --thinking flag (the exact
+// duplication that let preflight forget it). Tested directly — no spawn — so
+// the invariant is locked for BOTH call sites at once.
+describe("paseoRunArgs (A1 follow-up) — shared arg builder forwards --thinking", () => {
+  const base = { title: "t", slug: "s", waitMs: 60_000 };
+  test("includes --thinking <level> when a thinking level is resolved", () => {
+    const args = paseoRunArgs({ ...base, provider: "pi/zai/glm-5.2", thinking: "max" });
+    expect(args).toEqual([
+      "paseo", "run", "--json",
+      "--provider", "pi/zai/glm-5.2",
+      "--title", "t",
+      "--worktree-slug", "s",
+      "--new-workspace", "worktree",
+      "--wait-timeout", "1m",
+      "--thinking", "max",
+    ]);
+  });
+  test("OMITS --thinking when no level resolved (no silent default from the builder)", () => {
+    const args = paseoRunArgs({ ...base, provider: "codex/gpt-5.4" });
+    expect(args.some((a) => a === "--thinking")).toBe(false);
+  });
+  test("waitMs rounds up to a 1m minimum duration", () => {
+    // a tiny timeout (the e2e suite) still yields >=1m, never 0m / empty.
+    const args = paseoRunArgs({ ...base, provider: "x", waitMs: 5 });
+    expect(args[args.indexOf("--wait-timeout") + 1]).toBe("1m");
+  });
+});
+
 describe("dispatch (A1) — forwards --thinking + strips the suffix", () => {
   const record = (stub: string): { argv: string[]; cwd?: string } => {
     const dir = mkdtempSync(join(tmpdir(), "dag-thinking-"));
@@ -1562,6 +1593,57 @@ describe("PaseoAgent (C1) — backpressure wired into the dispatch loop", () => 
   });
 });
 
+
+// 0.3.0 review follow-up (Spec #1): singleShot was the one dispatch path that
+// skipped ProviderHealth — triage/research could still stampede a hot provider
+// in lockstep with the rest of the run. Now it backs off before dispatch AND
+// marks the provider hot on its own 429 (no fallback loop here, so markHot is
+// called directly instead of via runWithFallback's onRateLimited).
+describe("singleShot (C1 follow-up) — joins cooperative backpressure", () => {
+  /** Minimal fake-clock ProviderHealth: records every sleep so a wait is
+   *  observable without a real timer. Mirrors the fakeHealth helper above but
+   *  local so this block stays self-contained. */
+  function fakeHealth(cooldownMs = 60_000) {
+    const sleeps: number[] = [];
+    let t = 1_000;
+    const h = new ProviderHealth(
+      () => t,
+      async (ms) => {
+        sleeps.push(ms);
+        t += ms;
+      },
+      () => 0.5,
+      cooldownMs,
+      90_000,
+      5_000,
+    );
+    return { h, sleeps };
+  }
+
+  test("backs off before dispatch when the provider is hot, then re-marks it on a 429", async () => {
+    const { h, sleeps } = fakeHealth();
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: false, output: "HTTP 429 Too Many Requests", timedOut: false, rateLimited: true, connectionError: false }];
+    // a peer just 429'd triage's provider → it's hot
+    h.markRateLimited(PREFS.triage);
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, NULL_SINK, async () => {}, undefined, undefined, h);
+    await a.singleShot("triage", ticket(41), "b41", "main");
+    // waitIfHot fired before the dispatch (peer's cooldown backed it off)
+    expect(sleeps.length).toBe(1);
+    // its own 429 re-marked the provider hot for the NEXT peer
+    expect(h.isHot(PREFS.triage)).toBe(true);
+  });
+
+  test("does NOT wait when the provider is cold, and does NOT mark on success", async () => {
+    const { h, sleeps } = fakeHealth();
+    const d = new ScriptedDispatcher();
+    d.queue = [{ ok: true, output: "done", timedOut: false, rateLimited: false, connectionError: false }];
+    const a = new PaseoAgent(new FakeBranch(), PREFS, [], NOOP_LOG, undefined, 1000, d, NULL_SINK, async () => {}, undefined, undefined, h);
+    await a.singleShot("research", ticket(42), "b42", "main");
+    expect(sleeps).toEqual([]); // never hot → never waited
+    expect(h.isHot(PREFS.research)).toBe(false); // succeeded → never marked
+  });
+});
 
 describe("preflight (A2) — provider reachability gate", () => {
   test("checks each distinct provider once (dedupes primary reappearing as fallback)", async () => {

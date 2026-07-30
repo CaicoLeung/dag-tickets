@@ -172,6 +172,15 @@ export interface AgentPort {
 // Dispatcher — the Paseo dispatch seam
 // ---------------------------------------------------------------------------
 
+/** The thinking-level ids `paseo run --thinking <id>` accepts AND that may ride a
+ *  `:thinking` suffix on a provider spec. Defined here (beside
+ *  {@link DispatchOpts}, its consumer) as a TYPE; the runtime validation set
+ *  (`THINKING_LEVELS`) + the parse live in paseo.ts. Typing the field means a
+ *  typo in a thinking id is a compile error at every dispatch site, and the
+ *  CLI can reject an unknown `--thinking` value at parse time — both stop the
+ *  silent-downgrade class that was 0.3.0 feedback A1's root cause. */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 /** Options for one Paseo agent run. Mirrors `paseo run` flags. */
 export interface DispatchOpts {
   provider: string;
@@ -201,7 +210,7 @@ export interface DispatchOpts {
    *  is parsed inside `dispatch()` itself, so callers normally leave this unset
    *  and just pass `provider/model:thinking`. Absent both → paseo's provider
    *  default applies (unchanged behaviour). */
-  thinking?: string;
+  thinking?: ThinkingLevel;
 }
 
 /** Result of one Paseo agent dispatch. */

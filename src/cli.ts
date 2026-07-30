@@ -1,7 +1,7 @@
 import { buildGraph, CycleError } from "./graph.ts";
-import { runBatch } from "./scheduler.ts";
+import { runBatch, type SettleDetail } from "./scheduler.ts";
 import { processTicket, type OverlapContext, type RunContext } from "./lifecycle.ts";
-import { loadPrefs, PaseoAgent, parseProviderSpec, ProviderHealth, archiveTicketAgents, isDagWorktreeSegment, modelOverrideWarning, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary } from "./paseo.ts";
+import { loadPrefs, PaseoAgent, parseProviderSpec, ProviderHealth, archiveTicketAgents, isDagWorktreeSegment, isThinkingLevel, modelOverrideWarning, type ProviderPrefs, preflight, preflightProvider, preflightOk, preflightSummary } from "./paseo.ts";
 import { runWithRetry, isTransient } from "./retry.ts";
 import { DEFAULT_ROUTING, type RoutingConfig } from "./config.ts";
 import {
@@ -10,6 +10,7 @@ import {
   fetchIssues,
 } from "./discover.ts";
 import { branchFor, ensureMergedBase, mergedReference, repoInfo, ShellBranch, ShellPullRequest } from "./gitgh.ts";
+import type { ThinkingLevel } from "./ports.ts";
 import { remoteRef, type Logger, type MergeStrategy } from "./ports.ts";
 import type { FailureReason, SettleReason, Ticket, TicketKind, TicketStatus } from "./types.ts";
 import { loadState, saveState, ticketsWithStatus, type RunState, type TicketState } from "./state.ts";
@@ -99,8 +100,10 @@ interface ParsedArgs {
   reviewProvider?: string;
   /** 0.3.0 feedback A1: thinking level forwarded to every dispatch as
    *  `paseo run --thinking <id>`, overriding any `:thinking` suffix baked
-   *  into a provider string. */
-  thinking?: string;
+   *  into a provider string. Typed ({@link ThinkingLevel}) + validated at parse
+   *  time so an unknown id fails loudly (A1's whole point) instead of being
+   *  forwarded to paseo and rejected late. */
+  thinking?: ThinkingLevel;
   cwd?: string;
   runId?: string;
   resume?: string;
@@ -275,8 +278,21 @@ export function parseArgs(argv: string[]): ParsedArgs {
         a.provider = next(); break;
       case "--review-provider":
         a.reviewProvider = next(); break;
-      case "--thinking":
-        a.thinking = next(); break;
+      case "--thinking": {
+        // 0.3.0 feedback A1: validate at the edge. An unknown id here would be
+        // forwarded to `paseo run --thinking <bogus>` and rejected late (or, if
+        // paseo ever tolerated it, silently downgrade reasoning) — exactly the
+        // silent-intent class A1 exists to kill. Fail loud, like `--provider`
+        // auth fails loud at preflight.
+        const v = next();
+        if (!v || !isThinkingLevel(v)) {
+          throw new Error(
+            `--thinking must be one of off|minimal|low|medium|high|xhigh|max; got "${v ?? "(missing)"}"`,
+          );
+        }
+        a.thinking = v;
+        break;
+      }
       case "--fallback-provider":
         a.fallbackProviders.push(...(next()?.split(",").map((s) => s.trim()).filter(Boolean) ?? [])); break;
       case "--impl-label":
@@ -677,7 +693,12 @@ export async function main(argv: string[]): Promise<number> {
       ...a.fallbackProviders,
     ];
     log("info", `preflight: checking ${new Set(preflightProviders.filter(Boolean)).size} provider(s)`);
-    const results = await preflight(preflightProviders, (p) => preflightProvider(p, a.cwd));
+    // 0.3.0 feedback A1 (review follow-up): forward the --thinking override so
+    // preflight exercises the SAME (provider, thinking) the real dispatches use.
+    // Previously preflight parsed the provider-string suffix but ignored the
+    // override, so a `--thinking max` run preflighted at the default while every
+    // real dispatch ran at max — hiding the regression A1 exists to surface.
+    const results = await preflight(preflightProviders, (p) => preflightProvider(p, a.cwd, undefined, a.thinking));
     if (!preflightOk(results)) {
       process.stderr.write(
         `Preflight failed — aborting before run.start:\n  ${preflightSummary(results)}\nFix the provider/auth (e.g. codex login / API key) and re-run.\n`,
@@ -1024,7 +1045,14 @@ export async function main(argv: string[]): Promise<number> {
         state.tickets[n] = stateFromOutcome(outcome.status, outcome);
         if (!a.dryRun) await saveState(state, a.cwd);
         inflightTickets.delete(n); // settled normally → agent dispatch is done
-        return outcome.status;
+        // 0.3.0 feedback B1 (review follow-up): return the reason + human error
+        // (which carries the fix-loop count trail) so the scheduler stamps them
+        // onto TICKET_END — the machine-readable trace was missing the divergence
+        // shape the feedback asked to surface. A bare status would omit them.
+        const settle: SettleDetail = { status: outcome.status };
+        if (outcome.reason) settle.reason = outcome.reason;
+        if (outcome.error) settle.error = outcome.error;
+        return settle;
       },
       // #20: when a running dependent's blocker settles failed/skipped, kill the
       // dependent's agent dispatch + clean its worktree instead of letting it

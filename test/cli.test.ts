@@ -16,6 +16,25 @@ test("unknown argument still throws regardless of version flag", () => {
   expect(() => parseArgs(["--bogus"])).toThrow(/unknown argument/);
 });
 
+// 0.3.0 review follow-up (Spec #2 edge): --thinking is typed + validated at the
+// edge so an unknown id fails loudly (A1's whole point) instead of being
+// forwarded to `paseo run --thinking <bogus>` and rejected late or silently
+// downgrading reasoning.
+test("--thinking accepts a recognised level", () => {
+  for (const lvl of ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) {
+    expect(parseArgs(["--thinking", lvl]).thinking).toBe(lvl);
+  }
+});
+
+test("--thinking rejects an unknown id loudly", () => {
+  expect(() => parseArgs(["--thinking", "bogus"])).toThrow(/--thinking must be one of/);
+  expect(() => parseArgs(["--thinking", "maxim"])).toThrow(/--thinking must be one of/); // typo, not max
+});
+
+test("--thinking defaults to undefined (paseo's provider default applies)", () => {
+  expect(parseArgs([]).thinking).toBeUndefined();
+});
+
 test("--fallback-provider accepts a single provider", () => {
   expect(parseArgs(["--fallback-provider", "claude/sonnet"]).fallbackProviders).toEqual([
     "claude/sonnet",

@@ -15,6 +15,7 @@ import type {
   Logger,
   ReconcileResult,
   StepResult,
+  ThinkingLevel,
 } from "./ports.ts";
 import { normalizeBase, remoteRef, withLog } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
@@ -144,10 +145,34 @@ const DEFAULT_RUN_MS = 60 * 60 * 1000; // 60 min per agent run
  * runtime) so a typo in a provider string fails loudly at preflight instead of
  * silently running at the default thinking level — the exact silent-intent
  * violation the feedback reported. Add a level here when paseo grows one.
+ *
+ * Kept as `ReadonlySet<string>` (not `ReadonlySet<ThinkingLevel>`) so the
+ * {@link isThinkingLevel} guard can call `.has` with an arbitrary string and
+ * NARROW it — the type-level enforcement lives on the typed consumers
+ * (`DispatchOpts.thinking`, `ProviderSpec.thinking`, `thinkingOverride`), not
+ * on this runtime lookup set.
  */
 export const THINKING_LEVELS: ReadonlySet<string> = Object.freeze(
   new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
 );
+
+/** Type guard: is `s` a recognised {@link ThinkingLevel}? The single boundary
+ *  between the runtime vocabulary ({@link THINKING_LEVELS}) and the typed
+ *  consumers — used by {@link parseProviderSpec} (to decide whether a suffix is
+ *  a thinking id) and by the CLI (to reject an unknown `--thinking` at parse
+ *  time, loudly, instead of forwarding a bogus id to paseo). */
+export const isThinkingLevel = (s: string): s is ThinkingLevel => THINKING_LEVELS.has(s);
+
+/** A provider spec split into its dispatch-ready pieces — the natural home for
+ *  the `provider` + `thinking` pair that otherwise travels as a clump through
+ *  {@link DispatchOpts} and the cli wiring (the Data-Clump smell the 0.3.0
+ *  review flagged). {@link parseProviderSpec} is the single producer; dispatch /
+ *  preflight are the consumers. `thinking` is present iff the spec carried a
+ *  recognised `:thinking` suffix. */
+export interface ProviderSpec {
+  provider: string;
+  thinking?: ThinkingLevel;
+}
 
 /**
  * Parse a provider spec of the form `provider/model[:thinking]` into its
@@ -177,17 +202,14 @@ export const THINKING_LEVELS: ReadonlySet<string> = Object.freeze(
  * Pure + exported so the parse rule is unit-tested directly, independent of
  * dispatch / preflight / the agent adapter that all consume it.
  */
-export function parseProviderSpec(spec: string): {
-  provider: string;
-  thinking?: string;
-} {
+export function parseProviderSpec(spec: string): ProviderSpec {
   const colon = spec.lastIndexOf(":");
   if (colon <= 0) return { provider: spec }; // no colon, or leading colon — not a thinking suffix
   const suffix = spec.slice(colon + 1);
   // Reject empty suffix / suffixes with a slash (a port-ish or path-ish token,
   // never a thinking id) so `host:8080`-style strings stay intact.
   if (!suffix || suffix.includes("/")) return { provider: spec };
-  if (!THINKING_LEVELS.has(suffix)) return { provider: spec }; // unrecognised — leave intact
+  if (!isThinkingLevel(suffix)) return { provider: spec }; // unrecognised — leave intact
   return { provider: spec.slice(0, colon), thinking: suffix };
 }
 
@@ -206,6 +228,45 @@ const paseoLogPollMs = (): number => Number(process.env.DAG_PASEO_LOG_POLL_MS ??
 function msToDuration(ms: number): string {
   const m = Math.max(1, Math.round(ms / 60000));
   return m >= 60 ? `${Math.round(m / 60)}h` : `${m}m`;
+}
+
+/** The shared core of every `paseo run` argv: the flags every dispatch sends
+ *  (run / --json / --provider / --title / --worktree-slug / --new-workspace /
+ *  --wait-timeout) PLUS the `--thinking` forwarding 0.3.0 feedback A1 added.
+ *
+ *  Centralising the `--thinking` push here is the structural fix for the A1
+ *  root cause: that bug was duplicated arg-building where `preflightProvider`
+ *  forgot the flag `dispatch` had. With both callers building off this helper,
+ *  a future dispatch path can't silently drop `--thinking` the way preflight
+ *  once did — the flag lands iff the caller resolved a thinking level. Each
+ *  caller appends its own specifics (mode / branch flags / prompt) after.
+ *  Exported so the arg-construction invariant (`--thinking` present iff a level
+ *  resolved) is unit-testable without spawning `paseo run` — covering BOTH
+ *  call sites (dispatch + preflight) via the one shared builder. */
+export function paseoRunArgs(base: {
+  provider: string;
+  title: string;
+  slug: string;
+  waitMs: number;
+  thinking?: ThinkingLevel;
+}): string[] {
+  const args = [
+    "paseo",
+    "run",
+    "--json",
+    "--provider",
+    base.provider,
+    "--title",
+    base.title,
+    "--worktree-slug",
+    base.slug,
+    "--new-workspace",
+    "worktree",
+    "--wait-timeout",
+    msToDuration(base.waitMs),
+  ];
+  if (base.thinking) args.push("--thinking", base.thinking);
+  return args;
 }
 
 const RATE_LIMIT_RE = /\b429\b|usage limit reached|rate[ -]?limit|quota|too many requests/i;
@@ -373,23 +434,14 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   // running at medium.
   const { provider: providerSpec, thinking: parsedThinking } = parseProviderSpec(opts.provider);
   const thinking = opts.thinking ?? parsedThinking;
-  const args = [
-    "paseo",
-    "run",
-    "--json",
-    "--provider",
-    providerSpec,
-    "--title",
-    opts.title,
-    "--worktree-slug",
-    opts.slug,
-    "--new-workspace",
-    "worktree",
-    "--wait-timeout",
-    msToDuration(waitMs),
-  ];
+  const args = paseoRunArgs({
+    provider: providerSpec,
+    title: opts.title,
+    slug: opts.slug,
+    waitMs,
+    thinking,
+  });
   if (opts.mode) args.push("--mode", opts.mode);
-  if (thinking) args.push("--thinking", thinking);
   if (opts.branchMode === "branch-off") {
     args.push("--worktree-mode", "branch-off");
     if (opts.newBranch) args.push("--new-branch", opts.newBranch);
@@ -661,34 +713,36 @@ Run /${skill} for this issue. When finished, post any required comment/output on
  *  stable-log polling (we only care whether the dispatch completed), a short
  *  wall budget, and a `dag-preflight-<provider>` slug so a leftover preflight
  *  agent is recognisable. Never throws — the outcome is reported, not raised.
+ *
+ * 0.3.0 feedback A1 (review follow-up): `thinking` is the `--thinking` CLI
+ *  override, threaded here so preflight exercises the SAME (provider, thinking)
+ *  the real dispatches use. Previously preflight parsed the provider-string
+ *  suffix but ignored the override — so `--thinking max` ran at max in every
+ *  dispatch but at the default in preflight, hiding the very regression A1
+ *  exists to surface. The override wins over a parsed suffix, mirroring
+ *  {@link dispatch}'s `opts.thinking ?? parsedThinking` precedence.
  */
 export async function preflightProvider(
   provider: string,
   cwd?: string,
   timeoutMs = 60_000,
+  thinking?: ThinkingLevel,
 ): Promise<{ ok: boolean; error?: string }> {
   // 0.3.0 feedback A1 / D5: parse the `:thinking` suffix off the provider spec
   // so preflight exercises the SAME (provider, thinking) the real dispatches
   // use. A spec whose `:max` would have been silently dropped now fails fast at
   // preflight (or, once forwarded, runs at max) instead of cascading for 68min.
-  const { provider: providerSpec, thinking } = parseProviderSpec(provider);
+  const parsed = parseProviderSpec(provider);
+  // Override wins over the parsed suffix — same precedence as dispatch().
+  const effective = thinking ?? parsed.thinking;
   const slug = `dag-preflight-${provider.replace(/[^a-z0-9]+/gi, "-").slice(0, 30)}`;
-  const args = [
-    "paseo",
-    "run",
-    "--json",
-    "--provider",
-    providerSpec,
-    "--title",
-    "dag-tickets preflight",
-    "--worktree-slug",
+  const args = paseoRunArgs({
+    provider: parsed.provider,
+    title: "dag-tickets preflight",
     slug,
-    "--new-workspace",
-    "worktree",
-    "--wait-timeout",
-    msToDuration(timeoutMs),
-  ];
-  if (thinking) args.push("--thinking", thinking);
+    waitMs: timeoutMs,
+    thinking: effective,
+  });
   args.push("ping");
   const r = await run(args, { cwd, timeoutMs: timeoutMs + 60_000 });
   if (r.timedOut) return { ok: false, error: "preflight timed out" };
@@ -913,7 +967,7 @@ export class PaseoAgent implements AgentPort {
      *  into a provider string (dispatch honours opts.thinking before parsing).
      *  Absent → each provider's own `:thinking` suffix (or paseo's default)
      *  applies, so impl/review/fallback can each carry their own level. */
-    private readonly thinkingOverride?: string,
+    private readonly thinkingOverride?: ThinkingLevel,
     /** 0.3.0 feedback C1: run-wide shared provider-rate-limit health. When one
      *  ticket's dispatch detects a 429 on a provider, peers about to dispatch on
      *  the SAME provider back off (waitIfHot) instead of stampeding it in
@@ -1135,6 +1189,13 @@ export class PaseoAgent implements AgentPort {
       this.log("warn", `could not fetch ${remoteRef(base)} (offline?); failing ${skill} to avoid a stale branch-off`, t.number);
       return { ok: false, timedOut: false, rateLimited: false };
     }
+    // 0.3.0 feedback C1 (review follow-up): singleShot was the one dispatch
+    // path that skipped cooperative backpressure — triage/research could still
+    // stampede glm/deepseek in lockstep with the rest of the run. Back off like
+    // implement/review/fix do when a peer just 429'd this provider. (The fallback
+    // loop callers pass markHot as runWithFallback's onRateLimited; singleShot
+    // has no loop, so the post-dispatch mark below is its equivalent.)
+    await this.health?.waitIfHot(provider);
     const r = await this.dispatcher.dispatch(singleShotPrompt(skill, t), {
       provider,
       title: `${skill} #${t.number}`,
@@ -1147,6 +1208,9 @@ export class PaseoAgent implements AgentPort {
       logFile: this.logFileFor(t.number, skill),
       thinking: this.thinkingOverride,
     });
+    // C1: feed the shared health so a peer about to use the same provider backs
+    // off. No-op when not rate-limited or when no health is wired (unit tests).
+    if (r.rateLimited) this.markHot(provider);
     // 0.2.0 feedback D1: single-shot tickets (triage/research) create their own
     // worktree too — print its path so an operator can find it post-run, the
     // same way implement-kind tickets do.
