@@ -13,7 +13,7 @@ import type {
   ReconcileResult,
   StepResult,
 } from "./ports.ts";
-import { normalizeBase, remoteRef } from "./ports.ts";
+import { normalizeBase, remoteRef, throwIfAborted } from "./ports.ts";
 import { parseReviewVerdict } from "./parse.ts";
 import { EVT } from "./events.ts";
 import { NULL_SINK } from "./ports.ts";
@@ -176,7 +176,7 @@ export async function dispatch(prompt: string, opts: DispatchOpts): Promise<Disp
   }
   args.push(prompt);
 
-  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs) });
+  const r = await run(args, { cwd: opts.cwd, timeoutMs: waitMs + dispatchGraceMs(waitMs), signal: opts.signal });
   let status = r.ok ? "completed" : "failed";
   let output = r.stdout;
   if (r.ok) {
@@ -531,9 +531,11 @@ export class PaseoAgent implements AgentPort {
   }
 
   async implement(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ImplResult> {
-    // #34: observe the signal at the agent dispatch seam — an already-aborted
-    // signal returns a cancelled outcome without issuing further agent work.
-    if (signal?.aborted) return { ok: false, commits: 0, reason: "failed" };
+    // #34: an aborted dispatch is a cancellation, not an implement-failure —
+    // throw the one abort shape so it unwinds to the scheduler's dispatch
+    // wrapper (→ skipped sentinel). Never returns a synthetic {ok:false}, which
+    // the lifecycle would mislog as "implement agent failed".
+    throwIfAborted(signal);
     const baseRef = await this.resolveBranchOffBase(base);
     if (baseRef === null) {
       // Failing beats a silent stale branch-off: a dependent composing on
@@ -552,6 +554,7 @@ export class PaseoAgent implements AgentPort {
         branchMode: "branch-off",
         newBranch: branch,
         base: baseRef,
+        signal,
       },
       this.fallbacks,
       async (next) => {
@@ -562,6 +565,11 @@ export class PaseoAgent implements AgentPort {
         await this.branch.deleteBranch(branch);
       },
     );
+    // #34: the spawn respects the forwarded signal, so an abort mid-dispatch
+    // kills the proc and `r` resolves !ok — re-check the signal before
+    // classifying so a cancelled dispatch throws (→ skipped) instead of
+    // surfacing as a spurious implement-failed.
+    throwIfAborted(signal);
     if (!r.ok) {
       return {
         ok: false,
@@ -621,9 +629,9 @@ export class PaseoAgent implements AgentPort {
   }
 
   async singleShot(skill: string, t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<StepResult> {
-    // #34: observe the signal at the agent dispatch seam — an already-aborted
-    // signal returns a cancelled outcome without issuing further agent work.
-    if (signal?.aborted) return { ok: false, timedOut: false, rateLimited: false };
+    // #34: an aborted dispatch is a cancellation — throw (see implement) so it
+    // unwinds to the scheduler's skipped sentinel rather than a synthetic fail.
+    throwIfAborted(signal);
     const provider = skill === "research" ? this.prefs.research : this.prefs.triage;
     const baseRef = await this.resolveBranchOffBase(base);
     if (baseRef === null) {
@@ -639,7 +647,11 @@ export class PaseoAgent implements AgentPort {
       branchMode: "branch-off",
       newBranch: branch,
       base: baseRef,
+      signal,
     });
+    // #34: re-check after the spawn (which respects the forwarded signal) so a
+    // cancelled dispatch throws (→ skipped) instead of returning a synthetic fail.
+    throwIfAborted(signal);
     return { ok: r.ok, timedOut: r.timedOut, rateLimited: r.rateLimited };
   }
 

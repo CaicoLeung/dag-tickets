@@ -1033,14 +1033,15 @@ describe("runBatch — AbortController sentinel (#34)", () => {
     const n = 42;
     const p = Promise.resolve(n)
       .then(async (nn) => {
-        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
-        // A superseded dispatch whose process still finishes with "done" — the
-        // worst case the sentinel protects against.
+        // No pre-check: process always runs, then the post-check converts a
+        // superseded dispatch (controller aborted) to the skipped sentinel.
         const status = await Promise.resolve("done" as TicketStatus);
-        if (controller.signal.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
         return { number: n, status };
       })
-      .catch((e) => {
+      .catch(() => {
+        // Gate on the controller, not the exception: only THIS dispatch's
+        // cascade-abort maps to skipped; a genuine failure stays failed.
         if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
         return { number: n, status: "failed" as TicketStatus };
       });

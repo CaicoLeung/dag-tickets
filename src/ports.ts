@@ -59,6 +59,16 @@ export const NULL_SINK: EventSink = Object.freeze({
   emit() {},
 });
 
+/** #34: throw AbortError iff `signal` is aborted. The single construction site
+ *  for the AbortError this system uses — lives in the seam (ports.ts) so both
+ *  the lifecycle orchestrator and the agent adapter share one helper instead
+ *  of rebuilding the DOMException inline (dedupes the checkpoint throws flagged
+ *  in review). A thrown AbortError unwinds to the scheduler's dispatch wrapper,
+ *  which resolves the dispatch to the skipped sentinel. */
+export function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+}
+
 export interface CheckResult {
   /** "pass" | "fail" | "none" (no CI configured). */
   state: "pass" | "fail" | "none";
@@ -110,8 +120,12 @@ export interface StepResult {
  */
 export interface AgentPort {
   /** Run /implement in a fresh worktree branched off `base`. Verifies commits landed.
-   *  `signal` (#34): when aborted, the dispatch returns a cancelled outcome
-   *  without issuing further agent work. */
+   *  `signal` (#34): forwarded into the spawned `paseo run` so an in-flight
+   *  abort interrupts it; when aborted (at entry or after the spawn) the
+   *  adapter throws AbortError, which the scheduler's dispatch wrapper
+   *  resolves to the skipped sentinel. This param is the cross-seam transport
+   *  of the signal (the adapter can't see RunContext) — distinct from
+   *  RunContext.signal, the lifecycle's internal source. */
   implement(t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<ImplResult>;
   /** Run /code-review on `branch` against `base`. Returns the parsed verdict. */
   review(t: Ticket, branch: string, base: string): Promise<ReviewVerdict>;
@@ -119,8 +133,9 @@ export interface AgentPort {
    *  `round` (1-based) disambiguates repeated fix passes in the agent UI. */
   fix(t: Ticket, verdict: ReviewVerdict, branch: string, round: number): Promise<StepResult>;
   /** Single-shot skill (triage/research) in a fresh worktree — no PR.
-   *  `signal` (#34): when aborted, returns a cancelled outcome without
-   *  issuing further agent work. */
+   *  `signal` (#34): forwarded into the spawned `paseo run` so an in-flight
+   *  abort interrupts it; when aborted the adapter throws AbortError (→ the
+   *  scheduler's skipped sentinel), like `implement`. */
   singleShot(skill: string, t: Ticket, branch: string, base: string, signal?: AbortSignal): Promise<StepResult>;
   /** Human-readable provider that would serve this skill (dry-run display only). */
   providerLabel(skill: "implement" | "review" | "triage" | "research"): string;
@@ -177,6 +192,10 @@ export interface DispatchOpts {
   base?: string;
   /** checkout-branch: existing branch to check out. */
   branch?: string;
+  /** #34: aborting the signal interrupts the spawned `paseo run` so an
+   *  in-flight dispatch is actually stopped (not just entry-gated at the
+   *  adapter). Optional — callers that don't model cancellation omit it. */
+  signal?: AbortSignal;
 }
 
 /** Result of one Paseo agent dispatch. */

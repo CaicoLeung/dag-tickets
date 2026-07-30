@@ -767,8 +767,14 @@ export async function main(argv: string[]): Promise<number> {
           typeof priorAttempts === "number" && isTransient(prior?.reason)
             ? priorAttempts + 1
             : undefined;
+        // #34: carry the per-launch AbortSignal on the ticket's RunContext.
+        // Merged into a per-ticket copy (the shared `ctx` is reused across
+        // concurrent tickets and must not carry one ticket's signal). This is
+        // the ONE way the signal enters the lifecycle — RunContext.signal —
+        // not also a 4th processTicket param.
+        const ticketCtx: RunContext = { ...ctx, signal: info?.signal };
         const outcome = await runWithRetry(
-          () => processTicket(t, ctx, overlap, info?.signal),
+          () => processTicket(t, ticketCtx, overlap),
           {
             maxRetries: a.maxTicketRetries,
             baseDelayMs: retryBaseMs(),

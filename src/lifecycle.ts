@@ -3,7 +3,7 @@ import { routingRuleFor } from "./config.ts";
 import type { AgentPort, EventSink, ImplFailReason, Logger, MergeStrategy, PullRequestPort } from "./ports.ts";
 import { branchFor } from "./gitgh.ts";
 import { EVT } from "./events.ts";
-import { ABORT_ERROR } from "./scheduler.ts";
+import { throwIfAborted } from "./ports.ts";
 
 /**
  * Everything the lifecycle needs to drive one Ticket. The orchestrator touches
@@ -35,8 +35,12 @@ export interface RunContext {
    *  so reconcile lands on the merged base (no premature PR). Absent in tests /
    *  when overlap is disabled. */
   waitForBlockers?: (blockers: number[]) => Promise<void>;
-  /** #34: per-launch AbortSignal exposed at every side-effect boundary so
-   *  callers discover the signal without tracing the full parameter chain. */
+  /** #34: per-launch AbortSignal — the SINGLE source every side-effect
+   *  boundary in the lifecycle discovers (post-blocker-wait, reconcile,
+   *  createPr, mergePr, singleShot). Threaded one way: the caller merges it
+   *  onto a per-ticket RunContext copy (the shared ctx is never mutated with
+   *  a per-ticket signal); it is NOT also passed as a separate `processTicket`
+   *  param. */
   signal?: AbortSignal;
 }
 
@@ -74,29 +78,24 @@ export async function processTicket(
   t: Ticket,
   ctx: RunContext,
   overlap?: OverlapContext,
-  /** #34: per-launch AbortSignal so the lifecycle can observe cancellation
-   *  at every side-effect boundary (post-blocker-wait, reconcile, createPr,
-   *  mergePr, closeIssue). */
-  signal?: AbortSignal,
 ): Promise<TicketOutcome> {
-  // #34: expose the signal on RunContext so every side-effect boundary can
-  // discover it without tracing the full parameter chain (spec). Merged
-  // locally — the caller's ctx is shared across tickets and must not be
-  // mutated with a per-ticket signal.
-  const runCtx: RunContext = { ...ctx, signal };
+  // #34: the per-launch AbortSignal arrives on `ctx.signal` (the caller merges
+  //  it onto a per-ticket RunContext copy — see RunContext.signal). Read here
+  //  from ctx, not a 4th param: RunContext.signal is the single source every
+  //  side-effect boundary discovers, so the signal is threaded one way.
   const rule = routingRuleFor(t.kind);
   if (t.kind === "skip") {
-    runCtx.log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
+    ctx.log("info", `intentional skip — [${t.labels.join(", ")}] is for a human / interactive /triage, not a batch agent`, t.number);
     return { status: "skipped", error: "intentional-skip" };
   }
   if (t.kind === "unknown" || !rule.skill) {
-    runCtx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
+    ctx.log("warn", `no routing rule for labels [${t.labels.join(", ")}] — skipping`, t.number);
     return { status: "skipped", error: "unknown-kind" };
   }
 
-  if (runCtx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, runCtx);
-  if (rule.expectPr) return runImplementLifecycle(t, runCtx, overlap);
-  return runSingleShot(t, rule.skill, runCtx);
+  if (ctx.dryRun) return dryRunPlan(t, rule.skill, rule.expectPr, ctx);
+  if (rule.expectPr) return runImplementLifecycle(t, ctx, overlap);
+  return runSingleShot(t, rule.skill, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +188,7 @@ async function runImplementLifecycle(
   if (ctx.waitForBlockers) await ctx.waitForBlockers(t.blockedBy);
   // #34: after the potentially long blocker wait the dispatch may have been
   // superseded — check before any further side effects (reconcile, createPr).
-  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
+  throwIfAborted(ctx.signal);
 
   // #29 (pull-model reconcile): before opening a PR, land an overlapped
   // dependent onto the merged integration base. Safe here — between dispatches,
@@ -220,7 +219,7 @@ async function runImplementLifecycle(
 
   // 3. PR.
   // #34: check before side effects — a superseded dispatch must not create a PR.
-  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
+  throwIfAborted(ctx.signal);
   const pr = await ctx.pullRequest.createPr({
     title: `${t.title} (#${t.number})`,
     body: prBody(t),
@@ -252,7 +251,7 @@ async function runImplementLifecycle(
     return { status: "done", branch, pr, rounds };
   }
   // #34: check before merge — a superseded dispatch must not merge.
-  if (ctx.signal?.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
+  throwIfAborted(ctx.signal);
   try {
     await ctx.pullRequest.mergePr(pr, ctx.mergeStrategy);
     ctx.events.emit(EVT.MERGE, t.number, { strategy: ctx.mergeStrategy, ok: true });
@@ -270,10 +269,12 @@ async function runImplementLifecycle(
 }
 
 async function runSingleShot(t: Ticket, skill: string, ctx: RunContext): Promise<TicketOutcome> {
-  // #34: short-circuit single-shot dispatches when the signal is already
-  // aborted — the spec requires lifecycle side-effect checkpoints treat an
-  // aborted signal as a no-side-effect return (acceptance criterion).
-  if (ctx.signal?.aborted) return { status: "skipped", error: ABORT_ERROR.message };
+  // #34: an aborted single-shot dispatch is a cancellation, NOT a domain skip
+  // (siblings `intentional-skip` / `unknown-kind`). Throw the one abort shape
+  // so the scheduler's dispatch wrapper resolves it to the skipped sentinel —
+  // keeping the internal plumbing string out of user-facing TicketOutcome.error
+  // and making the abort event identical to runImplementLifecycle's checkpoints.
+  throwIfAborted(ctx.signal);
   const branch = branchFor(t.number, `${t.title}-shot`);
   ctx.log("info", `${skill} (single-shot)`, t.number);
   const r = await emitTimedStep(

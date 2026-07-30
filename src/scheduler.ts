@@ -5,14 +5,6 @@ import { EVT } from "./events.ts";
 import type { EventSink } from "./ports.ts";
 import { NULL_SINK } from "./ports.ts";
 
-/** #34: single source for the AbortError name + message used by the scheduler's
- *  dispatch AbortController and the lifecycle's side-effect checkpoints.
- *  Prevents the 5× duplication flagged in code review. */
-export const ABORT_ERROR = {
-  name: "AbortError" as const,
-  message: "The operation was aborted" as const,
-};
-
 export interface BatchResult {
   completed: number[];
   failed: number[];
@@ -135,6 +127,17 @@ export interface CascadeHooks {
   events: EventSink;
 }
 
+/** Minimal in-flight dispatch-map surface {@link applyCascadePlan} consumes
+ *  (`.has` + `.delete`). Defined structurally so the pure planner/applier
+ *  doesn't import the dispatch value type (`{promise, controller}`) that lives
+ *  inside {@link runBatch}: the call site passes its `Map<number, …>` directly
+ *  with no cast (removes the `as Map<number, unknown>` leakage flagged in
+ *  review). */
+export interface InflightDispatchMap {
+  has(n: number): boolean;
+  delete(n: number): boolean;
+}
+
 /**
  * Apply a cascade {@link planCascade|plan}: MARK not-yet-started dependents
  * terminal (existing first-wins behaviour) and ABORT in-flight ones (#20).
@@ -153,14 +156,14 @@ export interface CascadeHooks {
  * @param plan from {@link planCascade}; applied in order so a transitive
  *   dependent's `from` (computed in the planner's local mirror) stays consistent.
  * @param sets mutable terminal sets; failed/skipped gain the doomed dependents.
- * @param inflight mutable in-flight map; aborted dependents are deleted (race guard).
+ * @param inflight mutable in-flight dispatch map; aborted dependents are deleted (race guard).
  * @param startedAt mutable launch timestamps; aborted dependents' entries closed + removed.
  * @param hooks side-effect channels.
  */
 export function applyCascadePlan(
   plan: CascadeAction[],
   sets: TerminalSets,
-  inflight: Map<number, unknown>,
+  inflight: InflightDispatchMap,
   startedAt: Map<number, number>,
   hooks: CascadeHooks,
 ): void {
@@ -308,9 +311,9 @@ export async function runBatch(
         dispatch.get(a.dep)?.controller.abort();
       }
     }
-    // applyCascadePlan only uses .has / .delete on the map; cast hides the
-    // bundled value type from the pure-function signature.
-    applyCascadePlan(plan, { completed, failed, skipped }, dispatch as Map<number, unknown>, startedAt, {
+    // applyCascadePlan consumes only `.has` / `.delete`; InflightDispatchMap
+    // lets the bundled `{promise, controller}` value type stay inside runBatch.
+    applyCascadePlan(plan, { completed, failed, skipped }, dispatch, startedAt, {
       onSettle: opts.onSettle,
       abort: opts.abort,
       events,
@@ -339,18 +342,23 @@ export async function runBatch(
     const signalInfo: LaunchInfo = { ...info, signal: controller.signal };
     const p = Promise.resolve(n)
       .then(async (nn) => {
-        if (controller.signal.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
         const status = await opts.process(nn, signalInfo);
-        if (controller.signal.aborted) throw new DOMException(ABORT_ERROR.message, ABORT_ERROR.name);
+        // #34: a superseded dispatch (controller aborted) resolves to a harmless
+        // skipped sentinel so it can't win a later race and double-report —
+        // belt-and-suspenders with the `dispatch.delete` guard above. The check
+        // gates on the controller, NOT on the exception type, so a genuine
+        // failure that happens to throw its own DOMException("AbortError")
+        // (any inner fetch/AbortController) still surfaces as failed via the
+        // catch below when this dispatch wasn't cascade-aborted.
+        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
         return { number: n, status };
       })
-      .catch((e) => {
-        // #34: if explicitly aborted, resolve to harmless sentinel so the
-        // dispatch can't win a later race and double-report — even if a
-        // future edit forgets the Map.delete guard. Only AbortError maps
-        // to skipped; a genuine failure that coincides with a concurrent
-        // abort must still surface as failed.
-        if (e instanceof DOMException && e.name === ABORT_ERROR.name) return { number: n, status: "skipped" as TicketStatus };
+      .catch(() => {
+        // process rejected. Only THIS dispatch's cascade-abort (our controller)
+        // maps to skipped — a genuine failure must surface as failed even when
+        // it coincides with a concurrent abort, even if it throws AbortError
+        // from an inner AbortController that isn't ours.
+        if (controller.signal.aborted) return { number: n, status: "skipped" as TicketStatus };
         return { number: n, status: "failed" as TicketStatus };
       });
     dispatch.set(n, { promise: p, controller });
@@ -389,9 +397,11 @@ export async function runBatch(
     if (dispatch.size === 0) break; // nothing running, nothing launchable → done
 
     const settled = await Promise.race([...dispatch.values()].map((d) => d.promise));
-    // #34: guard against a cascade-aborted dispatch that resolved to sentinel
-    // (the controller.abort() in applyCascade synchronously aborts the signal
-    // before the next race, but the check makes the invariant explicit).
+    // #34: guard against a cascade-aborted dispatch that resolved to sentinel.
+    // The controller.abort() fires in the `applyCascade` wrapper's for-loop
+    // (above) before applyCascadePlan runs, so the signal is already aborted
+    // by the time the sentinel wins this race — but the check makes the
+    // no-double-report invariant explicit and survives a future reorder.
     if (!dispatch.has(settled.number)) continue;
     dispatch.delete(settled.number);
     overlapInflight.delete(settled.number);

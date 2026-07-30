@@ -8,6 +8,10 @@ export interface RunOptions {
   timeoutMs?: number;
   /** Extra env merged into the child environment. */
   env?: Record<string, string>;
+  /** #34: aborting the signal kills the spawned process so an in-flight dispatch
+   *  is interrupted mid-run (not just entry-gated by the caller). Like the
+   *  timeout path, the kill produces a non-zero exit; the caller sees `!ok`. */
+  signal?: AbortSignal;
 }
 
 export interface RunResult {
@@ -50,6 +54,33 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
     }, opts.timeoutMs);
   }
 
+  // #34: an external AbortSignal interrupts the spawned process mid-run. An
+  // already-aborted signal kills it immediately; otherwise arm a one-shot
+  // listener (removed after the proc settles so a short-lived signal can't
+  // leak the listener). The kill mirrors the timeout path: non-zero exit,
+  // caller sees `!ok` (aborted vs failed is indistinguishable here by design —
+  // the scheduler's dispatch wrapper decides skip-vs-fail from its controller).
+  const signal = opts.signal;
+  let onAbort: (() => void) | undefined;
+  if (signal) {
+    if (signal.aborted) {
+      try {
+        proc.kill();
+      } catch {
+        /* already dead */
+      }
+    } else {
+      onAbort = () => {
+        try {
+          proc.kill();
+        } catch {
+          /* already dead */
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
   if (opts.input !== undefined && proc.stdin) {
     proc.stdin.write(opts.input);
     proc.stdin.end();
@@ -61,6 +92,7 @@ export async function run(cmd: string[], opts: RunOptions = {}): Promise<RunResu
     proc.exited,
   ]);
   clearTimeout(timer);
+  if (onAbort && signal) signal.removeEventListener("abort", onAbort);
 
   return { ok: !timedOut && code === 0, stdout, stderr, code, timedOut };
 }
